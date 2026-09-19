@@ -22,8 +22,6 @@
 #ifndef CODE_H
 #define CODE_H
 
-#include <limits.h>
-
 #include "env.h"
 
 /* Definition of generated code */
@@ -41,9 +39,19 @@
   op_ ## prefix ## _ ## name = op_ ## prefix + vclass_ ## name
 #define VCLASS_OPS(prefix) op_ ## prefix, FOR_VCLASS(DEF_VCLASS_OP, prefix)
 
+union typecheck_arg {
+  struct {
+    bool is_arg : 1;
+    uint8_t argnum : 7;
+  } s;
+  uint8_t u;
+};
+CASSERT_SIZEOF(union typecheck_arg, 1);
+
 enum operator {
   /* Simple operations */
   op_return,			/* arg0 */
+  op_null,			/* arg0 */
   op_constant1,			/* arg1 is offset in code's constants */
   op_constant2,			/* arg2 is offset in code's constants */
   op_integer1,			/* arg1 is signed integer */
@@ -63,10 +71,13 @@ enum operator {
   op_execute_primitive_2arg,	/* arg2 is global offset */
   op_execute_global_1arg,       /* arg2 is global offset */
   op_execute_global_2arg,       /* arg2 is global offset */
-  op_argcheck,			/* arg1 is # of parameters expected */
-  op_varargs,			/* arg0. Makes vector of args -> local var 0 */
+  op_args_fixed,                /* arg1 is # of parameters expected */
+  op_args_range,                /* arg0; stack holds min/max # arguments */
+  op_args_vararg,               /* arg0; stack holds min/optional #
+                                   arguments */
+  op_pop_args,			/* arg0. Pop function args off stack */
   op_discard,			/* arg0. Pop top of stack (discard result) */
-  op_pop_n,			/* arg1. Pop n stack entries */
+  op_exit_discard_n,		/* arg1. Pop n entries */
   op_exit_n,			/* arg1. Pop top of stack, pop n
                                    entries, push old top of stack */
   /* All branch instructions must be consecutive, with the 1 byte version
@@ -88,11 +99,11 @@ enum operator {
      list */
   VCLASS_OPS(recall),
   VCLASS_OPS(assign),
-  VCLASS_OPS(vref),
 
   VCLASS_OPS(closure_var),  /* n.b., closure_var have no globals */
 
   op_define,
+  op_c_callback,             /* calls arg1's mcallback with arg2 as argument */
 
   /* Builtin operations (very common) */
   op_builtin_eq,
@@ -104,39 +115,25 @@ enum operator {
   op_builtin_ref,
   op_builtin_set,
   op_builtin_add,
-  op_builtin_addint,
   op_builtin_sub,
   op_builtin_bitand,
   op_builtin_bitor,
+  op_builtin_bitnot,
   op_builtin_not,
+  op_builtin_car,
+  op_builtin_cdr,
 
-  op_typeset_check,             /* arg1 is stack offset. Pop top of stack (an
-                                   integer) and make sure variable indicated by
-                                   arg1 is of a type therein. */
+  /* arg1 (a union typecheck_arg) is stack offset. Pop top of stack (an
+     integer) and make sure variable indicated by arg1 is of a type therein. */
+  op_typeset_check,
 
-  op_typecheck,			/* typecheck i: op_typecheck + i
-				   arg1 is stack offset */
+  /* typecheck i: op_typecheck + i. arg1 (a union typecheck_arg) is the stack
+     offset. */
+  op_typecheck,
 
-#define DEF_TYPECHECK_OP(name, arg)				\
-  op_typecheck_ ## name = op_typecheck + type_ ## name,
-#define DEF_STYPECHECK_OP(name, arg)				\
-  op_typecheck_ ## name = op_typecheck + stype_ ## name,
-
-  FOR_PLAIN_TYPES(DEF_TYPECHECK_OP,)
-  FOR_SYNTHETIC_TYPES(DEF_STYPECHECK_OP,)
-
+#define DEF_TYPECHECK_OP(name) op_typecheck_ ## name = op_typecheck + name
+  FOR_MUDLLE_TYPES(DEF_TYPECHECK_OP, SEP_COMMA)
 #undef DEF_TYPECHECK_OP
-#undef DEF_STYPECHECK_OP
-
-  op_last = op_typecheck
 };
-
-/* Max size of unsigned arg1 */
-#define ARG1_MAX ((1 << CHAR_BIT) - 1)
-/* Maximum for inline constants only, others can be larger */
-#define INTEGER1_MAX ((1 << (CHAR_BIT - 1)) - 1)
-#define INTEGER1_MIN (-(1 << (CHAR_BIT - 1)))
-#define INTEGER2_MAX ((1 << (2 * CHAR_BIT - 1)) - 1)
-#define INTEGER2_MIN (-(1 << (2 * CHAR_BIT - 1)))
 
 #endif

@@ -23,7 +23,6 @@
 #define INS_H
 
 #include "code.h"
-#include "types.h"
 
 struct label;
 struct loc;
@@ -39,7 +38,7 @@ union instruction {
 };
 CASSERT_SIZEOF(union instruction, 1);
 
-struct fncode *new_fncode(bool toplevel);
+struct fncode *new_fncode(bool toplevel, const struct loc *loc);
 /* Returns: A new function code structure (in which code for functions
      may be generated and in which constants may be stored).
    Warning: calls to new_fncode/delete_fncode must be matched in a stack-like
@@ -63,18 +62,22 @@ void ins0(enum operator op, struct fncode *fn);
    Modifies: fn
 */
 
-void ins1(enum operator op, uint8_t arg1, struct fncode *fn);
+void ins1(enum operator op, long arg1, struct fncode *fn);
 /* Effects: Adds instruction ins to code of 'fn'.
      The instruction has one argument, arg1.
    Modifies: fn
 */
 
-void ins2(enum operator op, uint16_t arg2, struct fncode *fn);
+void ins2(enum operator op, long arg2, struct fncode *fn);
 /* Effects: Adds instruction ins to code of 'fn'.
      The instruction has a two byte argument (arg2), stored in big-endian
      format.
    Modifies: fn
 */
+
+void ins_assign(enum variable_class vclass, long ofs, struct fncode *fn);
+void ins_recall(enum variable_class vclass, long ofs, struct fncode *fn);
+void ins_closure_var(enum variable_class vclass, long ofs, struct fncode *fn);
 
 void branch(enum operator branch, struct label *to, struct fncode *fn);
 /* Effects: Adds a branch instruction to lavel 'to' to instruction
@@ -91,7 +94,7 @@ int adjust_depth(int by, struct fncode *fn);
    Modifies: fn
 */
 
-uint16_t add_constant(value cst, struct fncode *fn);
+long add_constant(value cst, struct fncode *fn);
 /* Effects: Adds a constant to code of 'fn'.
    Returns: The index where this constant is stored.
    Modifies: fn
@@ -114,8 +117,9 @@ struct icode *generate_fncode(struct fncode *fn,
                               struct string *help,
                               struct string *varname,
                               const struct loc *loc,
-                              struct obj *arguments,
-                              unsigned return_typeset,
+                              struct vector *arguments,
+                              bool is_vararg,
+                              typeset_t return_typeset,
                               seclev_t seclev);
 /* Returns: A code structure with the instructions and constants in 'fn'.
    Requires: generate_fncode may only be called on the result of the most
@@ -135,7 +139,7 @@ void set_label(struct label *lab, struct fncode *fn);
    Modifies: lab, fn
 */
 
-void start_block(const char *name, struct fncode *fn);
+void start_block(const char *name, bool leave_result, struct fncode *fn);
 /* Effects: Starts a block called name (may be NULL), which can be
      exited with exit_block()
    Modifies: fn
@@ -146,16 +150,20 @@ void end_block(struct fncode *fn);
    Modifies: fn
 */
 
-int exit_block(const char *name, struct fncode *fn);
-/* Effects: Generates code to exit from specified named block
-     (pop stack, jump to block exit label)
-   Returns: false if the named block doesn't exist
-   Modifies: fn
-*/
+/* find block by name 'name' (NULL for no-name loop); '*leave_result' is set to
+   whether this block has a return value; NULL if not found */
+struct genblock *find_block(const char *name, struct fncode *fn,
+                            bool *leave_result);
+
+/* pops stack, jumps to 'block' */
+void exit_block(struct genblock *block, struct fncode *fn);
 
 void set_lineno(int line, struct fncode *fn);
 /* Effects: Sets line number for upcoming instructions
    Modifies: fn
 */
+
+bool fncode_add_vlist(struct vlist *vlist, struct fncode *fn);
+void fncode_remove_vlist(struct vlist *vlist, struct fncode *fn);
 
 #endif

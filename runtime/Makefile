@@ -23,19 +23,18 @@
 wrong-file:
 	$(error Use Makefile in the parent directory)
 
-RTOBJS:=$(addprefix runtime/, arith.o basic.o bigint.o bitset.o	\
-        bool.o debug.o files.o io.o list.o mudlle-float.o		\
-        mudlle-string.o mudlle-xml.o mudllecst.o pattern.o		\
-        runtime.o support.o symbol.o vector.o)
+runtime/bigint.$(OBJEXT): CFLAGS:=-Wno-invalid-source-encoding $(CFLAGS)
 
-$(RTOBJS): CFLAGS+=$(PRIMITIVE_CFLAGS)
+RTSRC:=$(addprefix runtime/, arith.c basic.c bigint.c bitset.c bool.c	\
+        debug.c files.c io.c list.c mudlle-float.c mudlle-string.c	\
+        mudlle-xml.c mudllecst.c pattern.c runtime.c support.c		\
+        symbol.c vector.c)
 
-mudlle: $(RTOBJS)
+mudlle: $(RTSRC:%.c=%.$(OBJEXT))
 
-RTSRC = $(RTOBJS:%.o=%.c)
-
-CSTFILES := error.h module.h types.h			\
-	runtime/basic.h runtime/files.h runtime/io.h
+CSTFILES := error.h module.h mtree.h print.h profile.h tree.h types.h	\
+	runtime/basic.h runtime/debug.h runtime/files.h runtime/io.h	\
+	runtime/runtime.h runtime/support.h
 
 ifneq ($(USE_XML),)
 XML_CFLAGS:=$(shell xml2-config --cflags || echo ' !!!FAIL!!! ')
@@ -53,16 +52,17 @@ RTDEPFILE:=runtime/.depend
 
 clean: clean_runtime
 clean_runtime:
-	rm -f runtime/*.o runtime/mudllecst.c $(RTDEPFILE)
+	rm -f runtime/*.$(OBJEXT) runtime/*.i runtime/mudllecst.c $(RTDEPFILE)
+	rmdir runtime 2>/dev/null || true
 
-runtime/mudllecst.c: runtime/consts.pl $(CSTFILES) runtime/Makefile
-	@echo "Create $@"
-	$(Q)LC_ALL=C $(PERL) $< -o $@ -- $(CSTFILES)
+runtime/mudllecst.c: runtime/consts.pl runtime/Makefile $(CSTFILES)
+	@echo "Creating $@"
+	$(Q)LC_ALL=C $(PERL) $< -o $@ -- $(wordlist 3,$(words $^),$^)
 
-$(RTDEPFILE): $(RTSRC) $(ARCHDEP)
-	@echo "Create $@"
-	$(Q)$(MAKEDEPEND) $(CPPFLAGS) $(CFLAGS) $(RTSRC) \
-		| sed 's!^\(.*\)\.o *:!runtime/\1.o:!g' > $@
+$(RTDEPFILE): $(ARCHDEP) $(RTSRC) $(OBJDEP)
+	@echo "Creating $@"
+	$(Q)$(MAKEDEPEND) $(CPPFLAGS) $(CFLAGS) $(wordlist 2,$(words $^),$^) \
+		| sed 's!^\(.*\)\.o *:!runtime/\1.$(OBJEXT):!g' > $@
 
 ifneq (,$(depfile))
 ifeq (,$(wildcard $(RTDEPFILE)))

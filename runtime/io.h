@@ -24,9 +24,8 @@
 
 #include "../mudlle-config.h"
 
-#include <sys/types.h>
+#include <time.h>
 
-#include "../error.h"
 #include "../ports.h"
 
 enum {
@@ -43,32 +42,35 @@ enum {
 
 void io_init(void);
 
-struct oport *get_oport(struct oport *oport);
-
 /* end mudlle const */
-#define TYPESET_OPORT TSET(oport)
+#define TYPESET_OPORT (TSET(oport) | TSET(file))
+#define OPORT_TYPES "a file or output port"
 
-#define __CT_OPORT_E(v, msg, typeset) (v = get_oport(v), error_none)
+struct oport_info {
+  bool use_ascii;
+};
 
-/* CT_OPORT checks that var is an oport or a character. If it is a
+enum runtime_error ct_oport(struct oport **oport, const char **errmsg,
+                            struct oport_info *info, bool force);
+#define __CT_OPORT_E(v, msg, info) ct_oport(&v, msg, info, true)
+#define __CT_OPT_OPORT_E(v, msg, info) ct_oport(&v, msg, info, false)
+
+/* CT_OPORT checks that var is a file, oport or character. If it is a
    character, sets var to its standard output port. May cause GC! */
-#define CT_OPORT F(TYPESET_OPORT, __CT_OPORT_E, TYPESET_OPORT)
+#define CT_OPORT(info) F2(TYPESET_OPORT, __CT_OPORT_E, (info))
 /* CT_OPT_OPORT does what CT_OPORT does, but just sets var to NULL for
-   any other types. May cause GC! */
-#define CT_OPT_OPORT F(TYPESET_ANY, __CT_OPORT_E, )
+   null or false. May cause GC! */
+#define CT_OPT_OPORT(info)                              \
+  F2(TYPESET_OPORT | TYPESET_FALSE | TSET(null),        \
+     __CT_OPT_OPORT_E, (info))
 
-static inline enum runtime_error ct_str_oport_e(struct oport *op,
-                                                const char **errmsg)
-{
-  if (!is_string_port(op))
-    {
-      *errmsg = "exepected a string oport";
-      return error_bad_value;
+#define __CT_STR_OPORT_E(edst, v, msg, typeset) \
+  if (!is_string_port(v))                       \
+    {                                           \
+      *msg = "exepected a string port";         \
+      edst = error_bad_value;                   \
     }
-  return error_none;
-}
 
-#define __CT_STR_OPORT_E(v, msg, typeset) ct_str_oport_e(v, msg)
 /* CT_STR_OPORT checks that var is an oport; then it checks that it is
    a string oport. */
 #define CT_STR_OPORT F(TSET(oport), __CT_STR_OPORT_E, TSET(oport))

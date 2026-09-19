@@ -31,24 +31,21 @@
 #  define __attribute__(x)
 #endif
 
-#if defined __i386__ || defined __x86_64__
+#define ALWAYS_INLINE __attribute__((always_inline)) inline
+
+#undef GCDBEUG
+
+#if defined __x86_64__ || defined __aarch64__
 #  define GCQDEBUG
 #  define GCDEBUG_CHECK
 #  undef WORDS_BIGENDIAN
+#  define HAVE___UINT128_T 1
 #else
 #  error "Unsupported architecture"
 #endif
 
-#ifdef __x86_64__
-#  define HAVE___UINT128_T 1
-#endif
-
 #ifdef __MACH__
 #  define HAVE_CRYPT 1
-#endif
-
-#ifndef PATH_MAX
-#  define PATH_MAX 1024
 #endif
 
 /* GC configuration, basic parameters */
@@ -71,12 +68,15 @@
 #  define __has_extension(x) 0
 #endif
 
+#ifdef __aarch64__
+#  undef NOCOMPILER
+#  define NOCOMPILER
+#endif
+
 
 #if defined __linux__ || defined __MACH__
-#  if defined __i386__ || defined __x86_64__
+#  ifdef __x86_64__
 #    define USE_CCONTEXT
-#  else
-#    define NOCOMPILER
 #  endif
 #else
 #  error Unsupported platform
@@ -85,7 +85,7 @@
 /* Execution limits */
 
 /* max mudlle stack usage in bytes */
-#define MAX_STACK_DEPTH (160 * 1024)
+#define MAX_STACK_DEPTH (180 * 1024)
 
 /* relative cost of an interpreted loop */
 #ifdef NOCOMPILER
@@ -98,10 +98,5 @@
 
 /* set to generate call count profiling information */
 #undef PROFILE_CALL_COUNT
-
-#undef MAX
-#define MAX(...) _Static_assert(0, "there is no MAX()")
-#undef MIN
-#define MIN(...) _Static_assert(0, "there is no MIN()")
 
 #endif  /* MUDLLE_CONFIG_H */

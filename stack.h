@@ -23,16 +23,20 @@
 #define STACK_H
 
 #include "objenv.h"
-#include "types.h"
 
 extern struct env *stack;
 
 void stack_init(void);
 void stack_clear(void);
 
-static inline void stack_reserve(ulong n)
+static ALWAYS_INLINE void stack_reserve(ulong n)
 {
   env_reserve(stack, n);
+}
+
+static ALWAYS_INLINE void stack_make_room(ulong n)
+{
+  env_make_room(stack, n);
 }
 
 /* Effect: Insures that stack has n free spaces.
@@ -43,6 +47,7 @@ value stack_pop(void);
 void stack_push(value v);
 
 value stack_get(ulong idx);
+void stack_set(ulong idx, value v);
 ulong stack_depth(void);
 
 #endif /* STACK_H */

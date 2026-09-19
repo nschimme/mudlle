@@ -20,8 +20,7 @@
  */
 
 library phase4 // Phase 4: code generation
-requires compiler, flow, graph, ins3, misc, mp, optimise, phase3, sequences,
-  vars
+requires compiler, flow, graph, ins3, misc, mp, optimise, sequences, vars
 defines mc:phase4
 reads mc:verbose, mc:disassemble
 [
@@ -34,7 +33,7 @@ reads mc:verbose, mc:disassemble
     [
       | remvar |
 
-      remvar = fn (v) v[mc:v_neighbours] = null;
+      remvar = fn (v) v[mc:v_neighbors] = null;
       lforeach(remvar, vars);
     ];
 
@@ -43,25 +42,25 @@ reads mc:verbose, mc:disassemble
       | vars, map, add_interferences |
 
       map = ifn[mc:c_fallvars];
-      // Make a neighbour bitset for every variable (except for 'myself')
-      vars = lappend(lfilter(fn (cvar) cvar[mc:v_cparent] != mc:myself,
-			     ifn[mc:c_fclosure]),
-		     ifn[mc:c_flocals]);
+      // Make a neighbor bitset for every variable (except for 'myself')
+      vars = lappend!(lfilter(fn (cvar) cvar[mc:v_cparent] != mc:myself,
+                              ifn[mc:c_fclosure]),
+                      ifn[mc:c_flocals]);
 
-      lforeach(fn (v) v[mc:v_neighbours] = mc:new_varset(ifn), vars);
+      lforeach(fn (v) v[mc:v_neighbors] = mc:new_varset(ifn), vars);
 
-      // Then set bits in neighbours for variables that are simultaneously
+      // Then set bits in neighbors for variables that are simultaneously
       // live. (these represent flow graph edges)
 
       add_interferences = fn (ins, live_in, live_out, x)
 	// add edges between all variables in live_out
 	bforeach(fn (nv1)
 		 [
-		   | neighbours |
+		   | neighbors |
 
-		   neighbours = map[nv1][mc:v_neighbours];
-		   if (neighbours != null)
-		     bunion!(neighbours, live_out)
+		   neighbors = map[nv1][mc:v_neighbors];
+		   if (neighbors != null)
+		     bunion!(neighbors, live_out)
 		 ], live_out);
 
       graph_nodes_apply(fn (n)
@@ -76,7 +75,7 @@ reads mc:verbose, mc:disassemble
 			],
 			cdr(ifn[mc:c_fvalue]));
 
-      lforeach(fn (v) clear_bit!(v[mc:v_neighbours], v[mc:v_number]), vars);
+      lforeach(fn (v) clear_bit!(v[mc:v_neighbors], v[mc:v_number]), vars);
 
       vars
     ];
@@ -87,7 +86,7 @@ reads mc:verbose, mc:disassemble
     //   necessary.
     [
       // Note that a lot of values start off spilled:
-      //   arguments beyond the 3rd (except if function has 4 args)
+      //   arguments beyond nregargs
       //   closure variables
       // These should be spilled first if necessary
       // To be considered: variables that are only used once should not be
@@ -96,7 +95,7 @@ reads mc:verbose, mc:disassemble
 
       | groups, no, nob, spiltargs, ncallee, ncaller, nscratch, nregargs,
 	spill, easy_spill, changes, color_graph, color_order, ainfo,
-	notspilt, spilt, temps, locals, map, vars, group_variables,
+        notspilt, spilt, temps, locals, map, vars, group_variables,
         select_colors, select_spill, localsb,
         vg_notspilt, vg_spilt, vg_local, vg_temp |
 
@@ -111,22 +110,16 @@ reads mc:verbose, mc:disassemble
 
 	  group = fn (il, live_in, live_out, x)
 	    [
-	      | ins, class, dvar |
-
+	      | ins, dvar, regclass |
 	      ins = il[mc:il_ins];
-              if (!mp:uses_scratch?(ins))
+
+              regclass = mp:uses_regclass(ins);
+              if (regclass == mc:regclass_none)
                 exit<function> null;
 
-	      class = ins[mc:i_class];
               dvar = il[mc:il_defined_var];
 
-	      if (class == mc:i_call
-                  || (class == mc:i_branch
-                      && (ins[mc:i_bop] == mc:branch_equal
-                          || ins[mc:i_bop] == mc:branch_nequal))
-                  || (class == mc:i_trap
-                      && (ins[mc:i_top] == mc:trap_global_write
-                          || ins[mc:i_top] == mc:trap_global_read)))
+	      if (regclass == mc:regclass_caller)
 		[
 		  | survive_call |
 
@@ -157,18 +150,9 @@ reads mc:verbose, mc:disassemble
 		  // makes register allocation for them rather pointless),
 		  // but is the simplest test
 
-		  // operations that imply allocation use scratch regs
-                  if (class == mc:i_closure
-                      || (class == mc:i_compute
-                          && (match (ins[mc:i_aop]) [
-                            ,mc:b_vector || ,mc:b_sequence => true
-                          ])))
-                    [
-                      survives = live_in;
-                      // test before making an otherwise-unnecessary copy
-                      if (dvar && bit_set?(live_in, dvar))
-                        clear_bit!(survives = bcopy(live_in), dvar)
-                    ]
+                  if (regclass == mc:regclass_early_scratch)
+                    // must not have inputs in scratch registers
+                    survives = live_in
 		  else
                     [
                       survives = bintersection(live_in, live_out);
@@ -205,33 +189,31 @@ reads mc:verbose, mc:disassemble
       easy_spill = fn (vars, bvars)
 	[
 	  | v |
-	  if (v = lexists?(fn (v)
-			   !v[mc:v_location] &&
-			   (v[mc:v_class] == mc:v_closure ||
-			    bit_set?(spiltargs, v[mc:v_number])),
-			   vars))
-	    [
-	      // spill the already spilt variable
-	      v[mc:v_location] = vector(mc:v_lspill,
-					if (v[mc:v_class] == mc:v_closure)
-					  mc:spill_closure
-					else
-					  mc:spill_args,
-					0); // spill offset not yet selected
-	      clear_bit!(bvars, v[mc:v_number]);
-	      true
-	    ]
-	  else
-	    false
+          v = lexists?(fn (v) (!v[mc:v_location]
+                               && (v[mc:v_class] == mc:v_closure
+                                   || bit_set?(spiltargs, v[mc:v_number]))),
+                       vars);
+          if (!v) exit<function> false;
+
+          // spill the already spilt variable
+          v[mc:v_location] = vector(
+            mc:v_lspill,
+            [
+              if (v[mc:v_class] == mc:v_closure)
+                mc:spill_closure
+              else
+                mc:spill_args
+            ],
+            0); // spill offset not yet selected
+          clear_bit!(bvars, v[mc:v_number]);
+          true
 	];
 
       spill = fn (vars, bvars)
 	[
-          // find variable with most neighbours to spill
+          // find variable with most neighbors to spill
 
-	  | best, maxneigh, bvars2 |
-          // create one copy to save some memory allocation
-          bvars2 = bcopy(bvars);
+	  | best, maxneigh |
           maxneigh = -1;
 
           loop
@@ -241,7 +223,7 @@ reads mc:verbose, mc:disassemble
               if (!v[mc:v_location])
                 [
                   | n |
-                  n = bcount(bintersection!(bvars2, v[mc:v_neighbours]));
+                  n = bcount_intersection(bvars, v[mc:v_neighbors]);
                   if (n > maxneigh)
                     [
                       maxneigh = n;
@@ -250,7 +232,6 @@ reads mc:verbose, mc:disassemble
                 ];
               if (vars == null)
                 exit null;
-              bassign!(bvars2, bvars);
             ];
 
           if (best == null)
@@ -280,22 +261,44 @@ reads mc:verbose, mc:disassemble
 	    [
 	      | v |
 
-	      // look for a node of vars with less than nregs neighbours
+	      // look for a node of vars with less than nregs neighbors
 	      v = lexists?(fn (v) [
                 (!v[mc:v_location]
-                 && bcount(bintersection(v[mc:v_neighbours], bvars)) < nregs)
+                 && bcount_intersection(v[mc:v_neighbors], bvars) < nregs)
               ], vars);
 
 	      if (!v) exit bempty?(bvars);
 
-	      count = count + 1;
+	      ++count;
 	      changes = true;
 	      v[mc:v_location] = vector(mc:v_lregister, regtype,
 					color_order[regtype]);
 	      clear_bit!(bvars, v[mc:v_number]);
-	      color_order[regtype] = color_order[regtype] + 1;
+	      ++color_order[regtype]
 	    ]
 	];
+
+      | get_free_color |
+      // return color unused by neighbors
+      get_free_color = fn (allocated, colors, var, locfield)
+        [
+          sfill!(colors, ~0);
+          // remove colors used by allocated neighbors
+          breduce(fn (nneighbor, colors) [
+            clear_bit!(colors,
+                       map[nneighbor][mc:v_location][locfield]);
+            colors
+          ], colors, bintersection(allocated, var[mc:v_neighbors]));
+
+          | color |
+          color = bitset_ffs(colors) - 1;
+          assert(color >= 0);
+
+          var[mc:v_location][locfield] = color;
+          set_bit!(allocated, var[mc:v_number]); // var is now allocated
+
+          color
+        ];
 
       select_colors = fn (vars, regtype, nregs)
 	// Types: vars: list of var
@@ -307,47 +310,32 @@ reads mc:verbose, mc:disassemble
 	//   This function is called once all variables have been allocated
 	//   with color_graph or spilled.
 	[
-	  | ovars, i, nused, allocated |
+	  | ovars, i, nused |
 
 	  nused = -1;
 	  // Find order of variables for given type
 	  i = color_order[regtype];
 	  ovars = make_vector(i);
-	  lforeach(fn (var)
-		  [
-		    | vloc |
-
-		    vloc = var[mc:v_location];
-		    if (vloc[mc:v_lclass] == mc:v_lregister &&
-			vloc[mc:v_lrtype] == regtype)
-		      ovars[vloc[mc:v_lrnumber]] = var
-		  ], vars);
+	  lforeach(fn (var) [
+            | vloc |
+            vloc = var[mc:v_location];
+            if (vloc[mc:v_lclass] == mc:v_lregister
+                && vloc[mc:v_lrtype] == regtype)
+              ovars[vloc[mc:v_lrnumber]] = var
+          ], vars);
 
 	  // Allocate variables in order from highest to lowest
 	  // (reverse of graph-removal order)
 	  // nodes are marked once they have been allocated
 
+          | allocated, colors |
+          colors = new_bitset(nregs);
 	  allocated = mc:new_varset(ifn);
-	  while (i > 0)
+          while (i > 0)
 	    [
-	      | var, colors, color |
-
-	      var = ovars[i = i - 1];
-	      // choose lowest available color
-	      colors = make_string(nregs);
-	      string_fill!(colors, true);
-
-	      // remove colors used by allocated neighbours
-	      bforeach
-		(fn (nneighbour) [
-                  colors[map[nneighbour][mc:v_location][mc:v_lrnumber]]
-                    = false
-                ], bintersection(allocated, var[mc:v_neighbours]));
-
-	      color = 0;
-	      while (!colors[color]) color = color + 1;
-	      var[mc:v_location][mc:v_lrnumber] = color;
-	      set_bit!(allocated, var[mc:v_number]); // var is now allocated
+	      | var, color |
+	      var = ovars[--i];
+              color = get_free_color(allocated, colors, var, mc:v_lrnumber);
 	      if (color > nused) nused = color;
 	    ];
 
@@ -363,41 +351,24 @@ reads mc:verbose, mc:disassemble
 	//   This function is called once all variables have been allocated
 	//   with color_graph or spilled.
 	[
-	  | allocate_spill, nspilled, allocated |
+	  | nspilled, allocated, colors |
 
+          colors = new_bitset(maxspill);
 	  nspilled = -1;
-	  allocate_spill = fn (var)
-	    [
-	      | colors, color |
-
-	      colors = make_string(maxspill);
-	      string_fill!(colors, true);
-
-	      // remove colors used by allocated neighbours
-	      bforeach(
-                fn (nneighbour) [
-                  colors[map[nneighbour][mc:v_location][mc:v_lsoffset]]
-                    = false
-                ], bintersection(allocated, var[mc:v_neighbours]));
-
-	      color = 0;
-	      while (!colors[color]) color = color + 1;
-	      var[mc:v_location][mc:v_lsoffset] = color;
-	      set_bit!(allocated, var[mc:v_number]); // var is now allocated
-	      if (color > nspilled) nspilled = color;
-	    ];
 
 	  // Allocate all spilled variables, in an arbitrary order
 	  allocated = mc:new_varset(ifn);
-	  lforeach(fn (var)
-		  [
-		    | vloc |
-
-		    vloc = var[mc:v_location];
-		    if (vloc[mc:v_lclass] == mc:v_lspill &&
-			vloc[mc:v_lrtype] == mc:spill_spill)
-		      allocate_spill(var)
-		  ], vars);
+	  lforeach(fn (var) [
+            | vloc |
+            vloc = var[mc:v_location];
+            if (vloc[mc:v_lclass] == mc:v_lspill
+                && vloc[mc:v_lrtype] == mc:spill_spill)
+              [
+                | color |
+                color = get_free_color(allocated, colors, var, mc:v_lsoffset);
+                if (color > nspilled) nspilled = color;
+              ]
+          ], vars);
 
 	  nspilled + 1
 	];
@@ -410,10 +381,19 @@ reads mc:verbose, mc:disassemble
       ncaller = mp:ncaller(ifn);
       ncallee = mp:ncallee(ifn);
 
-      // first nregargs are in registers
+      assert(nregargs == 0);    // fix the below if this changes
+      | spiltvars |
+      for (|fargs| fargs = ifn[mc:c_ffullargs]; fargs != null;)
+        [
+          | farg, var, ts |
+          @(farg . fargs) = fargs;
+          @[var ts _] = farg[mc:fullarg_arg];
+          if (ts == null || (ts & TYPESET_FLAG_OPTIONAL))
+            exit<break> null;
+          spiltvars = var . spiltvars
+        ];
       spiltargs = mc:new_varset(ifn);
-      mc:set_vars!(spiltargs, lmap(fn (@[var _ _]) var,
-				   nth_pair(nregargs + 1, ifn[mc:c_fargs])));
+      mc:set_vars!(spiltargs, spiltvars);
 
       vars = make_igraph(ifn);
       // separate variables into 4 groups:
@@ -423,10 +403,10 @@ reads mc:verbose, mc:disassemble
       //   3: temps: those that can live in the scratch registers
       //   2: locals: all the others
       groups = group_variables(vars);
-      temps    = bitset_to_list(groups[vg_temp],     map);
-      locals   = bitset_to_list(groups[vg_local],    map);
-      spilt    = bitset_to_list(groups[vg_spilt],    map);
-      notspilt = bitset_to_list(groups[vg_notspilt], map);
+      temps    = bitset_map_list(groups[vg_temp],     map);
+      locals   = bitset_map_list(groups[vg_local],    map);
+      spilt    = bitset_map_list(groups[vg_spilt],    map);
+      notspilt = bitset_map_list(groups[vg_notspilt], map);
 
       if (mc:verbose >= 3)
 	[
@@ -436,12 +416,18 @@ reads mc:verbose, mc:disassemble
 
       // Do scratch registers first, as they should normally all
       // be successful
-      if (!color_graph(temps, groups[vg_temp], mc:reg_scratch, nscratch))
-	[
-	  // if fail, add unallocated temps to locals
-	  locals = lappend(lfilter(fn (v) !v[mc:v_location], temps), locals);
-	  bunion!(groups[vg_local], groups[vg_temp]);
-	];
+      while (temps != null
+             && !color_graph(temps, groups[vg_temp], mc:reg_scratch, nscratch))
+        [
+          // spill one temp to locals and try again
+          | first, fnum |
+          temps = lfilter!(fn (v) !v[mc:v_location], temps);
+          @(first . temps) = temps;
+          locals = first . locals;
+          fnum = first[mc:v_number];
+          set_bit!(groups[vg_local], fnum);
+          clear_bit!(groups[vg_temp], fnum);
+        ];
 
       localsb = groups[vg_local];
       <allocate_locals> loop
@@ -495,7 +481,8 @@ reads mc:verbose, mc:disassemble
       if (mc:verbose >= 3)
 	[
 	  dformat("USED: scratch: %d, caller: %d callee: %d, spilt %d\n",
-                  ainfo[0], ainfo[1], ainfo[2], ainfo[3]);
+                  ainfo[mc:vainfo_scratch], ainfo[mc:vainfo_caller],
+                  ainfo[mc:vainfo_callee], ainfo[mc:vainfo_spill]);
 	];
       clear_igraph(vars);
       ainfo
@@ -548,12 +535,13 @@ reads mc:verbose, mc:disassemble
         ];
 
       code = mp:mgen_preamble(ifn, ainfo);
-      dforeach(fn (il)
-	         if (il[mc:il_label])
-	           il[mc:il_label][mc:l_mclabel] = mp:new_label(code),
-	       ifn[mc:c_fvalue]);
-      dforeach(fn (il) mp:mgen_instruction(code, ifn, ainfo, il),
-               ifn[mc:c_fvalue]);
+      dforeach(fn (il) [
+        if (il[mc:il_label])
+          il[mc:il_label][mc:l_mclabel] = mp:new_label(code)
+      ], ifn[mc:c_fvalue]);
+      dforeach(fn (il) [
+        mp:mgen_instruction(code, ifn, ainfo, il)
+      ], ifn[mc:c_fvalue]);
 
       if (mc:verbose >= 5)
 	[

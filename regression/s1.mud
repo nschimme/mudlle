@@ -1,4 +1,4 @@
-eval("f = fn (x) if (x < 10) 20 else 15");
+reval("f = fn (x) if (x < 10) 20 else 15");
 regress("if1", f(9), 20);
 regress("if2", f(10), 15);
 regress("if3", f(11), 15);

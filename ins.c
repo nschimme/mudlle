@@ -21,23 +21,20 @@
 
 #include "mudlle-config.h"
 
-#include <stddef.h>
-#include <stdlib.h>
-#include <string.h>
-
 #include "alloc.h"
+#include "assoc.h"
 #include "builtins.h"
 #include "calloc.h"
-#include "code.h"
-#include "compile.h"
 #include "dwarf.h"
 #include "ins.h"
-#include "lexer.h"
+#include "mtree.h"
 #include "mvalues.h"
 #include "tree.h"
-#include "utils.h"
+
 
 #include "runtime/mudlle-string.h"
+
+#define assert_compiler(what, fn) assert(what)
 
 /* Instruction lists are stored in reverse order, to simplify creation.
    They are reversed before use ...
@@ -54,25 +51,27 @@ struct ilist			/* Instruction list */
   int lineno;
 };
 
-struct blocks
+struct genblock
 {
-  struct blocks *next;
+  struct genblock *next;
   const char *name;
   struct label *exitlab;        /* Label for block exit */
-  int stack_depth;		/* Stack depth at block entry */
+  int stack_depth;              /* Stack depth at block entry */
+  bool leave_result;
 };
 
 struct fncode {
+  struct loc loc;
   struct ilist *instructions;
   int current_depth, max_depth; /* This tracks the stack depth as
                                    determined by the instructions */
   struct label *next_label;	/* For the 'label' function */
-  struct dynpro csts;           /* Mudlle list of constants */
+  union dynpro_list csts;       /* Mudlle list of constants */
   uint16_t cstindex;		/* Index of next constant */
-  struct blocks *blks;		/* Stack of named blocks */
+  struct genblock *blks;        /* Stack of named blocks */
   bool toplevel;
   struct alloc_block *memory;
-  int lineno;
+  struct assoc_array locals;
 };
 
 struct label			/* A pointer to an instruction */
@@ -82,16 +81,14 @@ struct label			/* A pointer to an instruction */
 				   another label ... */
 };
 
-static int bc_length; /* For statistical purposes */
-
 static void add_ins(uint8_t ins, struct fncode *fn)
 {
   struct ilist *newp = allocate(fnmemory(fn), sizeof *newp);
   *newp = (struct ilist){
     .next   = fn->instructions,
-    .ins.op = ins,
+    .ins.u  = ins,
     .lab    = fn->next_label,
-    .lineno = fn->lineno
+    .lineno = fn->loc.line
   };
   fn->instructions = newp;
   if (fn->next_label)
@@ -104,7 +101,7 @@ static void add_ins(uint8_t ins, struct fncode *fn)
 void set_lineno(int line, struct fncode *fn)
 {
   if (line > 0)
-    fn->lineno = line;
+    fn->loc.line = line;
 }
 
 int adjust_depth(int by, struct fncode *fn)
@@ -120,7 +117,7 @@ int adjust_depth(int by, struct fncode *fn)
   return fn->current_depth;
 }
 
-struct fncode *new_fncode(bool toplevel)
+struct fncode *new_fncode(bool toplevel, const struct loc *loc)
 /* Returns: A new function code structure (in which code for functions
      may be generated).
 */
@@ -130,17 +127,45 @@ struct fncode *new_fncode(bool toplevel)
   *newp = (struct fncode){
     .toplevel = toplevel,
     .memory   = afnmemory,
-    .lineno   = 1
+    .loc      = *loc,
+    .locals.type = &const_icharp_to_voidp_assoc_array_type
   };
-  dynpro(&newp->csts, NULL);
+  dynpro(&newp->csts, (struct list *)NULL);
 
   return newp;
+}
+
+bool fncode_add_vlist(struct vlist *vlist, struct fncode *fn)
+{
+  for (; vlist != NULL; vlist = vlist->next)
+    {
+      if (vlist->var[0] == '%')
+        continue;
+      struct vlist *prev = assoc_array_lookup(&fn->locals, vlist->var);
+      if (prev != NULL)
+        {
+          compile_warning(&vlist->loc, "redefinition of '%s%s%s'",
+                          CMARKUP(var, vlist->var));
+          compile_note(&prev->loc, "the previous declaration is here");
+          return false;
+        }
+      assoc_array_set(&fn->locals, vlist->var, vlist);
+    }
+  return true;
+}
+
+void fncode_remove_vlist(struct vlist *vlist, struct fncode *fn)
+{
+  for (; vlist != NULL; vlist = vlist->next)
+    if (vlist->var[0] != '%')
+      assoc_array_remove(&fn->locals, vlist->var);
 }
 
 void delete_fncode(struct fncode *fn)
 /* Effects: deletes struct fncode *'fn'
  */
 {
+  assoc_array_free(&fn->locals);
   undynpro(&fn->csts);
   free_block(fn->memory);
 }
@@ -159,12 +184,19 @@ bool fntoplevel(struct fncode *fn)
   return fn->toplevel;
 }
 
-uint16_t add_constant(value cst, struct fncode *fn)
+long add_constant(value cst, struct fncode *fn)
 /* Effects: Adds a constant to code of 'fn'.
    Returns: The index where this constant is stored.
 */
 {
-  fn->csts.obj = alloc_list(cst, fn->csts.obj);
+  /* first, check for duplicates; mainly for strings */
+  long idx = fn->cstindex - 1;
+  for (struct list *l = fn->csts.l; l != NULL; l = l->cdr, --idx)
+    if (l->car == cst)
+      return idx;
+
+  fn->csts.l = alloc_list(cst, fn->csts.l);
+  assert_compiler(fn->cstindex < MAX_VALUE(fn->cstindex), fn);
   return fn->cstindex++;
 }
 
@@ -173,26 +205,30 @@ void ins_constant(value cst, struct fncode *fn)
    Modifies: fn
 */
 {
-  uint16_t aindex;
+  if (cst == NULL)
+    {
+      ins0(op_null, fn);
+      return;
+    }
 
   if (integerp(cst))
     {
       long i = intval(cst);
 
-      if (i >= INTEGER1_MIN && i <= INTEGER1_MAX)
+      if (i >= INT8_MIN && i <= INT8_MAX)
 	{
-	  ins1(op_integer1, i, fn);
+	  ins1(op_integer1, (uint8_t)i, fn);
 	  return;
 	}
-      if (i >= INTEGER2_MIN && i <= INTEGER2_MAX)
+      if (i >= INT16_MIN && i <= INT16_MAX)
 	{
-	  ins2(op_integer2, i, fn);
+	  ins2(op_integer2, (uint16_t)i, fn);
 	  return;
 	}
     }
 
-  aindex = add_constant(cst, fn);
-  if (aindex <= ARG1_MAX)
+  long aindex = add_constant(cst, fn);
+  if (aindex <= UINT8_MAX)
     ins1(op_constant1, aindex, fn);
   else
     ins2(op_constant2, aindex, fn);
@@ -205,60 +241,85 @@ void ins0(enum operator op, struct fncode *fn)
 {
   switch (op)
     {
+    case op_null:
+      adjust_depth(1, fn);
+      break;
     case op_discard: case op_builtin_eq: case op_builtin_neq:
     case op_builtin_le: case op_builtin_lt: case op_builtin_ge:
     case op_builtin_gt: case op_builtin_ref: case op_builtin_add:
-    case op_builtin_addint: case op_builtin_sub: case op_builtin_bitand:
-    case op_builtin_bitor:
+    case op_builtin_sub: case op_builtin_bitand: case op_builtin_bitor:
       adjust_depth(-1, fn);
       break;
     case op_builtin_set:
+    case op_args_range:
+    case op_args_vararg:
       adjust_depth(-2, fn);
       break;
-    default:
+    case op_c_callback:         /* pops one, pushes one */
+    case op_return:
+    case op_builtin_bitnot: case op_builtin_not:
+    case op_builtin_car: case op_builtin_cdr:
+    case op_pop_args:
       break;
+    default:
+      abort();
     }
   add_ins(op, fn);
 }
 
-void ins1(enum operator op, uint8_t arg1, struct fncode *fn)
+void ins1(enum operator op, long arg1, struct fncode *fn)
 /* Effects: Adds instruction ins to code of 'fn'.
      The instruction has one argument, arg1.
    Modifies: fn
 */
 {
+  assert_compiler(arg1 >= 0 && arg1 <= UINT8_MAX, fn);
+
   switch (op)
     {
-      /* Note: op_exit_n *MUST NOT* modify stack depth */
     case op_recall_local: case op_recall_closure:
-    case op_vref_local: case op_integer1: case op_constant1:
+    case op_integer1: case op_constant1:
     case op_closure:
       adjust_depth(1, fn);
       break;
     case op_typeset_check:
       adjust_depth(-1, fn);
       break;
-    case op_execute: case op_pop_n: case op_execute_primitive:
+    case op_execute: case op_execute_primitive:
     case op_execute_secure: case op_execute_varargs:
       adjust_depth(-arg1, fn);
       break;
-    default:
+    case op_args_fixed:
+    case op_assign_closure:
+    case op_assign_local:
+    case op_clear_local:
+    case op_closure_code1:
+    case op_closure_var_closure:
+    case op_closure_var_local:
+    case op_exit_discard_n:     /* special handling */
+    case op_exit_n:             /* special handling */
       break;
+    default:
+      if (op >= op_typecheck && op < op_typecheck + mudlle_synthetic_types)
+        break;
+      abort();
     }
   add_ins(op, fn);
   add_ins(arg1, fn);
 }
 
-void ins2(enum operator op, uint16_t arg2, struct fncode *fn)
+void ins2(enum operator op, long arg2, struct fncode *fn)
 /* Effects: Adds instruction ins to code of 'fn'.
      The instruction has a two byte argument (arg2), stored in big-endian
      format.
    Modifies: fn
 */
 {
+  assert_compiler(arg2 >= 0 && arg2 <= UINT16_MAX, fn);
+
   switch (op)
     {
-    case op_recall_global: case op_vref_global:
+    case op_recall_global:
     case op_integer2: case op_constant2:
       adjust_depth(1, fn);
       break;
@@ -269,12 +330,43 @@ void ins2(enum operator op, uint16_t arg2, struct fncode *fn)
     case op_execute_secure2: case op_execute_varargs2:
       adjust_depth(-arg2, fn);
       break;
-    default:
+    case op_execute_primitive_1arg:
+    case op_execute_global_1arg:
+    case op_closure_code1:
+    case op_closure_code2:
+    case op_assign_global:
+    case op_define:
       break;
+    default:
+      abort();
     }
   add_ins(op, fn);
   add_ins(arg2 >> 8, fn);
   add_ins(arg2 & 0xff, fn);
+}
+
+static void ins_access(enum operator base, enum variable_class vclass,
+                       long ofs, struct fncode *fn)
+{
+  if (vclass == vclass_global)
+    ins2(base + vclass, ofs, fn);
+  else
+    ins1(base + vclass, ofs, fn);
+}
+
+void ins_assign(enum variable_class vclass, long ofs, struct fncode *fn)
+{
+  ins_access(op_assign, vclass, ofs, fn);
+}
+
+void ins_recall(enum variable_class vclass, long ofs, struct fncode *fn)
+{
+  ins_access(op_recall, vclass, ofs, fn);
+}
+
+void ins_closure_var(enum variable_class vclass, long ofs, struct fncode *fn)
+{
+  ins_access(op_closure_var, vclass, ofs, fn);
 }
 
 void branch(enum operator abranch, struct label *to, struct fncode *fn)
@@ -287,8 +379,8 @@ void branch(enum operator abranch, struct label *to, struct fncode *fn)
 {
   switch (abranch)
     {
-    case op_branch1: break;
-    case op_branch_nz1: case op_branch_z1: case op_loop1:
+    case op_loop1: case op_branch1: break;
+    case op_branch_nz1: case op_branch_z1:
       adjust_depth(-1, fn);
       break;
     default: abort();
@@ -372,7 +464,7 @@ static bool resolve_offsets(struct fncode *fn)
 	      assert(prev1); assert(prev2);
 	      offset -= 3;
 
-	      if (offset >= INTEGER2_MIN && offset <= INTEGER2_MAX)
+	      if (offset >= INT16_MIN && offset <= INT16_MAX)
 		{
 		  prev1->ins.u = offset >> 8;
 		  prev2->ins.u = offset & 0xff;
@@ -389,7 +481,7 @@ static bool resolve_offsets(struct fncode *fn)
 	      assert(prev1);
 	      offset -= 2;
 
-	      if (offset >= INTEGER1_MIN && offset <= INTEGER1_MAX)
+	      if (offset >= INT8_MIN && offset <= INT8_MAX)
 		prev1->ins.u = offset;
 	      else
 		{
@@ -440,7 +532,7 @@ static struct string *build_lineno_data(struct ilist *ins)
 
   ulong nins = 1;
 
-  uint32_t last_line = UINT32_MAX;
+  int last_line = -1;
   for (struct ilist *i = ins; i; i = i->next)
     if (i->lineno != last_line)
       {
@@ -453,7 +545,7 @@ static struct string *build_lineno_data(struct ilist *ins)
 
   struct lni_state *states = malloc(sizeof *states * nins);
   ulong i = 0;
-  last_line = UINT32_MAX;
+  last_line = -1;
   for (; ins; ins = ins->next)
     if (ins->lineno != last_line)
       {
@@ -479,8 +571,9 @@ struct icode *generate_fncode(struct fncode *fn,
                               struct string *help,
                               struct string *varname,
                               const struct loc *loc,
-                              struct obj *arguments,
-                              unsigned return_typeset,
+                              struct vector *arguments,
+                              bool is_vararg,
+                              typeset_t return_typeset,
                               seclev_t seclev)
 /* Returns: A code structure with the instructions and constants in 'fn'.
    Requires: generate_fncode may only be called on the result of the most
@@ -489,6 +582,8 @@ struct icode *generate_fncode(struct fncode *fn,
      in reverse temporal order)
 */
 {
+  assert(loc->fname->filename != NULL && loc->fname->nicename != NULL);
+
   struct string *lineno_data = NULL;
 
   fn->instructions = reverse_ilist(fn->instructions);
@@ -500,47 +595,44 @@ struct icode *generate_fncode(struct fncode *fn,
        scanins = scanins->next)
     ++sequence_length;
 
-  if (!TYPE(arguments, string))
-    assert(TYPE(arguments, vector));
+  assert(TYPE(arguments, vector));
   assert(immutablep(arguments));
 
-  struct string *mfilename = NULL, *mnicename = NULL;
-  GCPRO(help, varname, mfilename, mnicename, arguments, lineno_data);
+  struct list *mfilenames = NULL;
+  GCPRO(help, varname, mfilenames, arguments, lineno_data);
 
-  mfilename = scache_alloc_str(loc->fname->path);
-  mnicename = scache_alloc_str(loc->fname->nice);
+  mfilenames = scache_alloc_pair(loc->fname->filename, loc->fname->nicename);
 
   lineno_data = build_lineno_data(fn->instructions);
 
   /* Warning: Portability */
   ulong size = (offsetof(struct icode, constants)
-                + fn->cstindex * sizeof(value)
+                + fn->cstindex * sizeof (value)
                 + sequence_length * sizeof (union instruction));
-  bc_length += size;
-  struct icode *gencode = gc_allocate(size);
+  struct icode *gencode = (struct icode *)gc_allocate(size);
   UNGCPRO();
 
   *gencode = (struct icode){
     .code = {
       .o = {
         .size         = size,
-        .garbage_type = garbage_code,
-        .type         = type_code,
+        .garbage_type = garbage_icode,
+        .type         = type_icode,
         .flags        = OBJ_IMMUTABLE, /* code is immutable */
 #ifdef GCDEBUG
         .generation = gencode->code.o.generation,
 #endif
       },
       .varname        = varname,
-      .filename       = mfilename,
-      .nicename       = mnicename,
+      .filenames      = mfilenames,
       .help           = help,
-      .arguments.obj  = arguments,
+      .vararg_alloc   = is_vararg,
+      .arguments      = arguments,
       .linenos        = lineno_data,
       .lineno         = (loc->line > 0 && loc->line <= UINT16_MAX
                          ? loc->line
                          : 1),
-      .column         = (loc->col > 0 && loc->col < P(8)
+      .column         = (loc->col > 0 && loc->col < (int)P(8)
                          ? loc->col
                          : 1),
       .seclevel       = seclev,
@@ -564,7 +656,7 @@ struct icode *generate_fncode(struct fncode *fn,
 
   /* Copy the constants */
   {
-    struct list *csts = fn->csts.obj;
+    struct list *csts = fn->csts.l;
     for (int i = fn->cstindex; i-- > 0; )
       {
         GCCHECK(csts);
@@ -579,30 +671,24 @@ struct icode *generate_fncode(struct fncode *fn,
   /* Jump to interpreter to execute interpreted code - machine specific */
 
 #ifndef NOCOMPILER
-#ifdef __i386__
-  static const struct magic_dispatch magic_dispatch = {
-    .movl_ecx = 0xb9,
-    .invoke   = interpreter_invoke,
-    .jmp_ecx  = { 0xff, 0xe1 },
-    .nop1     = NOP1,
-  };
-  CASSERT_SIZEOF(magic_dispatch, 1 + 4 + 2 + 1);
-#elif defined __x86_64__
+#ifdef __x86_64__
   static const struct magic_dispatch magic_dispatch = {
     .movq_r11 = { 0x49, 0xbb },
-    .invoke   = interpreter_invoke,
+    .invoke   = 0,
     .jmpq_r11 = { 0x41, 0xff, 0xe3 },
     .nop3     = NOP3,
   };
   CASSERT_SIZEOF(magic_dispatch, 2 + 8 + 3 + 3);
+  gencode->magic_dispatch = magic_dispatch;
+  void (*invoke)(void) = interpreter_invoke;
+  memcpy(&gencode->magic_dispatch.invoke, &invoke, sizeof invoke);
 #else
   #error Unsupported architecture
 #endif
-  gencode->magic_dispatch = magic_dispatch;
 #endif
 
 #ifdef GCSTATS
-  gcstats_add_alloc(type_code, MUDLLE_ALIGN(size, sizeof (long)));
+  gcstats_add_alloc(type_icode, MUDLLE_ALIGN(size, sizeof (long)));
 #endif
 
   return gencode;
@@ -614,10 +700,7 @@ struct label *new_label(struct fncode *fn)
 */
 {
   struct label *newp = allocate(fn->memory, sizeof *newp);
-
-  newp->ins = NULL;
-  newp->alias = NULL;
-
+  *newp = (struct label){ .ins = NULL, .alias = NULL };
   return newp;
 }
 
@@ -631,17 +714,20 @@ void set_label(struct label *lab, struct fncode *fn)
   else fn->next_label = lab;
 }
 
-void start_block(const char *name, struct fncode *fn)
+void start_block(const char *name, bool leave_result, struct fncode *fn)
 /* Effects: Starts a block called name (may be NULL), which can be
      exited with exit_block()
 */
 {
-  struct blocks *newp = allocate(fn->memory, sizeof *newp);
+  struct genblock *newp = allocate(fn->memory, sizeof *newp);
 
-  newp->next = fn->blks;
-  newp->name = name;
-  newp->exitlab = new_label(fn);
-  newp->stack_depth = fn->current_depth;
+  *newp = (struct genblock){
+    .next         = fn->blks,
+    .name         = name,
+    .exitlab      = new_label(fn),
+    .stack_depth  = fn->current_depth,
+    .leave_result = leave_result
+  };
 
   fn->blks = newp;
 }
@@ -654,30 +740,30 @@ void end_block(struct fncode *fn)
   fn->blks = fn->blks->next;
 }
 
-int exit_block(const char *name, struct fncode *fn)
-/* Effects: Generates code to exit from specified named block
-     (pop stack, jump to block exit label)
-   Returns: false if the named block doesn't exist
-*/
+/* find block by name 'name' (NULL for no-name loop); '*leave_result' is set to
+   whether this block has a return value; NULL if not found */
+struct genblock *find_block(const char *name, struct fncode *fn,
+                            bool *leave_result)
 {
-  struct blocks *find = fn->blks;
-  int npop;
+  for (struct genblock *find = fn->blks; find != NULL; find = find->next)
+    if (name == NULL
+        ? find->name == NULL
+        : find->name != NULL && strcasecmp(name, find->name) == 0)
+      {
+        *leave_result = find->leave_result;
+        return find;
+      }
+  return NULL;
+}
 
-  for (;;)
-    {
-      if (!find) return false;
-      if (name == NULL)
-	{
-	  if (find->name == NULL) break;
-	}
-      else if (find->name != NULL && strcasecmp(name, find->name) == 0) break;
-      find = find->next;
-    }
-
-  npop = fn->current_depth - find->stack_depth - 1;
+/* pops stack, jumps to 'block' */
+void exit_block(struct genblock *block, struct fncode *fn)
+{
+  int npop = fn->current_depth - block->stack_depth;
+  if (block->leave_result)
+    --npop;
   assert(npop >= 0);
-  if (npop > 0) ins1(op_exit_n, npop, fn);
-  branch(op_branch1, find->exitlab, fn);
-
-  return true;
+  if (npop > 0)
+    ins1(block->leave_result ? op_exit_n : op_exit_discard_n, npop, fn);
+  branch(op_branch1, block->exitlab, fn);
 }

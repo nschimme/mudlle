@@ -23,9 +23,8 @@
 #define OBJENV_H
 
 #include "mvalues.h"
-#include "types.h"
 
-struct env			/* Is a record */
+struct env                      /* Is a record */
 {
   struct obj o;
   value used;         /* # of elements used as opposed to allocated */
@@ -48,9 +47,12 @@ ulong env_grow_and_add_entry(struct env *env, value v);
    Requires: table contain less than 2^30 entries.
 */
 
+/* make room for 'n' items and return a pointer to the first (deepest) */
+void env_make_room(struct env *env, ulong n);
+
 static inline ulong env_add_entry(struct env *env, value v)
 {
-  long used = intval(env->used);
+  ulong used = uintval(env->used);
   if (used >= vector_len(env->values))
     return env_grow_and_add_entry(env, v);
 

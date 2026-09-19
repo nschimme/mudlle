@@ -17,19 +17,23 @@
 ;; along with GNU Emacs; see the file COPYING.  If not, write to
 ;; the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
 
-(cond ((< emacs-major-version 23)
-       (error "Emacs 23 is required by mudlle-mode.el"))
-      ((>= emacs-major-version 24)
-       (require 'cl-lib))
-      (t
-       (require 'cl)
-       (defalias 'cl-case 'case)
-       (defalias 'cl-destructuring-bind 'destructuring-bind)
-       (defalias 'cl-loop 'loop)))
+(when (< emacs-major-version 24)
+  (error "Emacs 24 is required by mudlle-mode.el"))
+
+(unless (require 'cl-lib nil t)
+  ;; cl-lib was added in 24.3; emulate it
+  (require 'cl)
+  (defalias 'cl-case 'case)
+  (defalias 'cl-destructuring-bind 'destructuring-bind)
+  (defalias 'cl-loop 'loop))
 
 (require 'eldoc)
+(require 'font-lock)
 (require 'help-mode)
 (require 'newcomment)
+(require 'rx)
+(eval-and-compile
+  (require 'dabbrev))
 
 (defvar mudlle-mode-abbrev-table nil
   "Abbrev table in use in mudlle-mode buffers.")
@@ -69,10 +73,13 @@
 (defvar mudlle-mode-syntax-table nil
   "Syntax table in use in mudlle-mode buffers.")
 
+(defvar-local mudlle-ftaf-current nil)
+
 (if mudlle-mode-syntax-table
     ()
   (setq mudlle-mode-syntax-table (make-syntax-table))
   (modify-syntax-entry ?\\ "\\" mudlle-mode-syntax-table)
+  (modify-syntax-entry ?\" "_" mudlle-mode-syntax-table)
   (modify-syntax-entry ?/ ". 124b" mudlle-mode-syntax-table)
   (modify-syntax-entry ?\n "> b" mudlle-mode-syntax-table)
   (modify-syntax-entry ?\r "> b" mudlle-mode-syntax-table)
@@ -90,13 +97,37 @@
   (modify-syntax-entry ?& "." mudlle-mode-syntax-table)
   (modify-syntax-entry ?| "." mudlle-mode-syntax-table))
 
+(eval-when-compile
+  (require 'align))
+
+(eval-after-load 'align
+  (lambda ()
+    (add-to-list 'align-rules-list
+                 `(mudlle-comment
+                   (regexp   . "\\(\\s-*\\)\\(//.*\\|/\\*.*\\*/\\s-*\\)$")
+                   (modes    . (quote (mudlle-mode)))
+                   (column   . comment-column)
+                   (valid    . ,(function
+		                 (lambda ()
+		                   (save-excursion
+		                     (goto-char (match-beginning 1))
+		                     (not (bolp))))))))
+    (let ((ops (regexp-opt '("=>" "."
+                             "=" "+=" "-=" "*=" "/=" "%="
+                             "^=" "&=" "|=" "&&=" "^^="
+                             "||=" ">>=" "<<="))))
+      (add-to-list 'align-rules-list
+                   `(mudlle-pattern-match
+                     (regexp . ,(concat "\\(\\s-+\\)" ops))
+                     (modes  . (quote (mudlle-mode))))))))
+
 (defconst mudlle-type-names
-  '("code"   "closure" "variable" "internal"  "primitive" "varargs"
-    "secure" "integer" "string"   "vector"    "pair"      "symbol"
-    "table"  "private" "object"   "character" "gone"      "oport"
-    "mcode"  "float"   "bigint"   "reference" "null"
-    "none"   "any"     "function" "list"
-    "int")
+  '("icode"  "closure"     "variable"   "internal"  "primitive"  "varargs"
+    "secure" "integer"     "string"     "vector"    "pair"       "symbol"
+    "table"  "private"     "object"     "character" "gone"       "oport"
+    "mcode"  "float"       "bigint"     "null"      "connection" "cookie"
+    "file"   "weak_ref"    "regexp"     "none"      "any"        "function"
+    "list"   "bigint_like" "float_like" "false"     "int")
   "The allowed names of mudlle data types.")
 
 (defconst mudlle-type-names-regexp
@@ -119,22 +150,123 @@ Does not contain any submatch groups.")
 (defconst mudlle-anchored-symbol-regexp (concat "\\=" mudlle-symbol-regexp)
   "Regular expression with no submatches matching a mudlle symbol at point.")
 
-(defconst mudlle-partial-string-regexp
-  "\"\\(?:[^\"\\]\\|\\\\.\\|\\\\\n\\)*\\(\"\\)?"
-  "Regular expression matching a possibly partial mudlle string.
-The first submatch group, if present, contains any closing double quote.")
+(eval-and-compile
+  (defconst mudlle-character-constant-regexp
+    (rx not-word-boundary "?"
+        (or (: "\\" (or (: "N{" (+ (any "A-Z" ?- ?\ )) "}")
+                        (: "x" (= 2 (any "0-9" "A-F" "a-f")))
+                        (: (** 1 3 (any "0-7")))
+                        anything))
+            (not (any "(){}[]\"\t\n\v\f\r "))))
+    "Regular expression matching a mudlle character constant."))
+
+(eval-and-compile
+  (defconst mudlle-max-raw-string-hashes
+    256
+    "Max number of #-characters that that be used in a mudlle raw
+string delimeter.")
+
+  (defconst mudlle-partial-string-regexp
+    (let ((raw-hashes (format "#\\{0,%d\\}" mudlle-max-raw-string-hashes)))
+      (rx (or (: (group-n 2 "\"\"\"")     ; triple-quoted
+	         (group-n 3 (? (or (1+ (not (in "\\\"")))
+		                   (: ?\\ anything))
+		               (0+
+		                (0+ (not (in "\\\"")))
+		                (? ?\\ anything)
+		                (? ?\" (? ?\")
+		                   (or (1+ (not (in "\\\"")))
+			               (: ?\\ anything)))
+		                )))
+	         (? (group-n 1 "\"\"\"")))
+              ;; raw string
+              (: (group-n 2 ?r (group-n 4 (regexp raw-hashes)) ?\")
+                 (group-n 3 (minimal-match (0+ anything)))
+                 (or (group-n 1 (: ?\" (backref 4)))
+                     string-end))
+              ;; single-quoted
+	      (: (group-n 2 ?\")
+	         (group-n 3 (0+ (or (1+ (not (in "\"\\\n")))
+		                    (: ?\\ anything))))
+	         (? (group-n 1 ?\")))
+	      )))
+    "Regular expression matching a possibly partial mudlle string.
+The first submatch group, if present, contains any closing delimeter.
+The second submatch group contains the opening delimeter.
+The third submatch group contains the content string."))
+
+(defconst mudlle-anchored-partial-string-regexp
+  (rx-to-string `(: point (regexp ,mudlle-partial-string-regexp)))
+  "Regular expression matching a possibly partial mudlle string starting at
+point.
+The first submatch group, if present, contains any last closing quote.")
+
+(defun mudlle-string-syntax-propertize ()
+  "Put the `syntax-table' and `syntax-multiline' properties on a mudlle string
+as matched by `mudlle-partial-string-regexp'."
+  (let ((beg         (match-beginning 0))
+        (end         (match-end 0))
+        (end-quote   (match-end 1))
+        (payload-beg (match-beginning 3))
+        (payload-end (match-end 3)))
+
+    (if (nth 4 (syntax-ppss beg))
+        ;; inside comment
+        (while (progn (forward-char 1)
+                      (eq (char-after) ?\")))
+      (put-text-property beg (1+ beg) 'syntax-table (string-to-syntax "|"))
+      (when (and payload-beg (eq (char-after beg) ?r))
+        ;; backslashes in raw string are not escapes
+        (goto-char payload-beg)
+        (while (re-search-forward "[\\\\\"]+" payload-end t)
+          (put-text-property (match-beginning 0) (match-end 0) 'syntax-table
+                             (string-to-syntax "_"))))
+      (goto-char end)
+      (when (< beg (line-beginning-position))
+        (put-text-property beg end 'syntax-multiline t))
+      (when end-quote
+        (put-text-property (1- end-quote) end-quote
+                           'syntax-table (string-to-syntax "|"))))))
+
+(defconst mudlle-syntax-propertize-function
+  (syntax-propertize-rules
+   (mudlle-character-constant-regexp
+    (0 (ignore)))
+   (mudlle-partial-string-regexp
+    (0 (ignore (mudlle-string-syntax-propertize))))))
 
 (defconst mudlle-anchored-formal-argument-regexp
   (concat "\\="
-          "\\(" mudlle-typeset-regexp "[[:space:]\n]+\\)?"
+          "\\(" mudlle-typeset-regexp "[[:space:]\n]*\\)?"
 	  "\\(" mudlle-symbol-regexp "\\)")
   "Regular expression matching a mudlle formal argument.
 The first submatch group, if present, contains the data typeset.
 The second submatch group contains the name of the argument.")
 
+(eval-and-compile
+  (defconst mudlle-help-markup-regexp "`\\(.[a-zA-Z0-9_$?!]*\\)"
+    "Regular expression used to find text to be marked up using
+`mudlle-help-highlight-face'. Only subexpression 1 will be
+retained in the final text."))
+
 (defconst mudlle-end-of-line-regexp
   "\\s-*\\(/\\*\\([^*]*\\|\\*[^/]\\)*\\*/\\s-*\\)*\\(//.*\\)?$"
   "Regular expression matching optional comments and then end of line.")
+
+(defun mudlle-forward-expr (limit)
+  "Move point past one mudlle expression, at most until LIMIT."
+  (save-restriction
+    (narrow-to-region (point-min) limit)
+    (condition-case nil
+        (while (progn
+                 (mudlle-skip-comment limit)
+                 (if (looking-at "[,;]")
+                     nil
+		   (let ((old-point (point)))
+                     (forward-sexp)
+		     (> (point) old-point)))))
+      (:success (< (point) limit))
+      (scan-error nil))))
 
 (defun mudlle-skip-comment (limit)
   "Move point past all comments, at most until LIMIT."
@@ -155,45 +287,296 @@ typically for `mudlle-typeset-regexp'."
             (font-lock-apply-highlight
              '(0 font-lock-type-face nil t))))))))
 
-(defun mudlle-fontiy-complex-argument (limit)
+(defun mudlle-fontify-complex-argument (limit)
   "Fontifies one complex argument component starting at point, until LIMIT."
   (mudlle-skip-comment limit)
   (cond ((re-search-forward "\\=,\\s-*" limit t)
          (cond ((looking-at "(")
                 (forward-sexp)
                 t)
-               ((re-search-forward mudlle-symbol-regexp limit t)
+               ((re-search-forward mudlle-anchored-symbol-regexp limit t)
                 t)))
+        ((looking-at "_")
+         (when (< (point) limit)
+           (forward-char))
+         t)
         ((looking-at "[[({]")
          (let ((end (save-excursion (forward-sexp) (point))))
            (when (<= end limit)
              (forward-char)
              (setq end (1- end))
              (while (< (point) end)
-               (mudlle-fontiy-complex-argument end))
+               (mudlle-fontify-complex-argument end))
              (when (= (point) end)
                (forward-char)
                t))))
+        ((re-search-forward "\\=<" limit t)
+         (and (mudlle-fontify-complex-argument limit)
+              (mudlle-skip-comment limit)
+              (re-search-forward "\\=\\s-*=\\s-*" limit t)
+              (mudlle-fontify-complex-argument limit)
+              (mudlle-skip-comment limit)
+              (re-search-forward "\\=>" limit t)))
         ((re-search-forward mudlle-anchored-symbol-regexp limit t)
 	 (font-lock-apply-highlight
-	  '(0 font-lock-variable-name-face)))
-        ((re-search-forward "\\S-+" limit t))))
+	  '(0 font-lock-variable-name-face))
+         t)
+        ((re-search-forward mudlle-anchored-partial-string-regexp limit t)
+         (match-beginning 1))
+        ((re-search-forward "\\=\\S-+" limit t))))
+
+(defun mudlle-extract-strings-at-point ()
+  "Deletes the mudlle string, or sequence of concatenated strings, at point.
+and returns them as (list STRING MODE OPEN-DELIM END-DELIM).
+Leaves point at the beginning of the first string."
+  (let ((parse-state (parse-partial-sexp (save-excursion
+                                           (mudlle-beginning-of-defun)
+                                           (point))
+                                         (point)))
+        dst strings last last-word)
+    (undo-boundary)
+    (if (nth 3 parse-state)
+        ;; beginning of string
+        (goto-char (nth 8 parse-state))
+      (re-search-forward "\\=\\s-*" nil t))
+
+    (setq dst (point))
+    (cl-loop while (re-search-forward
+                    mudlle-anchored-partial-string-regexp nil t)
+             do (setq last (match-end 0))
+             unless (match-beginning 1) do (error "No string at point") end
+             collect
+             (let* ((this (match-string-no-properties 3))
+                    (open-delim (or (match-string-no-properties 2)
+                                    (error "Internal error")))
+                    (end-delim  (or (match-string-no-properties 1)
+                                    (error "Internal error")))
+                    (mode (cond ((string-equal "\"" open-delim) :single)
+                                ((string-equal "\"\"\"" open-delim) :triple)
+                                ((string-match "\\`r#*\"\\'" open-delim) :raw)
+                                (t (error "Internal error")))))
+               (mudlle-skip-comment (point-max))
+               (list this mode open-delim end-delim))
+             until (not (when (eq (char-after) ?+)
+                          (forward-char)
+                          (mudlle-skip-comment (point-max))
+                          t))
+             finally do
+             (unless last
+               (error "No string at point"))
+             (mudlle-skip-comment (point-max))
+             (delete-region dst last)
+             (goto-char dst))))
+
+(defun mudlle-string-to-triple-quote ()
+  "Convert the string at point to a canonical triple-quoted string."
+  (interactive)
+  (let ((orig-pos (point))
+        (strings  (mudlle-extract-strings-at-point))
+        (dst      (point))
+        last-word)
+    (setq orig-pos (- orig-pos (point)))
+
+    (insert "\"\"\"")
+    (cl-destructuring-bind (str mode open-delim end-delim)
+        (car strings)
+      (setq orig-pos (max 0 (- orig-pos (length open-delim))))
+      ;; retain any leading backslash-newline
+      (when (string-match "\\`\\\\\n" str)
+        (insert "\\\n")))
+
+    (setq last-word (point))
+    (cl-loop
+     for (this mode open-delim close-delim) in strings do
+     (cl-loop
+      with next-nquote = 2
+      with nquote = nil
+      for i from 0 to (1- (length this)) do
+      (when (and last-word (>= (current-column) 79))
+        (let ((p (set-marker (make-marker) (point))))
+          (goto-char last-word)
+          (insert "\\\n")
+          (goto-char p)
+          (set-marker p nil)
+          (setq last-word nil
+                next-nquote 0)))
+
+      (setq nquote next-nquote
+            next-nquote 0)
+
+      ;; not perfect but will land us close enough
+      (when (>= i orig-pos)
+        (setq dst      (point-marker)
+              orig-pos most-positive-fixnum))
+
+      (let ((c (elt this i)) n)
+        (if (and (not (eq c ?\")) (eq mode :raw))
+            (insert
+             (cl-case c
+               (?\a "\\a")
+               (?\b "\\b")
+               (?\f "\\f")
+               (?\n c)
+               (?\r "\\r")
+               (?\t "\\t")
+               (?\v "\\v")
+               (?\\ "\\\\")
+               (t (if (string-equal (get-char-code-property
+                                     c 'general-category)
+                                    "Cc")
+                      (format "\\%03o" c)
+                    c))))
+          (cl-case c
+            (?\  (setq last-word (point))
+                 (while (progn (insert ?\ )
+                               (and (< (1+ i) (length this))
+                                    (= (elt this (1+ i)) ?\ )))
+                   (setq i (1+ i))))
+            (?\\ (cl-case (setq n (elt this (1+ i)))
+                   (?\n (setq i (1+ i)))
+                   (?n (setq i (1+ i))
+                       (insert ?\n))
+                   (?N (when (string-match "\\\\N\\(?:{[^}]*}\\)?" this i)
+                         (insert (match-string 0 this))
+                         (setq i (1- (match-end 0)))))
+                   (?\" (setq next-nquote nquote))
+                   (t (insert c n)
+                      (setq i (1+ i)))))
+            (?\" (setq next-nquote (1+ nquote))
+                 (when (or (= nquote 2)
+                           (= (1+ i) (length this)))
+                   (insert ?\\)
+                   (setq next-nquote 0))
+                 (insert ?\"))
+            (t (insert c)))))))
+
+    (when (> (current-column) 76)
+      (unless last-word
+        (setq last-word (point)))
+      (let ((p (set-marker (make-marker) (point))))
+        (goto-char last-word)
+        (insert "\\\n")
+        (goto-char p)
+        (set-marker p nil)))
+
+    (insert "\"\"\"")
+    (goto-char dst)))
+
+(defun mudlle-string-to-raw ()
+  "Convert the string at point to a raw string."
+  (interactive)
+  (let* ((orig-pos (point))
+         (strings  (mudlle-extract-strings-at-point))
+         (dst      (point))
+         (hashes   0))
+    (setq orig-pos (- orig-pos (point)))
+
+    (cl-destructuring-bind (str mode open-delim end-delim)
+        (car strings)
+      (setq orig-pos (max 0 (- orig-pos (length open-delim)))))
+
+    (let ((pos  0)
+          (text (apply #'concat (mapcar #'car strings))))
+      (while (string-match "\"#*" text pos)
+        (setq pos (match-end 0))
+        (let ((len (- pos (match-beginning 0))))
+          (when (> len hashes)
+            (setq hashes len)))))
+
+    (when (> hashes 256)
+      (error "String cannot be represented as a raw string"))
+
+    (insert ?r)
+    (insert-char ?\# hashes)
+    (insert ?\")
+
+    (cl-loop
+     for (this mode open-delim close-delim) in strings do
+     (if (eq mode :raw)
+         (progn
+           (when (<= orig-pos (length this))
+             (setq dst      (+ (point) orig-pos)
+                   orig-pos most-positive-fixnum))
+           (insert this))
+
+       (cl-loop
+        for i from 0 to (1- (length this)) do
+
+        ;; not perfect but will land us close enough
+        (when (>= i orig-pos)
+          (setq dst      (point-marker)
+                orig-pos most-positive-fixnum))
+
+        (let ((c (elt this i)))
+          (if (not (eq c ?\\))
+              (insert c)
+            (let ((n (elt this (setq i (1+ i)))))
+              (cl-case n
+                (?\n)                ; do nothing
+                (?a (insert "\a"))
+                (?b (insert "\b"))
+                (?f (insert "\f"))
+                (?n (insert "\n"))
+                (?r (insert "\r"))
+                (?t (insert "\t"))
+                (?v (insert "\v"))
+                (?\\ (insert "\\"))
+                (?\" (insert "\""))
+                (?x (if (and (eq (string-match "x\\([[:xdigit:]]\\{2\\}\\)?"
+                                               this i)
+                                 i)
+                             (match-beginning 1))
+                        (progn
+                          (insert (read (concat "?\\x" (match-string 1 this))))
+                          (setq i (+ i 2)))
+                      (insert "\\x")))
+                (?N (let (n)
+                      (if (and (eq (string-match "N\\(?:{\\([^}]*\\)}\\)?"
+                                                 this i)
+                                   i)
+                               (setq n (match-string 1 this))
+                               (setq n (char-from-name n)))
+                          (progn
+                            (insert n)
+                            (setq i (1- (match-end 0))))
+                        (insert "\\N"))))
+                ((?0 ?1 ?2 ?3 ?4 ?5 ?6 ?7)
+                 (unless (eq (string-match "[0-7]\\{1,3\\}" this i) i)
+                   (error "Internal error"))
+                 (insert (read (concat "?\\" (match-string 0 this))))
+                 (setq i (1- (match-end 0))))
+                (t (insert ?\\ n)))))))))
+
+    (insert ?\")
+    (insert-char ?\# hashes)
+    (goto-char dst)))
+
+(defun mudlle-fontify-doc-string ()
+  "Fontify the mudlle documentation string that just matched
+`mudlle-anchored-partial-string-regexp'."
+  (let ((string-end (point)))
+    (goto-char (match-beginning 0))
+    (while (re-search-forward mudlle-help-markup-regexp string-end 'limit)
+      (font-lock-apply-highlight '(1 font-lock-constant-face prepend)))))
 
 (defun mudlle-fontify-defun (limit)
   "Fontifies the mudlle function starting at point, which must be
 right after the \"fn\" keyword, until LIMIT."
   (mudlle-skip-comment limit)
-  (when (re-search-forward (concat "\\=" mudlle-partial-string-regexp)
+  (when (re-search-forward mudlle-anchored-partial-string-regexp
                            limit t)
-    (while (and (match-beginning 1) ; end double quote
+    (while (and (prog1 (match-beginning 1)     ; last double quote
+                  (mudlle-fontify-doc-string))
 		(mudlle-skip-comment limit)
 		(eq (char-after) ?+))
 		(progn
 		  (forward-char)
 		  (mudlle-skip-comment limit)
-		  (re-search-forward
-		   (concat "\\=" mudlle-partial-string-regexp)
-		   limit t))))
+		  (when (re-search-forward
+                         mudlle-anchored-partial-string-regexp
+                         limit t)
+                    (mudlle-fontify-doc-string)
+                    t))))
   (mudlle-skip-comment limit)
   (cond ((re-search-forward mudlle-anchored-symbol-regexp limit t)
 	 (font-lock-apply-highlight
@@ -209,17 +592,23 @@ right after the \"fn\" keyword, until LIMIT."
                                '(2 font-lock-variable-name-face))
                               t)
                              ((re-search-forward "\\=\\s-*@\\s-*" limit t)
-                              (mudlle-fontiy-complex-argument limit)))
+                              (mudlle-fontify-complex-argument limit)))
                        (mudlle-skip-comment limit)
+                       (cond ((eq (char-after) ?=)
+                              (and (< (point) limit)
+                                   (or (forward-char) t)
+                                   (mudlle-forward-expr limit)
+                                   (mudlle-skip-comment limit)))
+                             (t))
                        (eq (char-after) ?,)
+                       (< (point) limit)
                        (or (forward-char) t)))
            ))))
 
 (defconst mudlle-defun-regexp
   (concat "\\(?:\\(" mudlle-symbol-regexp "\\)[[:space:]\n]*"
-	  "=[[:space:]\n]*"
+	  "=[[:space:]\n]*\\)?"
 	  "\\(" mudlle-typeset-regexp "[[:space:]\n]*\\)?"
-	  "\\)?"
 	  "\\<fn\\>")
   "Regular expression matching a mudlle function, ending after the \"fn\"
 keyword.
@@ -273,15 +662,15 @@ that should be indented at the beginning of the line. Its first
 parenthesized expression is the keyword.")
 
 (defconst mudlle-font-lock-keywords
-  (let ((kw (regexp-opt '("#arith" "fn" "if" "else" "while" "for"
-                          "exit" "loop" "match" "match!") 'symbols)))
-    `(,kw
-      (,mudlle-bol-keyword-regexp . 1)
-      (mudlle-fontify-local-vars)
-      (,(concat "<[[:space:]\n]*\\(" mudlle-symbol-regexp "\\)[[:space:]\n]*>")
-       (1 font-lock-constant-face))
-      (mudlle-fontify-defuns)
-    ))
+  `(,(regexp-opt '("#arith" "fn" "if" "else" "while" "for"
+                   "exit" "loop" "match" "match!")
+                 'symbols)
+    (,mudlle-bol-keyword-regexp . 1)
+    (,mudlle-character-constant-regexp . font-lock-string-face)
+    (mudlle-fontify-local-vars)
+    (,(concat "<[[:space:]\n]*\\(" mudlle-symbol-regexp "\\)[[:space:]\n]*>")
+     (1 font-lock-constant-face))
+    (mudlle-fontify-defuns))
   "Settings for `font-lock-defaults' in `mudlle-mode'.")
 
 (defgroup mudlle nil "Major mode for mudlle."
@@ -292,11 +681,6 @@ parenthesized expression is the keyword.")
   "Face used by `mudlle-help' to highlight variable names."
   :group 'mudlle
   :type 'face)
-
-(defconst mudlle-help-markup-regexp "`\\(.[a-zA-Z0-9_$?!]*\\)"
-  "Regular expression used to find text to be marked up using
-`mudlle-help-highlight-face'. Only subexpression 1 will be
-retained in the final text.")
 
 (defcustom mudlle-source-path nil
   "Top directory of mudlle source tree."
@@ -360,13 +744,11 @@ alist with mudlle documentation."
   :type 'hook
   :group 'mudlle)
 
-(defun mudlle-mode ()
+(define-derived-mode mudlle-mode prog-mode
+  "mudlle"
   "Major mode for editing mudlle code.
-Expression and list commands understand all mudlle brackets.
-Tab indents for mudlle code.
-Comments are delimited with // and end of line.
-Paragraphs are separated by blank lines only.
-Delete converts tabs to spaces as it moves back.
+
+The hook `mudlle-mode-hook' is run with no args at mode initialization.
 \\{mudlle-mode-map}
 Variables controlling indentation style:
  `mudlle-tab-always-indent'
@@ -393,43 +775,37 @@ Variables controlling indentation style:
  `mudlle-argdecl-indent'
     Indentation level of declarations of mudlle function arguments.
  `mudlle-function-data-file'
-    Data file of mudlle functions.
-
-Turning on mudlle mode calls the value of the variable mudlle-mode-hook
-with no args, if that value is non-nil."
-  (interactive)
-  (kill-all-local-variables)
+    Data file of mudlle functions."
+  :group 'mudlle
   (use-local-map mudlle-mode-map)
-  (setq major-mode 'mudlle-mode)
-  (setq mode-name "mudlle")
-  (setq local-abbrev-table mudlle-mode-abbrev-table)
   (set-syntax-table mudlle-mode-syntax-table)
-  (set (make-local-variable 'paragraph-start)
-       (concat "\\[$\\|\f\\|[ \t]*\\(?:"
-               (regexp-opt mudlle-header-keywords) "\\)"))
-  (set (make-local-variable 'eldoc-documentation-function)
-       'mudlle-eldoc-function)
-  (set (make-local-variable 'paragraph-separate) "[ \t]*$")
-  (set (make-local-variable 'paragraph-ignore-fill-prefix) t)
-  (set (make-local-variable 'indent-line-function) 'mudlle-indent-line)
-  (set (make-local-variable 'require-final-newline) t)
-  (set (make-local-variable 'comment-start) "// ")
-  (set (make-local-variable 'comment-end) "")
-  (set (make-local-variable 'comment-column) 32)
-  (set (make-local-variable 'comment-start-skip) "// *")
-  (set (make-local-variable 'comment-indent-function) 'mudlle-comment-indent)
-  (set (make-local-variable 'dabbrev-abbrev-skip-leading-regexp) "!")
-  (set (make-local-variable 'font-lock-defaults)
-       '(mudlle-font-lock-keywords
-	 nil
-	 case-fold
-	 ((?_ . "w"))
-	 mudlle-beginning-of-defun
-	 (font-lock-multiline . t)))
-  (set (make-local-variable 'parse-sexp-ignore-comments) t)
-  (set (make-local-variable 'beginning-of-defun-function)
-       'mudlle-beginning-of-defun)
-  (set (make-local-variable 'compilation-error-screen-columns) nil)
+  (setq-local paragraph-start (concat "\\[$\\|\f\\|[ \t]*\\(?:"
+                                      (regexp-opt mudlle-header-keywords)
+                                      "\\)")
+              eldoc-documentation-function 'mudlle-eldoc-function
+              paragraph-separate "[ \t]*$"
+              paragraph-ignore-fill-prefix t
+              indent-line-function 'mudlle-indent-line
+              require-final-newline t
+              comment-start "// "
+              comment-end ""
+              comment-column 32
+              comment-start-skip "// *"
+              comment-indent-function 'mudlle-comment-indent
+              dabbrev-abbrev-skip-leading-regexp "!"
+              syntax-propertize-function
+              mudlle-syntax-propertize-function
+              syntax-propertize-extend-region-functions
+              '(syntax-propertize-wholelines syntax-propertize-multiline)
+              font-lock-defaults '(mudlle-font-lock-keywords
+	                           nil
+	                           case-fold
+	                           ((?_ . "w"))
+	                           mudlle-beginning-of-defun
+	                           (font-lock-multiline . t))
+              parse-sexp-ignore-comments t
+              beginning-of-defun-function 'mudlle-beginning-of-defun
+              compilation-error-screen-columns nil)
   (run-hooks 'mudlle-mode-hook))
 
 ;; This is used by indent-for-comment
@@ -573,12 +949,13 @@ Returns nil if line starts inside a string, t if in a comment."
     (let ((indent-point (point))
 	  (case-fold-search nil)
 	  state
-	  containing-sexp)
-      (goto-char (or parse-start (point-min)))
+	  containing-sexp
+          (parse-start (or parse-start (point-min))))
+      (goto-char parse-start)
       (while (< (point) indent-point)
 	(setq parse-start     (point)
-              state           (parse-partial-sexp (point) indent-point 0))
-        (setq containing-sexp (cadr state)))
+              state           (parse-partial-sexp parse-start indent-point 0)
+              containing-sexp (cadr state)))
 
       (when (and containing-sexp
 		 (= (char-after containing-sexp) ?\[))
@@ -605,7 +982,7 @@ Returns nil if line starts inside a string, t if in a comment."
 	     (skip-syntax-forward "-")
 	     (if (= (following-char) ?\[)
 		 0   ; Unless it starts a function body
-	       (mudlle-backward-to-noncomment (or parse-start (point-min)))
+	       (mudlle-backward-to-noncomment parse-start)
 	       ;; Add a little if this is a continuation line.
 	       (if (or (bobp)
 		       (memq (preceding-char) '(?\) ?\; ?\])))
@@ -726,12 +1103,19 @@ Returns nil if line starts inside a string, t if in a comment."
   (if (= (preceding-char) ?\))
       (forward-sexp -1))
   (forward-line 0)
+
+  (let ((ppss (syntax-ppss)))
+    (while (nth 3 ppss)
+      (goto-char (nth 8 ppss))
+      (forward-line 0)
+      (setq ppss (syntax-ppss))))
+
   (if (<= (point) lim)
       (goto-char (1+ lim)))
   (skip-syntax-forward "-"))
 
 (defun mudlle-backward-to-start-of-if (&optional limit)
-  "Move to the start of the last ``unbalanced'' if."
+  "Move to the start of the last unbalanced \"if\"."
   (unless limit (setq limit (point-min)))
   (let ((if-level 1)
         (case-fold-search nil))
@@ -748,7 +1132,17 @@ Returns nil if line starts inside a string, t if in a comment."
 (defvar mudlle-functions nil
   "An alist or hash table with the help text on mudlle functions.
 Typically set by loading the file specified by `mudlle-function-data-file'.
-The function `mudlle-functions' will convert it to an alist if necessary.")
+The function `mudlle-functions' will convert it to an alist if necessary.
+
+Each entry is a (NAME DOC TYPE FILE LINE COLUMN LIBRARY &optional SECLEV)
+  NAME     name of the symbol, a string
+  DOC      documentation string
+  TYPE     type symbol; one of closure, primitive, secure, varargs, or variable
+  FILE     file name or nil
+  LINE     line number or nil
+  COLUMN   column number or nil
+  LIBRARY  name of the defining mudlle library or t for built-ins
+  SECLEV   security level; it is only present for type secure.")
 (when mudlle-function-data-file
   (load mudlle-function-data-file t))
 
@@ -768,12 +1162,13 @@ The function `mudlle-functions' will convert it to an alist if necessary.")
 
 Updates the variable `mudlle-functions' from an alist to a hash table if
 necessary."
-  (unless (hash-table-p mudlle-functions)
-    (let ((a mudlle-functions))
-      (setq mudlle-functions (make-hash-table :test 'mudlle-symbol-hash-test))
-      (cl-loop for entry in a do
-               (puthash (car entry) entry mudlle-functions))))
-  mudlle-functions)
+  (if (hash-table-p mudlle-functions)
+      mudlle-functions
+    (let ((h (make-hash-table :test 'mudlle-symbol-hash-test
+                              :size (safe-length mudlle-functions))))
+      (cl-loop for entry in mudlle-functions do
+               (puthash (car entry) entry h))
+      (setq mudlle-functions h))))
 
 (defun mudlle-find-symbol-start (&optional at-point)
   "Return the starting position of the symbol starting at or closest before
@@ -796,7 +1191,7 @@ point. If AT-POINT is non-nil, only consider symbols ending on or after point."
   (let* ((end (point))
          (beg (or (mudlle-find-symbol-start)
                   (error "Nothing to complete")))
-         (pattern (buffer-substring beg end))
+         (pattern (buffer-substring-no-properties beg end))
          (completion-ignore-case t)
          (completion (try-completion pattern (mudlle-functions))))
     (cond ((eq completion t))
@@ -836,6 +1231,7 @@ point. If AT-POINT is non-nil, only consider symbols ending on or after point."
 \\{mudlle-apropos-mode-map}")
 
 (defun mudlle-apropos-follow ()
+  "Follow cross-reference at point."
   (interactive)
   (save-excursion
     (forward-line 0)
@@ -866,8 +1262,8 @@ point. If AT-POINT is non-nil, only consider symbols ending on or after point."
 and ah:seclev to the fields in AHELP and execute BODY."
   (declare (indent 1) (debug t))
   `(cl-destructuring-bind
-       (ah:name ah:help ah:type
-                &optional ah:file ah:line ah:column ah:library ah:seclev)
+       (ah:name ah:help ah:type ah:file ah:line ah:column ah:library
+                &optional ah:seclev)
       ,ahelp
     ,@body))
 
@@ -925,40 +1321,54 @@ LINE can also be a string of a symbol definition to find."
                                     nil t))))
          (goto-char (match-beginning 0)))))
 
-(if (< emacs-major-version 22)
+(eval-and-compile
+  (if (< emacs-major-version 22)
+      (defun mudlle-find-file-button (path file line column)
+	(help-xref-button 0 'mudlle-find-pos
+			  (list path file line column)))
+
     (defun mudlle-find-file-button (path file line column)
       (help-xref-button 0 'mudlle-find-pos
-                        (list path file line column)))
+			path file line column))
 
-  (defun mudlle-find-file-button (path file line column)
-    (help-xref-button 0 'mudlle-find-pos
-                      path file line column))
+    (define-button-type 'mudlle-find-pos
+      :supertype 'help-xref
+      'help-function 'mudlle-find-pos)
 
-  (define-button-type 'mudlle-find-pos
-    :supertype 'help-xref
-    'help-function 'mudlle-find-pos)
+    (define-button-type 'mudlle-help
+      :supertype 'help-xref
+      'help-function 'mudlle-help)
 
-  (define-button-type 'mudlle-help
-    :supertype 'help-xref
-    'help-function 'mudlle-help)
-
-  (define-button-type 'mudlle-apropos
-    :supertype 'help-xref
-    'help-function 'mudlle-apropos))
+    (define-button-type 'mudlle-apropos
+      :supertype 'help-xref
+      'help-function 'mudlle-apropos)))
 
 (defun mudlle-symbol-at-point (&optional at-point)
   "Return the name of the symbol starting closest before point.
 If AT-POINT is non-nil, only conside symbols ending on or after point."
-  (let ((beg (mudlle-find-symbol-start at-point)))
+  (let ((beg (mudlle-find-symbol-start at-point))
+        (old-point (point)))
     (when beg
-      (save-excursion
-        (goto-char beg)
-        (when (looking-at mudlle-symbol-regexp)
-          (match-string-no-properties 0))))))
+      (goto-char beg)
+      (prog1
+          (when (looking-at mudlle-symbol-regexp)
+            (match-string-no-properties 0))
+        (goto-char old-point)))))
+
+(defconst mudlle-help-abbrev-regexp
+  "\\(\\(?:\\<\\(?:[Cc]f\\|[Ii]\\.?e\\|[Ee]\\.?g\\)\\.\\),?\\) ")
+
+(defun mudlle-help-string (help-text)
+  (cond ((stringp help-text)
+         (replace-regexp-in-string mudlle-help-abbrev-regexp
+                                   (concat "\\1" `[ ,mudlle-nbsp ])
+                                   help-text))
+        ((not help-text) "No help text.")
+        (t (format "%s" help-text))))
 
 (defun mudlle-help-print (ahelp)
   (let ((path mudlle-c-source-path)
-        line file)
+        column line file)
     (mudlle-ahelp-bind ahelp
       (setq column ah:column
             line   ah:line
@@ -1008,12 +1418,7 @@ If AT-POINT is non-nil, only conside symbols ending on or after point."
       (princ "\n\n")
 
       (let ((start (point)))
-        (cond ((stringp ah:help)
-               (insert ah:help))
-              ((not ah:help)
-               (insert "No help text."))
-              (t
-               (princ ah:help)))
+        (insert (mudlle-help-string ah:help))
         (goto-char start)))
     )
   )
@@ -1032,17 +1437,24 @@ If AT-POINT is non-nil, only conside symbols ending on or after point."
 
         (cond ((gethash text (mudlle-functions))
                (help-insert-xref-button text 'mudlle-help text))
-              ((let ((case-fold-search t))
-                 (when (string-match "\\`\\(.*\\)xxx\\'" text)
-                   (let ((prefix (match-string 1 text)))
+              ((let ((case-fold-search t) is-prefix)
+                 (when (cond ((string-match "\\`\\(.*\\)xxx\\'" text)
+                              (setq is-prefix t))
+                             ((string-match "\\`xxx\\(.*\\)\\'" text)))
+                   (let ((substr (match-string 1 text)))
                      (when (cl-loop for name being the hash-keys
                                     of (mudlle-functions)
-                                    thereis (string-prefix-p prefix name t))
+                                    thereis (funcall (if is-prefix
+                                                         #'string-prefix-p
+                                                       #'string-suffix-p)
+                                                     substr name t))
                        (help-insert-xref-button
                         text
                         'mudlle-apropos
-                        (concat "\\`" (regexp-quote prefix))
-                        t))))))
+                        (concat (when is-prefix "\\`")
+                                (regexp-quote substr)
+                                (unless is-prefix "\\'")))
+                       t)))))
               (t (insert text)
                  (put-text-property start (point)
                                     'face mudlle-help-highlight-face)))))
@@ -1097,13 +1509,16 @@ If AT-POINT is non-nil, only conside symbols ending on or after point."
          (ahelp (and sym (gethash sym (mudlle-functions)))))
     (when ahelp
       (mudlle-ahelp-bind ahelp
-        (let ((text (concat ah:name ": "
-                            (cond ((stringp ah:help) ah:help)
-                                  ((not ah:help) "No help text.")
-                                  (t (format "%s" ah:help))))))
+        (let ((text (mudlle-help-string ah:help)))
+          ;; remove any leading "Alias for ..." line
+          (when (string-match "\\`Alias for \\(?:local function \\)?\\S-*\n"
+                              text)
+            (setq text (substring text (match-end 0))))
           ;; only show one line
           (when (string-match "\n" text)
             (setq text (substring text 0 (match-beginning 0))))
+
+          (setq text (concat ah:name ": " text))
 
           (let ((start 0)
                 (width (window-width (minibuffer-window)))
@@ -1161,7 +1576,8 @@ If AT-POINT is non-nil, only conside symbols ending on or after point."
           (buf (get-buffer "*Mudlle help*")))
       (when buf
         (with-current-buffer buf
-          (help-setup-xref (list 'mudlle-help keyword) (interactive-p)))))
+          (help-setup-xref (list 'mudlle-help keyword)
+                           (called-interactively-p 'interactive)))))
 
     (with-output-to-temp-buffer "*Mudlle help*"
       (set-buffer standard-output)
@@ -1270,7 +1686,7 @@ If AT-POINT is non-nil, only conside symbols ending on or after point."
 	      ;; Compute the standard indent for this level.
 	      (let ((val (calculate-mudlle-indent
                           (if (car indent-stack)
-			       (- (car indent-stack))))))
+			      (- (car indent-stack))))))
 		(setcar indent-stack (setq this-indent val))))
 	    ;; Adjust line indentation according to its contents
 	    (when (= (following-char) ?\])
@@ -1290,5 +1706,78 @@ If AT-POINT is non-nil, only conside symbols ending on or after point."
                 (indent-for-comment)
                 (forward-line 0)))
 	    ))))))
+
+(defconst mudlle-ftaf-ansi-alist
+  '((black   . 30)
+    (red     . 31)
+    (green   . 32)
+    (yellow  . 33)
+    (blue    . 34)
+    (magenta . 35)
+    (cyan    . 36)
+    (white   . 37))
+  "Association-list mapping ANSI color to ANSI escape code for use in
+`mudlle-fontify-to-ansi-file'.")
+
+(defconst mudlle-ftaf-color-alist
+  '((font-lock-comment-delimiter-face . red)
+    (font-lock-comment-face           . red)
+    (font-lock-constant-face          . magenta)
+    (font-lock-function-name-face     . blue)
+    (font-lock-keyword-face           . cyan)
+    (font-lock-string-face            . green)
+    (font-lock-type-face              . green)
+    (font-lock-variable-name-face     . yellow)
+    ((font-lock-constant-face font-lock-string-face) . magenta))
+  "Association-list mapping face to ANSI color for use in
+`mudlle-fontify-to-ansi-file'.")
+
+(defun mudlle-ftaf-print-face-transition (from to)
+  "Print, to `standard-output', ANSI escape sequences to transition from
+face FROM to face TO."
+  (unless (eq from to)
+    (let* ((color (assoc to mudlle-ftaf-color-alist))
+	   (ansi  (and color (assq (cdr color) mudlle-ftaf-ansi-alist)))
+	   (old   mudlle-ftaf-current))
+      (cond ((eq old ansi))
+	    ((and old (not ansi))
+	     (princ "\033[0m"))
+	    (t
+	     (princ "\033[")
+	     (princ (int-to-string (cdr ansi)))
+	     (princ "m")))
+      (setq mudlle-ftaf-current ansi))))
+
+(defun mudlle-fontify-to-ansi-file (dst)
+  "Save the current buffer to the file DST with ANSI escape codes
+according to fontification."
+  (interactive "FWrite file:")
+  (save-excursion
+    (let ((src (current-buffer)))
+      (with-temp-file dst
+        (let ((dstbuf (current-buffer)))
+          (with-current-buffer src
+	    (setq mudlle-ftaf-current nil)
+            (let ((standard-output dstbuf))
+
+              (if (or (< emacs-major-version 25)
+                      (and (= emacs-major-version 25)
+                           (< emacs-minor-version 1)))
+                  (with-no-warnings (font-lock-fontify-buffer))
+                (font-lock-ensure (point-min) (point-max)))
+
+              (goto-char (point-min))
+              (let ((face (get-text-property (point) 'face)))
+                (mudlle-ftaf-print-face-transition nil face)
+                (while (< (point) (point-max))
+                  (let ((next (next-single-property-change (point) 'face
+                                                           (current-buffer)
+                                                           (point-max))))
+                    (princ (buffer-substring-no-properties (point) next))
+                    (goto-char next)
+                    (let ((nface (get-text-property (point) 'face)))
+                      (mudlle-ftaf-print-face-transition face nface)
+                      (setq face nface))))
+                (mudlle-ftaf-print-face-transition face nil)))))))))
 
 (provide 'mudlle-mode)

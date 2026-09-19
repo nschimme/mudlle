@@ -28,66 +28,76 @@ writes mc:verbose, mc:erred, mc:this_module, mc:disassemble
   mc:verbose = 2; // default verbosity level
   mc:disassemble = false;
 
-  mc:compile = fn (mod, protect, int seclev)
+  | do_compile |
+  do_compile = fn (mod, protect, seclev, global_syms)
     [
-      if (!mod) exit<function> false;
-
-      if (mc:disassemble && mc:verbose < 1)
+      if (mc:verbose >= 1)
         [
-          mc:reset_closure_count();
-          mc:reset_ins_count();
+          display("PHASE1\n");
         ];
+      mc:phase1(mod, seclev, global_syms);
+      if (mc:erred) exit<function> false;
+
+      if (global_syms != null)
+        exit<function> false;
+
+      if (mc:verbose >= 1)
+        display("PHASE2\n");
+      mc:phase2(mod);
+      if (mc:erred) exit<function> false;
+
+      if (mc:verbose >= 4)
+        [
+          mc:ins_list(mod[mc:m_body]);
+          newline();
+        ];
+
+      | fns |
+      fns = mc:all_functions(mod[mc:m_body]);
+
+      if (mc:verbose >= 1)
+        [
+          display("PHASE3\n");
+        ];
+      mc:phase3(fns);
+
+      | remaining_fns |
+      remaining_fns = mc:all_functions(mod[mc:m_body]);
+      fns = lfilter!(fn (f) lfind?(f, remaining_fns), fns);
+
+      if (mc:verbose >= 1)
+        [
+          display("PHASE4\n");
+        ];
+      mc:phase4(fns);
+
+      mc:prelink(mod, protect)
+    ];
+
+  // if 'global_syms' is a dihash, stop after parsing and add global
+  // symbol usage to it; see gsym_use() in phase1.mud
+  mc:compile = fn (vector mod, protect, int seclev, function get_source,
+                   {vector,null} global_syms = null)
+    [
+      if (!callable?(get_source, 1))
+        error(error_bad_value);
+
+      mc:reset_closure_count();
+      mc:reset_ins_count();
+      mc:reset_var_count();
 
       mc:erred = false;
       mc:this_module = mod;
 
-      mc:sort_messages(true);
+      mc:handle_messages(get_source);
 
       | result |
-      result = false;
+      result = trap_error(
+        fn () do_compile(mod, protect, seclev, global_syms),
+        fn (n) false,
+        call_trace_on, null);
 
-      <erred> [
-        if (mc:verbose >= 1)
-          [
-            display("PHASE1\n");
-          ];
-        mc:phase1(mod, seclev);
-        if (mc:erred) exit<erred> null;
-
-        if (mc:verbose >= 1)
-          display("PHASE2\n");
-        mc:phase2(mod);
-        if (mc:erred) exit<erred> null;
-
-        if (mc:verbose >= 4)
-          [
-            mc:ins_list(mod[mc:m_body]);
-            newline();
-          ];
-
-        | fns |
-        fns = mc:all_functions(mod[mc:m_body]);
-
-        if (mc:verbose >= 1)
-          [
-            display("PHASE3\n");
-          ];
-        mc:phase3(fns);
-
-        | remaining_fns |
-        remaining_fns = mc:all_functions(mod[mc:m_body]);
-        fns = lfilter!(fn (f) lfind?(f, remaining_fns), fns);
-
-        if (mc:verbose >= 1)
-          [
-            display("PHASE4\n");
-          ];
-        mc:phase4(fns);
-
-        result = mc:prelink(mod, protect)
-      ];
-
-      mc:sort_messages(false);
+      mc:handle_messages(null);
 
       mc:reset_var_cache();
 

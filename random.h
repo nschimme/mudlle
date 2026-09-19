@@ -3,6 +3,7 @@
 
 #include "mudlle-config.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 struct pcg32_random {
@@ -24,6 +25,8 @@ uint64_t random_range64_r(struct pcg32_random *rng, uint64_t range);
 /* returns a number in [0..1) */
 double drandom(void);
 double drandom_r(struct pcg32_random *rng);
+
+void randomize_array(void *base, size_t nmemb, size_t size);
 
 void random_init(void);
 

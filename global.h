@@ -22,11 +22,11 @@
 #ifndef GLOBAL_H
 #define GLOBAL_H
 
-#include "module.h"
 #include "objenv.h"
 
 /* if you change this, make sure to fix the lexer too */
 #define GLOBAL_ENV_PREFIX ":"
+#define USER_ENV_PREFIX "$"
 #define MAX_VARIABLE_LENGTH 1024 /* max characters in a variable name */
 
 extern struct env *environment;
@@ -34,6 +34,15 @@ extern struct vector *env_values;
 extern struct vector *mvars;
 extern struct table *global;
 extern struct vector *global_names;
+
+#define GLOBAL_LOOKUP(name, mname)                              \
+  static ulong name;                                            \
+  if (!name)                                                    \
+    {                                                           \
+      STATIC_STRING(sstr_ ## name, mname);                      \
+      name = mglobal_lookup(GET_STATIC_STRING(sstr_ ## name));  \
+    }                                                           \
+  ((void)0)
 
 ulong global_lookup(const char *name);
 /* Returns: the index for global variable name in environment.
@@ -72,9 +81,14 @@ void global_init(void);
 */
 
 void check_global_read(ulong goffset);
-void check_global_write(value val, ulong goffset);
+void check_global_write(ulong goffset, value val);
 /* Errors out if the calling code is not allowed to access that global.
-   NB: adjust x86builtins.S if you change this declaration.
+   N.b., adjust x64builtins.S if you change this declaration.
 */
+
+static ALWAYS_INLINE long nglobals(void)
+{
+  return intval(environment->used);
+}
 
 #endif

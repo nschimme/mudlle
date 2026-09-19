@@ -19,25 +19,7 @@
  * ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-library inference // type inference, disabled version
-requires ins3, vars
-defines mc:infer_types, mc:show_type_info, mc:constant?
+module inference // type inference, disabled version
 [
-  mc:show_type_info = mc:infer_types = fn (x) 0;
-
-  mc:constant? = fn (v)
-    // Types: v: var
-    // Returns: false if v is not a constant
-    //   an appropriate itype_xxx otherwise
-    [
-      | vclass |
-
-      vclass = v[mc:v_class];
-      if (vclass == mc:v_constant)
-	mc:itypemap[typeof(v[mc:v_kvalue])]
-      else if (vclass == mc:v_global_constant)
-	mc:itypemap[typeof(global_value(v[mc:v_goffset]))]
-      else
-	false
-    ];
+  null
 ];

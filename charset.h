@@ -26,19 +26,20 @@
 #ifndef CHARSET_H
 #define CHARSET_H
 
-#include <stdbool.h>
 #include <string.h>
 
 #define __IS_CCLS(x, mask, cmp)                                 \
   ((latin1_char_class[(unsigned char)x] & mask) cmp)
 
-#define IS_8SPACE(x)    __IS_CCLS((x), 0x20, != 0)
-#define IS_8NAME(x)     __IS_CCLS((x),    1, != 0)
-#define IS_8PRINT(x)    __IS_CCLS((x),    2, != 0)
 #define IS_8ALPHA(x)    __IS_CCLS((x),    4, != 0)
 #define IS_8ALPHANUM(x) __IS_CCLS((x), 0x14, != 0)
+#define IS_8DIGIT(x)    __IS_CCLS((x), 0x10, != 0)
+#define IS_8NAME(x)     __IS_CCLS((x),    1, != 0)
+#define IS_8NAMENUM(x)  __IS_CCLS((x), 0x11, != 0)
 #define IS_8NOSPACE(x)  __IS_CCLS((x), 0x22, == 2)
-#define IS_8OBJNAME(x)  __IS_CCLS((x),    9, != 0)
+#define IS_8OBJNAME(x)  __IS_CCLS((x), 0x19, != 0)
+#define IS_8PRINT(x)    __IS_CCLS((x),    2, != 0)
+#define IS_8SPACE(x)    __IS_CCLS((x), 0x20, != 0)
 
 #define TO_7PRINT(x) (latin1_to_ascii_print[(unsigned char)(x)])
 #define TO_7LOWER(x) (latin1_to_ascii_icmp[(unsigned char)(x)])
@@ -55,13 +56,15 @@ extern const unsigned char latin1_to_lower[256];
    characters; 'i' ignores case; '8' preserves accents */
 int str7icmp(const char *s1, const char *s2);
 int mem7icmp(const void *_s1, const void *_s2, size_t n);
-int str7nicmp(const char *s1, const char *s2, int n);
-void *mem7ichr(const void *_s, int _c, size_t n);
+int str7nicmp(const char *s1, const char *s2, size_t n);
+void *mem7ichr(const void *s, int c, size_t n);
 void strto7print(char *str);
 void str8lwr(char *str);
 void str7lwr(char *str);
 
+
 int lookup_named_character(const char *name, size_t namelen);
+const char *iso88591_char_name(int c);
 
 #define FOR_CHAR_ESCAPES(op, sep)               \
   op('\a', 'a') sep()                           \

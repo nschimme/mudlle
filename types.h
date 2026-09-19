@@ -22,14 +22,10 @@
 #ifndef TYPES_H
 #define TYPES_H
 
-#include <stdarg.h>
-#include <stddef.h>
-
 #include "mudlle-macro.h"
 #include "mudlle.h"
 
 #ifdef USE_GMP
-#include <gmp.h>
 #endif
 
 typedef unsigned long ulong;
@@ -38,76 +34,97 @@ typedef uint8_t seclev_t;
 
 #define sizeoffield(type, field) (sizeof ((type *)0)->field)
 
+struct strbuf;
+
+/* end mudlle const */
+
 /* The basic classes of all objects, as seen by the garbage collector */
 enum garbage_type {
-  garbage_string,		/* contains binary, non-GCed data */
-  garbage_record,		/* container for other GCed data  */
-  garbage_code,			/* special for code		  */
-  garbage_forwarded,		/* temporarily used during GCs	  */
-  garbage_primitive,		/* primitives			  */
-  garbage_temp,			/* container for C pointer	  */
-  garbage_mcode,		/* special for mcode		  */
-  garbage_static_string,	/* statically allocated string	  */
+  garbage_string,               /* contains non-mudlle values     */
+  garbage_record,               /* contains mudlle values         */
+  garbage_icode,                /* special for icode              */
+  garbage_forwarded,            /* temporarily used during GCs    */
+  garbage_primitive,            /* primitives                     */
+  garbage_ctemp,                /* non-saveable non-mudlle values */
+  garbage_mcode,                /* special for mcode              */
+  garbage_static_string,        /* statically allocated string    */
+  garbage_mtemp,                /* non-saveable mudlle values     */
   /* insert new types here */
-  garbage_free			/* in the free lists		  */
+  garbage_free                  /* in the free lists              */
 };
 
-/* The values below MUST NEVER CHANGE. Stored data depends on them.
-   Add new types just before 'type_null'.
-   Also some generated code depends on the values. */
-#define FOR_PLAIN_TYPES(op, arg)					\
-  op(code, arg) op(closure, arg) op(variable, arg) op(internal, arg)	\
-  op(primitive, arg) op(varargs, arg) op(secure, arg)			\
-									\
-  op(integer, arg) op(string, arg) op(vector, arg) op(pair, arg)	\
-  op(symbol, arg) op(table, arg) op(private, arg)			\
-									\
-  op(object, arg) op(character, arg) op(gone, arg)			\
-									\
-  op(oport, arg) op(mcode, arg) op(float, arg) op(bigint, arg)		\
-  op(reference, arg)							\
-									\
-  op(null, arg)
+/* start mudlle const */
 
-/* Synthetic types, not used in object representations but represent
-   a set of the previous types.
-   They can thus change */
-#define FOR_SYNTHETIC_TYPES(op, arg)				\
-  op(none, arg)	     /* no types */				\
-  op(any, arg)	     /* any types */				\
-  op(function, arg)  /* closure, primitive, varargs, secure */	\
-  op(list, arg)	     /* pair, null */
+/* Values below MUST NEVER CHANGE. Stored data depends on them.
+   Add new storable types just before 'null'; add non-storable
+   types last. */
+#define FOR_PLAIN_TYPES(op, arg, sep)                                   \
+  op(icode, arg) sep() op(closure, arg) sep() op(variable, arg) sep()   \
+  op(internal, arg) sep() op(primitive, arg) sep()                      \
+  op(varargs, arg) sep() op(secure, arg) sep()                          \
+                                                                        \
+  op(integer, arg) sep() op(string, arg) sep() op(vector, arg) sep()    \
+  op(pair, arg) sep() op(symbol, arg) sep() op(table, arg) sep()        \
+  op(private, arg) sep()                                                \
+                                                                        \
+  op(object, arg) sep() op(character, arg) sep() op(gone, arg) sep()    \
+                                                                        \
+  op(oport, arg) sep() op(mcode, arg) sep() op(float, arg) sep()        \
+  op(bigint, arg) sep()                                                 \
+                                                                        \
+  /* the following types must never be stored to disk */                \
+  op(null, arg) sep() op(connection, arg) sep() op(cookie, arg)         \
+  sep() op(file, arg) sep() op(weak_ref, arg) sep() op(regexp, arg)
 
 #define FOR_MTYPE(name, op) op(type_ ## name)
-#define FOR_STYPE(name, op) op(stype_ ## name)
 
-#define FOR_MUDLLE_TYPES(op)					\
-  FOR_PLAIN_TYPES(FOR_MTYPE, op)				\
-  FOR_SYNTHETIC_TYPES(FOR_STYPE, op)
-
-#define DEF_MTYPE(t) t,
+#define FOR_MUDLLE_TYPES(op, sep)                                       \
+  FOR_PLAIN_TYPES(FOR_MTYPE, op, sep) sep()                             \
+  /* the following synthetic types can change values */                 \
+  op(stype_none)        sep() /* no types */                            \
+  op(stype_any)         sep() /* any types */                           \
+  op(stype_function)    sep() /* closure, primitive, varargs, secure */ \
+  op(stype_list)        sep() /* pair, null */                          \
+  op(stype_bigint_like) sep() /* bigint, integer */                     \
+  op(stype_float_like)  sep() /* float, bigint, integer */              \
+  op(stype_false)             /* false; special case */
 
 enum mudlle_type
 {
-  FOR_MUDLLE_TYPES(DEF_MTYPE)
-  last_synthetic_type,
-  last_type = stype_none
+  /* end mudlle const */
+  FOR_MUDLLE_TYPES(EXPAND_ARGS, SEP_COMMA),
+  /* start mudlle const */
+  mudlle_synthetic_types,
+  mudlle_types = stype_none,
 };
 
 #undef DEF_MTYPE
 #undef DEF_STYPE
 
-#define TYPESET_ANY (P(last_type) - 1)
-#define TYPESET_PRIMITIVE (TSET(primitive) | TSET(varargs) | TSET(secure))
-#define TYPESET_FUNCTION (TSET(closure) | TYPESET_PRIMITIVE)
-#define TYPESET_LIST (TSET(pair) | TSET(null))
+typedef uint32_t typeset_t;
+#define TSBIT(t) ((typeset_t)1 << (t))
+#define TSET(t)  TSBIT(type_ ## t)
 
-#define TSET(t) P(type_ ## t)
+#define TYPESET_ANY         (TSBIT(mudlle_types) - 1)
+#define TYPESET_PRIMITIVE   (TSET(primitive) | TSET(varargs) | TSET(secure))
+#define TYPESET_FUNCTION    (TSET(closure) | TYPESET_PRIMITIVE)
+#define TYPESET_LIST        (TSET(pair) | TSET(null))
+#define TYPESET_BIGINT_LIKE (TSET(bigint) | TSET(integer))
+#define TYPESET_FLOAT_LIKE  (TSET(float) | TSET(bigint) | TSET(integer))
 
-static inline unsigned type_typeset(enum mudlle_type type)
+/* special case, not part of TYPESET_ANY */
+#define TYPESET_FALSE         TSBIT(mudlle_types)
+
+/* end mudlle const */
+#define TYPESET_FLAG_RETURN   TSBIT(mudlle_types + 1)
+/* start mudlle const */
+#define TYPESET_FLAG_OPTIONAL TSBIT(mudlle_types + 2)
+CASSERT(mudlle_types + 2 < sizeof (typeset_t) * CHAR_BIT);
+
+static inline typeset_t type_typeset(enum mudlle_type type)
 {
-  if (type < last_type)
-    return P(type);
+  if (type < mudlle_types)
+    return TSBIT(type);
 
   switch (type)
     {
@@ -119,6 +136,13 @@ static inline unsigned type_typeset(enum mudlle_type type)
       return TYPESET_FUNCTION;
     case stype_list:
       return TYPESET_LIST;
+    case stype_float_like:
+      return TYPESET_FLOAT_LIKE;
+    case stype_bigint_like:
+      return TYPESET_BIGINT_LIKE;
+    case stype_false:
+      return TYPESET_FALSE;
+      CASSERT(mudlle_synthetic_types - mudlle_types == 7);
     default:
       return 0;
     }
@@ -131,10 +155,10 @@ typedef void *value;
 
 struct obj
 {
-  ulong size;			/* total size in bytes */
+  ulong size;                   /* total size in bytes */
   enum garbage_type garbage_type : 8;
   enum mudlle_type type : 8;
-  uint16_t flags;		/* OBJ_xxx flags */
+  uint16_t flags;               /* OBJ_xxx flags */
 #ifdef __x86_64__
   uint32_t unused;
 #endif
@@ -146,9 +170,9 @@ struct obj
 #define pointerp(obj) ((obj) && !((long)(obj) & 1))
 #define integerp(obj) ((long)(obj) & 1)
 
-#define staticp(v) (!pointerp(v)				\
-		    || (((struct obj *)(v))->garbage_type	\
-			== garbage_static_string))
+#define staticp(v) (!pointerp(v)                                \
+                    || (((struct obj *)(v))->garbage_type       \
+                        == garbage_static_string))
 
 #define TYPEOF(v)                                               \
   (integerp(v) ? type_integer                                   \
@@ -169,17 +193,17 @@ struct obj
 
 /* Code is defined in values (it is known to the gc) */
 
-struct closure			/* Is a record */
+struct closure                  /* Is a record */
 {
   struct obj o;
-  struct code *code;		/* May be type_code and type_mcode as well */
+  struct code *code;            /* May be type_icode or type_mcode */
   struct variable *variables[]; /* May be other types */
 };
 
-struct string			/* Is a string */
+struct string                   /* Is a string */
 {
   struct obj o;
-  char str[];			/* Must be null terminated */
+  char str[];                   /* Must be null terminated */
 };
 
 struct mudlle_float
@@ -188,23 +212,23 @@ struct mudlle_float
   double     d;
 };
 
+#ifdef USE_GMP
 struct bigint
 {
-  struct obj	o;
-#ifdef USE_GMP
-  mpz_t		mpz;
-  mp_limb_t	limbs[];
-#endif
+  struct obj    o;
+  mpz_t         mpz;
+  mp_limb_t     limbs[];
 };
+#endif
 
-struct variable			/* Is a record */
+struct variable                 /* Is a record */
 {
   /* This is used for one-item type_variable and type_function */
   struct obj o;
   value vvalue;
 };
 
-struct symbol			/* Is a record */
+struct symbol                   /* Is a record */
 {
   struct obj o;
   struct string *name;          /* must be readonly */
@@ -212,27 +236,25 @@ struct symbol			/* Is a record */
 };
 
 /* A primitive operation (eg +, -) */
-struct primitive		/* Is a permanent external */
+struct primitive                /* Is a permanent external */
 {
   struct obj o;
   const struct prim_op *op;
 };
 
-struct vector;
-typedef value (*vararg_op_fn)(struct vector *args, ulong nargs);
-
 struct prim_op                  /* The primitive's definition */
 {
   struct string *name;          /* Always points to a static string */
-  const char *help;
-  value (*op)();
+  struct string *help;          /* Always points to a static string */
+  void *op;                     /* op<N>_fn or op<N>plus_fn */
 #ifdef PROFILE_CALL_COUNT
   unsigned *call_count;
 #endif
   int16_t nargs;
-  uint16_t flags;		/* Helps compiler select calling sequence */
-  const char *const *types;	/* Pointer to type signature array */
-  seclev_t seclevel;		/* Only for type_secure */
+  uint16_t flags;               /* Helps compiler select calling sequence */
+  const char *const *arglist;
+  const char *const *types;     /* Pointer to type signature array */
+  seclev_t seclevel;            /* Only for type_secure */
   const char *filename;
   int lineno;
 };
@@ -258,20 +280,22 @@ enum {
   OP_APPLY       = P(7),   /* apply-like function, evaluating one argument,
                               returning its return value; must correspond
                               to an entry in mc:apply_functions */
-  OP_FASTSEC     = P(8),   /* Forces a SECT?OP to be type_primitive. Only
+  OP_FASTSEC     = P(8),   /* Forces a SECOP to be type_primitive. Only
                               useful for M-secure primitives, because the only
                               valid seclevel info will be maxseclevel. */
   OP_TRACE       = P(9),   /* Auto-creates a call stack entry with all the
                               arguments of the primitive, useful when called by
                               compiled mudlle. Needed (and allowed) for plain
                               primitives only. */
-  OP_ACTOR       = P(10),  /* Uses actor(); shows in call traces */
-  OP_TRIVIAL     = P(11),  /* Skip sanity-checks in primitive wrapper. */
+  OP_TRIVIAL     = P(10),  /* Skip sanity-checks in primitive wrapper. */
+  OP_VARARG_COPY = P(11),  /* For varargs, the argument vector must be a fresh
+                              copy. */
 
   ALL_OP_FLAGS   = P(12) - 1,
 
   /* flags that can change without requiring recompiling mudlle */
-  COMPILER_SAFE_OP_FLAGS = OP_OPERATOR | OP_TRACE | OP_ACTOR | OP_NUL_STR,
+  COMPILER_SAFE_OP_FLAGS = (OP_OPERATOR | OP_TRACE | OP_TRIVIAL | OP_NUL_STR
+                            | OP_VARARG_COPY)
 };
 
 enum {
@@ -280,20 +304,20 @@ enum {
   CLF_NOCLOSURE = P(2)          /* Does not have any closure variables */
 };
 
-struct vector			/* Is a record */
+struct vector                   /* Is a record */
 {
   struct obj o;
   value data[];
 };
 
-struct list			/* Is a record */
+struct list                     /* Is a record */
 {
   struct obj o;
   value car, cdr;
 };
 
 
-struct table			/* Is a record */
+struct table                    /* Is a record */
 {
   struct obj o;
   value used;                   /* ~n for case/accent-sensitive tables */
@@ -315,39 +339,46 @@ struct mjmpbuf                  /* a string */
                                    NULL while being jumped to */
 };
 
-struct closure *unsafe_alloc_closure(ulong nb_variables);
+struct mweak_ref
+{
+  struct obj o;
+  value v;
+};
+
+struct closure *alloc_closure_noinit(ulong nb_variables);
 struct closure *alloc_closure0(struct code *code);
 struct string *alloc_string(const char *s);
 struct string *mudlle_string_copy(struct string *s);
 char *mudlle_string_dup(struct string *s);
-struct string *alloc_empty_string(size_t length);
+struct string *alloc_string_noinit(size_t length);
 struct string *alloc_string_length(const char *s, size_t length);
+struct string *strbuf_to_mudlle(const struct strbuf *sb);
 struct mudlle_float *alloc_float(double d);
-struct bigint *alloc_bigint(mpz_t mpz);
 struct string *safe_alloc_string(const char *s);
 struct variable *alloc_variable(value val);
 struct symbol *alloc_symbol(struct string *name, value data);
 struct vector *alloc_vector(ulong size);
-struct vector *make_vector(unsigned argc, va_list va);
+struct vector *make_vector(unsigned argc, value args[static argc]);
 struct list *alloc_list(value car, value cdr);
+
+#ifdef USE_GMP
 void check_bigint(struct bigint *bi);
+struct bigint *alloc_bigint(mpz_t mpz);
+#endif
+
 
 /* end mudlle consts */
 
 /* Private types which are visible to the mudlle programmer must be
    records identified by their first element with one of the following
-   constants: */
+   constants. They cannot be stored to disk so can be renumbered. */
 enum mprivate_type {
   PRIVATE_MJMPBUF = 1,
-  PRIVATE_REGEXP  = 2,
+  PRIVATE_PROFILE,
+  PRIVATE_MCALLBACK
 };
 
-struct mprivate *alloc_private(enum mprivate_type id, ulong size);
 
-#define IS_GRECORD(g) _Generic((g), struct grecord *: true, default: false)
-#define IS_STRING(s)  _Generic((s), struct string *: true,  default: false)
-#define IS_VALUE(v)   _Generic((v), value: true,            default: false)
-#define IS_VECTOR(v)  _Generic((v), struct vector *: true,  default: false)
 /* redefine LOCAL_MUDLLE_TYPES in your .c files as necessary */
 #define LOCAL_MUDLLE_TYPES
 #define IS_MUDLLE_TYPE(x)                       \
@@ -366,46 +397,47 @@ struct mprivate *alloc_private(enum mprivate_type id, ulong size);
            struct list *:         true,         \
            struct symbol *:       true,         \
            struct table *:        true,         \
+           struct mconnection *:  true,         \
            struct mprivate *:     true,         \
            struct mjmpbuf *:      true,         \
+           struct mweak_ref *:    true,         \
            struct object *:       true,         \
            struct character *:    true,         \
            struct oport *:        true,         \
-           struct string_oport *: true,         \
            struct mcode *:        true,         \
            struct mudlle_float *: true,         \
            struct bigint *:       true,         \
            LOCAL_MUDLLE_TYPES                   \
            default: false)
 
-#define CHECK_MUDLLE_TYPE(v) CASSERT_EXPR(IS_MUDLLE_TYPE(v))
-#define CHECK_VALUE(v) CASSERT_EXPR(IS_VALUE(v))
-#define CHECK_VECTOR(v) CASSERT_EXPR(IS_VECTOR(v))
+#define CHECK_MUDLLE_TYPE(v) \
+  static_assert_expr(IS_MUDLLE_TYPE(v), #v " is not a mudlle type")
 
 #define string_len(str)                                         \
-  (CASSERT_EXPR(IS_STRING(str)),                                \
-   ((str)->o.size - (sizeof(struct obj) + 1)))
+  (CASSERT_TYPE(str, struct string *),                          \
+   ((str)->o.size - (sizeof (struct obj) + 1)))
 
 #define grecord_len(rec)                                        \
-  (CASSERT_EXPR(IS_GRECORD(rec)),                               \
+  (CASSERT_TYPE(rec, struct grecord *),                         \
    ((rec)->o.size - sizeof (struct grecord)) / sizeof (value))
 #define vector_len(vec)                                         \
-  (CHECK_VECTOR(vec),                                           \
+  (CASSERT_TYPE(vec, struct vector *),                          \
    ((vec)->o.size - sizeof (struct vector)) / sizeof (value))
 
 #define grecord_fields(rec)                                     \
   ((sizeof (rec) - sizeof (struct obj)) / sizeof (value))
 
-/* 0 is false, everything else is true */
-#define isfalse(v) (CHECK_MUDLLE_TYPE(v), (value)(v) == makebool(false))
-#define istrue(v)  (!isfalse(v))
-/* Make a mudlle boolean (true or false) from a C integer */
-#define makebool(i) makeint(((i) | 0) != 0)
 
 #ifdef WORDS_BIGENDIAN
  /* MUDLLE_VALUE_UNION bitfield layouts assume little-endian */
  #error Unsupported endianness
 #endif
+
+/* MUDLLE_VALUE_UNION(name, <bitfields>) defines a union of bitfields that live
+   inside a mudlle integer, accessed as 'x.v' if 'x' is the union <name> variable.
+   The bitfields are accessed as 'x.i.<bitfield>'.
+   <bitfields> must use TAGGED_INT_BITS bits to ensure correct zero-initialization.
+   You _must_ set the 'isint' field to true when using this type. */
 #define MUDLLE_VALUE_UNION(name, ...)           \
 union name {                                    \
   struct {                                      \
@@ -425,14 +457,14 @@ struct tagged_ptr {
 static inline void set_tagged_ptr(struct tagged_ptr *dst, void *src)
 {
   ulong adr = (ulong)src;
-  assert((adr & (_Alignof(int) - 1)) == 0);
+  assert(adr % _Alignof (int) == 0);
   dst->v = (value)(adr | 1);
 }
 
 static inline void *get_tagged_ptr(const struct tagged_ptr *src)
 {
   ulong n = (ulong)src->v;
-  assert((n & (_Alignof(int) - 1)) == 1);
+  assert(n % _Alignof (int) == 1);
   return (void *)(n & ~1);
 }
 
@@ -445,11 +477,19 @@ static inline void *get_tagged_value(value v)
    GC allocate. */
 #define SET_VECTOR(v, idx, val)                 \
 do {                                            \
-  CHECK_VECTOR(v);                              \
+  CASSERT_TYPE((v), struct vector *);           \
   CHECK_MUDLLE_TYPE(val);                       \
   value __tmp = (val);                          \
   (v)->data[idx] = __tmp;                       \
 } while (0)
+
+/* iterative over mudlle string; supports break/continue */
+#define string_foreach(sval, var)                                       \
+  for (struct string *__foreach_str = (sval); __foreach_str; )          \
+    for (unsigned char var; __foreach_str; __foreach_str = NULL)        \
+      for (size_t __end = string_len(__foreach_str), __idx = 0;         \
+           (var = __foreach_str->str[__idx]), __idx < __end;            \
+           ++__idx)                                                     \
 
 /*
  * Converts the string sp into a long l and returns true.
@@ -463,5 +503,14 @@ bool mudlle_strtofloat(const char *sp, size_t len, double *d);
 #define MAX_PRIMITIVE_ARGS 5
 #define DOPRIMARGS(op, sep) \
   op(1) sep() op(2) sep() op(3) sep() op(4) sep() op(5)
+
+#define MAX_VARARG_FIXED 8      /* counting the argv */
+#define DOVAROPARGS(op, sep) \
+  op(1) sep() op(2) sep() op(3) sep() op(4) sep() op(5) sep() op(6) \
+  sep() op(7) sep() op(8)
+
+#define MAX_C_ARGS (MAX_PRIMITIVE_ARGS > MAX_VARARG_FIXED       \
+                    ? MAX_PRIMITIVE_ARGS                        \
+                    : MAX_VARARG_FIXED)
 
 #endif /* TYPES_H */

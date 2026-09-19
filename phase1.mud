@@ -20,8 +20,10 @@
  */
 
 library phase1 // Phase 1: name resolution
-requires compiler, dlist, ins3, misc, sequences, vars
-defines mc:phase1
+requires compiler, dihash, dlist, ins3, misc, sequences, vars
+defines mc:phase1, mc:gsym_defines, mc:gsym_reads, mc:gsym_writes,
+  mc:gsym_read, mc:gsym_written, mc:gsym_called
+
 reads mc:this_module, mc:describe_seclev, mc:erred
 writes mc:this_function
 
@@ -66,10 +68,19 @@ writes mc:this_function
     env_enter_block, env_leave_block, mstart, mcleanup, mlookup, imported?,
     all_readable, all_writable, readable, writable, definable, statics,
     required_modules, import, system_import, env_toplevel?, import_protected,
-    env_global_prefix, assv, warn_bad_module_variables,
-    ksymbol_get, kget_static, kmake_variable_ref, ksymbol_set!,
-    kmake_symbol_ref,
-    es_blocks, es_nlocals, es_args, es_closure, es_fn |
+    env_user_var_prefix, env_global_prefix,
+    assv, warn_bad_module_variables,
+    kget_static, kget_user_var,
+    es_blocks, es_nlocals, es_args, es_closure, es_fn,
+    describe_seclev, module_seclev, global_syms,
+    symbol_error |
+
+  mc:gsym_defines = 0;
+  mc:gsym_reads   = 1;
+  mc:gsym_writes  = 2;
+  mc:gsym_read    = 3;
+  mc:gsym_written = 4;
+  mc:gsym_called  = 5;
 
   // environment stack (topenv) indices
   es_blocks  = 0;
@@ -78,13 +89,49 @@ writes mc:this_function
   es_fn      = 3;
   es_nlocals = 4;
 
-  ksymbol_get        = mc:make_kglobal("symbol_get");
-  ksymbol_set!       = mc:make_kglobal("symbol_set!");
-  kget_static        = mc:make_kglobal("get_static");
-  kmake_variable_ref = mc:make_kglobal("make_variable_ref");
-  kmake_symbol_ref   = mc:make_kglobal("make_symbol_ref");
+  env_global_prefix = ":";
+  env_user_var_prefix = "$";
 
-  comp_null = list(vector(mc:c_recall, mc:no_loc, mc:var_make_constant(null)));
+  kget_user_var      = mc:make_kglobal("c:get_user_var");
+  kget_static        = mc:make_kglobal("c:get_static");
+
+  | mk_recall |
+  mk_recall = fn (loc, var)
+    list(vector(mc:c_recall, loc, var));
+
+  comp_null = mk_recall(mc:no_loc, mc:var_make_constant(null));
+
+  | gsym_use |
+  gsym_use = fn (int gidx, vector loc, int type)
+    [
+      if (global_syms == null) exit<function> null;
+      // global_syms is a dihash(gidx) -> table(filename)
+      //   -> assoc(mc:gsym_xxx) -> list((line << 32) | column)
+      | tab |
+      tab = dihash_ref(global_syms, gidx);
+      if (tab == null)
+        tab = dihash_set!(global_syms, gidx, make_ctable());
+      | entry, this |
+      entry = table_symbol_ref(tab, mc:this_module[mc:m_filename], null);
+      this = assq(type, symbol_get(entry));
+      if (!this)
+        [
+          this = type . null;
+          symbol_set!(entry, this . symbol_get(entry));
+        ];
+      | old, iloc |
+      old = cdr(this);
+      iloc = (mc:loc_line(loc) << 32) | mc:loc_column(loc);
+      assert(iloc >= 0);
+      if (!lfind?(iloc, old))
+        set_cdr!(this, iloc . old);
+    ];
+
+  describe_seclev = fn (int lev)
+    if (function?(mc:describe_seclev))
+      mc:describe_seclev(lev)
+    else
+      lev;
 
   // find vector v in l, for which v[0] == n
   assv = fn (n, l)
@@ -103,19 +150,20 @@ writes mc:this_function
       env = topenv = null;
     ];
 
-  env_enter_function = fn (f)
+  env_enter_function = fn (vector f)
     // Types: f : function
     // Modifies: env, topenv
     // Requires: the names in args be distinct
     // Effects: Adds a new function to the environment stack, with parameters
     //   called args
     [
-      | vargs |
+      assert(vlength(f) == mc:c_fallvars + 1);
       mc:this_function = f;
-      vargs = f[mc:c_fargs];
-      lforeach(fn (v) v[mc:vl_var] = mc:var_make_local(v[mc:vl_var]), vargs);
-      env = dcons!(topenv = vector(null, vargs, null, f, '(0)), env);
-      env_add_block(vargs);
+      topenv = indexed_vector(
+        es_fn       . f,
+        es_nlocals  . '(0));
+      env = dcons!(topenv, env);
+      env_add_block(null);
     ];
 
   env_toplevel? = fn ()
@@ -130,7 +178,7 @@ writes mc:this_function
     // Requires: All blocks of the top-level function must be exited
     // Effects: Pops the top level function from the environment stack
     // Returns: args, where args is a list of variables representing the
-    //   function's parameters
+    //   function's parameters; the first is the $nargs variable
     [
       | args |
       args = topenv[es_args];
@@ -144,6 +192,35 @@ writes mc:this_function
         mc:this_function = null;
 
       args
+    ];
+
+  | env_add_func_arg |
+  env_add_func_arg = fn (v)
+    [
+      v[mc:vl_var] = mc:var_make_local(v[mc:vl_var]);
+
+      topenv[es_args] = v . topenv[es_args];
+
+      | blocks, nlocals |
+      blocks = topenv[es_blocks];
+      nlocals = topenv[es_nlocals];
+
+      // find topmost (function) block
+      loop
+        [
+          | nblocks |
+          nblocks = cdr(blocks);
+          set_car!(nlocals, car(nlocals) + 1);
+          if (nblocks == null)
+            exit null;
+          blocks = nblocks;
+        ];
+
+      | vtable, name, var, loc |
+      @[ var _ loc ] = v;
+      name = var[mc:v_name];
+      vtable = car(blocks);
+      vtable[name] = vector(null, name, 0, loc) . var;
     ];
 
   env_enter_block = fn (locals, top?)
@@ -163,13 +240,18 @@ writes mc:this_function
         | cl |
         if (top?)
           [
+            | vname, getter |
             assert(var[mc:v_class] == mc:v_static);
             var = var[mc:v_sparent];
+            vname = var[mc:v_name];
+            getter = if (abbrev?(env_user_var_prefix, vname))
+              kget_user_var
+            else
+              kget_static;
             cl = list(vector(
               mc:c_execute, loc,
-              list(list(vector(mc:c_recall, loc, kget_static)),
-                   list(vector(mc:c_recall, loc,
-                               mc:var_make_constant(var[mc:v_name]))))));
+              list(mk_recall(loc, getter),
+                   mk_recall(loc, mc:var_make_constant(vname)))));
           ]
         else
           cl = comp_null;
@@ -185,7 +267,7 @@ writes mc:this_function
     [
       if (!mc:erred)
         table_foreach(fn (sym) [
-          | var, err |
+          | var, err, vname |
           var = car(symbol_get(sym));
           err = match! (var[mc:mv_used])
             [
@@ -194,8 +276,11 @@ writes mc:this_function
               ,mc:muse_write => "never read";
               ,(mc:muse_read | mc:muse_write) => exit<function> null;
             ];
+          vname = var[mc:mv_name];
+          if (abbrev?(env_user_var_prefix, vname))
+            exit<function> null;
           mc:set_loc(var[mc:mv_loc]);
-          mc:warning("local variable %s is %s", var[mc:mv_name], err);
+          mc:warning("local variable %s is %s", mc:markup_var(vname), err);
         ], car(topenv[es_blocks]));
 
       topenv[es_blocks] = cdr(topenv[es_blocks]);
@@ -205,17 +290,15 @@ writes mc:this_function
   // Add a new block of local vars
   env_add_block = fn (vars)
     [
-      | vtable, nv |
-
       assert(vector?(topenv));
 
+      | vtable, nv |
       vtable = make_table();
       nv = car(topenv[es_nlocals]);
       while (vars != null)
 	[
           | var, loc, name |
           @([var _ loc] . vars) = vars;
-          // cons(mc:mv_xxx vector, mc:v_xxx vector)
 
           if (nv == mc:max_local_vars)
             [
@@ -223,17 +306,35 @@ writes mc:this_function
               mc:error("too many local variables");
             ];
 
-          ++nv;
 	  name = var[mc:v_name];
-	  vtable[name] = vector(null, name, 0, loc) . var;
+
+          if (slength(name) && name[0] != ?%)
+            // look for previous definitions in the same function
+            for (|blocks| blocks = topenv[es_blocks]; blocks != null; )
+              [
+                | vtab, oldv |
+                @(vtab . blocks) = blocks;
+                oldv = vtab[name];
+                if (oldv != null)
+                  [
+                    mc:set_loc(loc);
+                    mc:warning("redefinition of '%s'", mc:markup_var(name));
+                    mc:set_loc(car(oldv)[mc:mv_loc]);
+                    mc:note("the previous declaration is here");
+                  ]
+              ];
+
+          ++nv;
+          vtable[name] = indexed_vector(
+            mc:mv_name . name,
+            mc:mv_used . 0,
+            mc:mv_loc  . loc) . var;
 	];
       topenv[es_blocks] = vtable . topenv[es_blocks];
       topenv[es_nlocals] = nv . topenv[es_nlocals];
     ];
 
-  env_global_prefix = ":";
-
-  env_lookup = vector fn (name, write)
+  env_lookup = vector fn (name, write, call)
     // Types: name : string
     //        result : var
     //	      write : boolean
@@ -255,9 +356,7 @@ writes mc:this_function
 
       if (abbrev?(env_global_prefix, name))
 	exit<function>
-	  mlookup(substring(name, slength(env_global_prefix),
-			    slength(name) - slength(env_global_prefix)),
-		  write);
+	  mlookup(string_tail(name, slength(env_global_prefix)), write, call);
 
       inenv = env;
 
@@ -266,14 +365,17 @@ writes mc:this_function
 	  // search all blocks of inenv function
 	  blocks = dget(inenv)[es_blocks];
 	  loop
-	    if (blocks == null) exit 0
-	    else if ((found = car(blocks)[name]) != null) exit<search> 0 // found!
-	    else blocks = cdr(blocks);
+            [
+              if (blocks == null) exit 0;
+              if ((found = car(blocks)[name]) != null)
+                exit<search> 0; // found!
+              blocks = cdr(blocks);
+            ];
 
 	  // not found, try next function
 	  inenv = dnext(inenv);
 	  if (inenv == env) // not found at all, is global
-	    exit<function> mlookup(name, write);
+	    exit<function> mlookup(name, write, call);
 	];
 
       // found is cons(mvar, var)
@@ -283,12 +385,25 @@ writes mc:this_function
       // Add found to all appropriate closures
       while (inenv != env)
 	[
-	  | cname, thisenv |
+	  | cname, thisenv, finder |
 	  inenv = dprev(inenv);
 	  thisenv = dget(inenv);
+
 	  // Is found already in the closure of the next function ?
-	  cname = lexists?(fn (cv) cv[mc:v_cparent] == found,
-			   thisenv[es_closure]);
+          finder = if (found[mc:v_class] == mc:v_static)
+            fn (cv)
+              [
+                if (cv[mc:v_class] != mc:v_static)
+                  exit<function> false;
+                cv = cv[mc:v_sparent];
+                assert(cv[mc:v_class] == mc:v_closure);
+                cv[mc:v_cparent] == found[mc:v_sparent]
+              ]
+          else
+            fn (cv) (cv[mc:v_class] == mc:v_closure
+                     && cv[mc:v_cparent] == found);
+          cname = lexists?(finder, thisenv[es_closure]);
+
 	  if (!cname)		// No, add it
             [
               found = if (found[mc:v_class] == mc:v_static)
@@ -308,7 +423,7 @@ writes mc:this_function
 
   // Module handling
 
-  mstart = fn (m, int seclev)
+  mstart = fn (m, int seclev, {vector,null} mglobal_syms)
     // Types: m : module
     // Effects: Does module-entry checks
     // Modifies: this_module, required_modules, readable, writable,
@@ -317,6 +432,12 @@ writes mc:this_function
       | all_loaded, mname |
 
       mname = m[mc:m_name];
+
+      global_syms = mglobal_syms;
+      symbol_error = if (mglobal_syms == null)
+        mc:error
+      else
+        mc:warning;
 
       // Check that all modules are loaded. As opposed to the interpreter,
       // the compiler does *not* load missing modules. It is not in the
@@ -359,17 +480,20 @@ writes mc:this_function
 	   status = module_vstatus(n);
 
 	   if (string?(status) && string_icmp(status, mname) != 0)
-	     mc:warning("cannot define %s: belongs to module %s", name, status)
+	     mc:warning("cannot define %s: belongs to module %s",
+                        mc:markup_var(name), status)
 	   else if (status == var_write)
 	     [
 	       if (seclev < SECLEVEL_GLOBALS)
-	         mc:error("cannot define %s: exists and is writable", name)
+	         symbol_error("cannot define %s: exists and is writable",
+                              mc:markup_var(name))
 	       else
-	         mc:warning("%s is writable", name);
+	         mc:warning("%s is writable", mc:markup_var(name));
              ]
 	   else if (status == var_system_write || status == var_system_mutable)
-	     mc:error("cannot define %s in mudlle", name);
+	     symbol_error("cannot define %s in mudlle", mc:markup_var(name));
 
+           gsym_use(n, mc:get_loc(), mc:gsym_defines);
 	   vector(n, name, 0, mc:get_loc())
 	 ],
 	 m[mc:m_defines]);
@@ -385,21 +509,24 @@ writes mc:this_function
 
         if (assv(n, definable))
           [
-            mc:error("cannot write and define %s", name);
+            symbol_error("cannot write and define %s", mc:markup_var(name));
             exit<function> l;
           ];
         if (status == var_system_write)
           [
-            mc:error("cannot write %s from mudlle", name);
+            symbol_error("cannot write %s from mudlle", mc:markup_var(name));
             exit<function> l;
           ];
+
+        gsym_use(n, mc:get_loc(), mc:gsym_writes);
         if (status == var_system_mutable)
           [
-            mc:warning("%s is always writable", name);
+            mc:warning("%s is always writable", mc:markup_var(name));
             exit<function> l;
           ];
         if (string?(status))
-          mc:warning("cannot write %s: belongs to module %s", name, status);
+          mc:warning("cannot write %s: belongs to module %s",
+                     mc:markup_var(name), status);
 
         vector(n, name, 0, mc:get_loc()) . l
       ], null, m[mc:m_writes]);
@@ -413,12 +540,14 @@ writes mc:this_function
         n = global_lookup(name);
         status = module_vstatus(n);
 
+        gsym_use(n, mc:get_loc(), mc:gsym_reads);
+
         if (status == var_system_write
             || status == var_system_mutable
             || status == var_system_mutable
             || equal?(status, "system"))
           [
-            mc:warning("%s is always readable", name);
+            mc:warning("%s is always readable", mc:markup_var(name));
             exit<function> l;
           ];
 
@@ -431,12 +560,12 @@ writes mc:this_function
         // avoid global_lookup here as that would create a global
         n = global_table()[name];
         if (!integer?(n)) exit<function> null;
-        lforeach(fn (l) [
-          match (assv(n, cdr(l)))
+        lforeach(fn (@(what . vars)) [
+          match (assv(n, vars))
             [
               [ _ _ _ line ] => [
                 mc:set_loc(line);
-                mc:error("cannot %s static %s", car(l), name);
+                mc:error("cannot %s static %s", what, mc:markup_var(name));
               ];
             ]
         ], list("define" . definable,
@@ -453,7 +582,7 @@ writes mc:this_function
 
   mcleanup = fn ()
     // Effects: Clean up module variables
-    readable = definable = writable = required_modules = null;
+    global_syms = readable = definable = writable = required_modules = null;
 
   imported? = fn (mod)
     // Returns: status of mod if it is in required_modules, false otherwise
@@ -496,7 +625,7 @@ writes mc:this_function
         v
     ];
 
-  mlookup = fn (name, write)
+  mlookup = fn (name, write, call)
     // Types: name: string
     //        write: boolean
     // Effects: Checks read/write accesses to global name for validity
@@ -505,6 +634,15 @@ writes mc:this_function
       | vstatus, n, vent |
 
       n = global_lookup(name);
+      gsym_use(n, mc:get_loc(),
+               [
+                 if (write)
+                   mc:gsym_written
+                 else if (call)
+                   mc:gsym_called
+                 else
+                   mc:gsym_read
+               ]);
       if (!write)
 	[
 	  // now: name is not imported
@@ -534,22 +672,24 @@ writes mc:this_function
 	      if (string?(vstatus))
 		[
 		  // implicitly import protected modules
-		  if (module_status(vstatus) == module_protected &&
-		      (!mc:this_module[mc:m_name] ||
-		       string_icmp(mc:this_module[mc:m_name], vstatus) != 0))
+		  if (module_status(vstatus) == module_protected
+                      && (!mc:this_module[mc:m_name]
+                          || !string_iequal?(mc:this_module[mc:m_name],
+                                             vstatus)))
 		    exit<function> import_protected(name, n, vstatus);
 
 		  if (imported?(vstatus) == module_loaded)
 		    exit<function> import(mc:var_make_dglobal(name, n),
                                           vstatus);
 		  if (!all_readable)
-		    mc:error("read of global %s (module %s)", name, vstatus)
+		    symbol_error("read of global %s (module %s)",
+                                 mc:markup_var(name), vstatus)
 		]
 	      else if (vstatus == var_system_write
                        || vstatus == var_system_mutable)
                 exit<function> system_import(n, name)
               else if (!all_readable)
-		mc:error("read of global %s", name);
+		symbol_error("read of global %s", mc:markup_var(name));
 	    ]
 	]
       else
@@ -558,7 +698,7 @@ writes mc:this_function
 	    [
               vent[mc:mv_used] |= mc:muse_write;
 	      if (!env_toplevel?())
-		mc:error("define of %s not at top level", name);
+		mc:error("define of %s not at top level", mc:markup_var(name));
 	    ]
 	  else if (vent = assv(n, writable))
             vent[mc:mv_used] |= mc:muse_write
@@ -566,19 +706,20 @@ writes mc:this_function
 	    [
 	      vstatus = module_vstatus(n);
               if (vstatus == var_system_write)
-                mc:error("cannot write global %s (module system)", name)
+                symbol_error("cannot write global %s (module system)", name)
               else if (vstatus == var_system_mutable)
                 exit<function> system_import(n, name)
               else if (all_writable)
 		[
 		  if (string?(vstatus))
 		    mc:warning("write of global %s (module %s)",
-                               name, vstatus);
+                               mc:markup_var(name), vstatus);
 		]
 	      else if (string?(vstatus))
-                mc:error("write of global %s (module %s)", name, vstatus)
+                symbol_error("write of global %s (module %s)",
+                             mc:markup_var(name), vstatus)
               else
-                mc:error("write of global %s", name);
+                symbol_error("write of global %s", mc:markup_var(name));
 	    ]
 	];
       // usual result, even for error cases
@@ -591,12 +732,12 @@ writes mc:this_function
     [
       | components, init |
       init = env_enter_block(vars, top?);
-      components = lappend(init, mappend(resolve_component, comps));
+      components = lappend!(init, mappend(resolve_component, comps));
       env_leave_block();
       components
     ];
 
-  resolve_component = fn (vector c)
+  resolve_component = fn (vector c, call? = false, aname = false)
     [
       | class, prevline, result |
       prevline = mc:get_loc();
@@ -605,100 +746,121 @@ writes mc:this_function
       class = c[mc:c_class];
       result = if (class == mc:c_assign)
 	[
-	  | val, var, function |
-
-	  c[mc:c_asymbol] = var = env_lookup(c[mc:c_asymbol], true);
-	  c[mc:c_avalue] = val = resolve_component(c[mc:c_avalue]);
-
-          if (var[mc:v_class] == mc:v_static)
-            [
-              var = var[mc:v_sparent];
-              c = vector(
-                mc:c_execute, c[mc:c_loc],
-                list(list(vector(mc:c_recall, c[mc:c_loc], ksymbol_set!)),
-                     list(vector(mc:c_recall, c[mc:c_loc], var)),
-                     val));
-            ];
-
-	  // Try & get a value for the "varname" field of a function
-	  // recognises: "<name> = fn ..."
-	  if (cdr(val) == null
-              && (function = car(val))[mc:c_class] == mc:c_closure)
-	    function[mc:c_fvar] = var;
-
+          | var |
+          mc:maybe_set_loc(c[mc:c_asymloc]);
+	  c[mc:c_asymbol] = var = env_lookup(c[mc:c_asymbol], true, false);
+          mc:maybe_set_loc(c[mc:c_loc]);
+   	  c[mc:c_avalue] = resolve_component(c[mc:c_avalue], call?, var);
 	  list(c)
 	]
-      else if (class == mc:c_recall || class == mc:c_vref)
-	[
-          | vref?, var |
-          vref? = class == mc:c_vref;
-          c[mc:c_rsymbol] = var = env_lookup(c[mc:c_rsymbol], vref?);
-          if (var[mc:v_class] == mc:v_static)
-            [
-              | fun |
-              fun = if (class == mc:c_vref) kmake_symbol_ref else ksymbol_get;
-              c[mc:c_rsymbol] = var = var[mc:v_sparent];
-              c[mc:c_class] = mc:c_recall;
-              c = vector(mc:c_execute, c[mc:c_loc],
-                         list(list(vector(mc:c_recall, mc:no_loc, fun)),
-                              list(c)))
-            ]
-          else if (vref?)
-            [
-              | arg |
-              if (var[mc:v_class] == mc:v_global)
-                arg = resolve_component(
-                  vector(mc:c_execute, mc:no_loc,
-                         list(vector(mc:c_recall, mc:no_loc,
-                                     env_global_prefix + "global_lookup"),
-                              vector(mc:c_constant, mc:no_loc,
-                                     var[mc:v_name]))))
-              else
-                arg = list(c);
-              c = vector(
-                mc:c_execute, c[mc:c_loc],
-                list(list(vector(mc:c_recall, mc:no_loc,
-                                 kmake_variable_ref)),
-                     arg))
-            ];
-
-	  list(c)
-	]
+      else if (class == mc:c_recall)
+        [
+          c[mc:c_rsymbol] = env_lookup(c[mc:c_rsymbol], false, call?);
+          list(c)
+        ]
       else if (class == mc:c_constant)
-	list(vector(mc:c_recall, mc:no_loc,
-		    mc:var_make_constant(c[mc:c_cvalue])))
+	mk_recall(mc:no_loc, mc:var_make_constant(c[mc:c_cvalue]))
       else if (class == mc:c_closure)
 	[
-	  | components, args |
+          c = indexed_vector(
+            mc:c_class           . mc:c_closure,
+            mc:c_loc             . c[mc:c_loc],
+            mc:c_freturn_typeset . c[mc:c_freturn_typeset],
+            mc:c_fhelp           . c[mc:c_fhelp],
+            mc:c_ffullargs       . c[mc:c_ffullargs],
+            mc:c_farginfo        . c[mc:c_farginfo],
+            mc:c_fvalue          . c[mc:c_fvalue],
+            mc:c_ffilename       . c[mc:c_ffilename],
+            mc:c_fnicename       . c[mc:c_fnicename],
+            mc:c_fendloc         . c[mc:c_fendloc],
+            mc:c_freturn_itype   . mc:itypeset_from_typeset(
+              c[mc:c_freturn_typeset]),
+            mc:c_fvar            . aname,
+            // skipped 6 varlists
+            mc:c_fnoescape       . false,
+            mc:c_fnargs_var      . false,
+            // phase4: misc (skipped)
+            mc:c_fnvars          . 0,
+            mc:c_fallvars        . null);
 
-	  env_enter_function(c);
-	  components = resolve_component(c[mc:c_fvalue]);
-	  args = env_leave_function();
+          // validate the above assignments if this changes
+          assert(mc:c_fallvars == 22);
+
+          env_enter_function(c);
+          | arginfo |
+          arginfo = c[mc:c_farginfo];
+
+          if (arginfo[mc:arginfo_noptargs] > 0)
+            [
+              | nargs_var |
+              nargs_var = vector("%nargs", TYPESET_ANY | TYPESET_FLAG_OPTIONAL,
+                                 c[mc:c_loc]);
+              env_add_func_arg(nargs_var);
+              c[mc:c_fnargs_var] = nargs_var;
+            ];
+
+          | blocks_added |
+          blocks_added = false;
+          for (| fargs | fargs = c[mc:c_ffullargs]; fargs != null; )
+            [
+              | farg, defval |
+              @(farg . fargs) = fargs;
+              defval = farg[mc:fullarg_default_val];
+              if (defval != null)
+                farg[mc:fullarg_default_val] = resolve_component(defval);
+              env_add_func_arg(farg[mc:fullarg_arg]);
+
+              | patcomp |
+              if (farg[mc:fullarg_pat_vars] != null)
+                [
+                  ++blocks_added;
+                  patcomp = env_enter_block(farg[mc:fullarg_pat_vars], false);
+                ];
+              if (farg[mc:fullarg_pat_expr] != null)
+                patcomp = lappend!(
+                  patcomp,
+                  resolve_component(farg[mc:fullarg_pat_expr]));
+              farg[mc:fullarg_pat_expr] = patcomp;
+            ];
+          | components |
+          components = resolve_component(c[mc:c_fvalue]);
+          for (; blocks_added > 0; --blocks_added)
+            env_leave_block();
+          env_leave_function();
 
 	  // add a "function" label
 	  components = list(vector(mc:c_labeled, mc:no_loc,
 				   "function",
 				   components));
-
-	  list(vector(mc:c_closure, c[mc:c_loc],
-		      c[mc:c_freturn_typeset],
-		      c[mc:c_fhelp],
-		      args,	// parameters
-		      c[mc:c_fvarargs],
-		      components,
-		      c[mc:c_ffilename],
-		      c[mc:c_fnicename],
-                      mc:itypeset_from_typeset(c[mc:c_freturn_typeset]),
-		      false,	// var name
-		      null, null, null, null, null, null, // var lists
-                      false,                              // noescape
-                      null,                               // phase4: misc
-                      0,                                  // phase4: nvars
-                      null))                              // phase4: allvars
+          c[mc:c_fvalue] = components;
+	  list(c)
 	]
       else if (class == mc:c_execute)
 	[
-	  c[mc:c_efnargs] = lmap(resolve_component, c[mc:c_efnargs]);
+          | args, callee |
+          args = c[mc:c_efnargs];
+          callee = resolve_component(car(args), true);
+	  args = callee . lmap(resolve_component, cdr(args));
+          callee = car(last_pair(callee));
+
+          c[mc:c_efnargs] = args;
+
+          if (callee[mc:c_class] == mc:c_recall)
+            [
+              | sym, val, fsec, vcls |
+              sym = callee[mc:c_rsymbol];
+              vcls = sym[mc:v_class];
+              if (vcls == mc:v_global_constant
+                  && secure?(val = global_value(sym[mc:v_goffset]))
+                  && (fsec = function_seclevel(val)) > module_seclev)
+                mc:warning("calling secure %s primitive %s() from seclevel %s",
+                           describe_seclev(fsec),
+                           mc:markup_fn(val),
+                           describe_seclev(module_seclev));
+              if (vcls == mc:v_global || vcls == mc:v_global_constant
+                  || vcls == mc:v_global_define)
+                gsym_use(sym[mc:v_goffset], callee[mc:c_loc], mc:gsym_called);
+            ];
 	  list(c)
 	]
       else if (class == mc:c_builtin)
@@ -728,10 +890,16 @@ writes mc:this_function
   warn_bad_module_variables = fn (int seclev)
     [
       lforeach(fn (var) [
+        if (!(var[mc:mv_used] & mc:muse_write))
+          [
+            mc:set_loc(var[mc:mv_loc]);
+            mc:warning("%s was never defined", mc:markup_var(var[mc:mv_name]))
+          ]
+      ], definable);
+      lforeach(fn (var) [
         mc:set_loc(var[mc:mv_loc]);
-        if (~var[mc:mv_used] & mc:muse_read)
-          mc:warning("readable global %s was never %s",
-                     var[mc:mv_name],
+        if (!(var[mc:mv_used] & mc:muse_read))
+          mc:warning("%s was never %s", mc:markup_var(var[mc:mv_name]),
                      if (var[mc:mv_used]) "read" else "used");
         | n, vstatus |
         n = global_lookup(var[mc:mv_name]);
@@ -741,75 +909,78 @@ writes mc:this_function
             | mseclev |
             mseclev = module_seclevel(vstatus);
             mseclev = if (mseclev && mseclev < seclev)
-              [
-                mseclev = if (function?(mc:describe_seclev))
-                  mc:describe_seclev(mseclev)
-                else
-                  seclev;
-                format(" (lvl %s)", mseclev)
-              ]
+              format(" (lvl %s)", describe_seclev(mseclev))
             else
               "";
-            mc:warning("reads global variable %s defined in %s%s",
-                       var[mc:mv_name], vstatus, mseclev);
+            mc:warning("reads %s defined in %s%s",
+                       mc:markup_var(var[mc:mv_name]), vstatus, mseclev);
           ]
       ], readable);
       lforeach(fn (var) [
-        mc:set_loc(var[mc:mv_loc]);
-        if (~var[mc:mv_used] & mc:muse_write)
-          mc:warning("writable global %s was never %s",
-                     var[mc:mv_name],
-                     if (var[mc:mv_used]) "written" else "used")
+        if (!(var[mc:mv_used] & mc:muse_write))
+          [
+            mc:set_loc(var[mc:mv_loc]);
+            mc:warning("%s was never %s",
+                       mc:markup_var(var[mc:mv_name]),
+                       if (var[mc:mv_used]) "written" else "used")
+          ]
       ], writable);
       table_foreach(fn (@<name = [_ loc syms]>) [
-        mc:set_loc(loc);
         if (syms == null)
-          mc:warning("symbols from required module %s were never used",
-                     name);
+          [
+            mc:set_loc(loc);
+            mc:warning("symbols from required module %s were never used",
+                       name);
+          ]
       ], required_modules);
     ];
 
-  mc:phase1 = fn (m, int seclev)
+  mc:phase1 = fn (m, int seclev, {vector,null} mglobal_syms)
     [
-      | components, fname, nname, top_var, loc |
+      | fname, nname, top_var |
 
       top_var = vector(mc:v_global, "top-level");
+      module_seclev = seclev;
 
       fname = m[mc:m_filename];
       nname = m[mc:m_nicename];
 
-      mstart(m, seclev);
+      mstart(m, seclev, mglobal_syms);
       env_init();
-      loc = m[mc:m_body][mc:c_loc];
-      env_enter_function(vector(mc:c_closure, loc,
-				typeset_any,    // return typeset
-				null,           // help
-				null,           // arguments
-				false,          // vararg?
-				null,           // value
-				fname,          // filename
-				nname));        // nicename
-      components = resolve_block(m[mc:m_statics], list(m[mc:m_body]), true);
-      env_leave_function();
+      | func |
+      func = indexed_vector(
+        mc:c_class            . mc:c_closure,
+        mc:c_loc              . m[mc:m_loc],
+        mc:c_freturn_typeset  . typeset_any,
+        mc:c_fhelp            . null,
+        mc:c_ffullargs        . null,
+        mc:c_farginfo         . indexed_sequence(
+          mc:arginfo_nargs    . 0,
+          mc:arginfo_noptargs . 0,
+          mc:arginfo_vararg   . false),
+        mc:c_fvalue           . null,
+        mc:c_ffilename        . fname,
+        mc:c_fnicename        . nname,
+        mc:c_fendloc          . m[mc:m_endloc],
+        mc:c_freturn_itype    . itype_any,
+        mc:c_fvar             . top_var,
+        // skipped 6 varlists
+        mc:c_fnoescape        . false,
+        mc:c_fnargs_var       . false,
+        // phase4: misc (skipped)
+        mc:c_fnvars           . 0,
+        mc:c_fallvars         . null);
+
+      // validate the above assignments if this changes
+      assert(mc:c_fallvars == 22);
+
+      env_enter_function(func);
+      func[mc:c_fvalue] = resolve_block(m[mc:m_statics], list(m[mc:m_body]),
+                                        true);
+      @() = env_leave_function();
       warn_bad_module_variables(seclev);
       mcleanup();
 
-      // make a top-level function
-      m[mc:m_body] =
-	vector(mc:c_closure, loc,
-	       typeset_any,                     // return typeset
-	       null,                            // help
-	       null,                            // arguments
-	       false,                           // vararg?
-	       components,                      // value
-	       fname,                           // filename
-	       nname,                           // nicename
-	       itype_any,                       // return itypeset
-	       top_var,                         // variable name
-	       null, null, null, null, null, null, // var lists
-	       false,				// noescape
-	       null,                            // misc
-	       0,                               // nvars
-	       null)                            // allvars
+      m[mc:m_body] = func;
     ];
 ];

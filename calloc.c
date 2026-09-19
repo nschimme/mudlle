@@ -22,10 +22,7 @@
 #include "mudlle-config.h"
 
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-#include "alloc.h"
 #include "calloc.h"
 #include "mvalgrind.h"
 #include "utils.h"
@@ -41,8 +38,8 @@
 struct memblock
 {
   struct memblock *previous;
-  char *pos;			/* Where next to allocate from */
-  char *end;			/* End of block */
+  char *pos;                    /* Where next to allocate from */
+  char *end;                    /* End of block */
   char data[];
 };
 
@@ -58,10 +55,7 @@ static struct memblock *make_block(size_t size)
     size = DFLT_BLOCK_SIZE;
   struct memblock *newp = malloc(sizeof *newp + size);
   if (newp == NULL)
-    {
-      fprintf(stderr, "No memory left\n");
-      abort();
-    }
+    abort();
 
   VALGRIND_CREATE_MEMPOOL(newp, 0, 0);
   VALGRIND_MAKE_MEM_NOACCESS(newp->data, size);
@@ -77,7 +71,7 @@ struct alloc_block *new_block(void)
 /* Return: A new block from which to allocate some memory.
  */
 {
-  struct alloc_block *newp = xmalloc(sizeof *newp);
+  struct alloc_block *newp = malloc(sizeof *newp);
   newp->memblock = make_block(DFLT_BLOCK_SIZE);
   return newp;
 }

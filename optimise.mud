@@ -27,12 +27,14 @@ reads mc:verbose
 writes mc:this_function
 [
   | fold, compute_ops, branch_ops, useless_instructions, remove_instruction,
-    fold_constants, fold_length_branch, propagate_copies,
+    fold_constants, fold_length_branch, propagate_copies, nofold,
     propagate_closure_constants, propagate_closure_constant,
-    eliminate_dead_code, change, pfoldbranch, partialfold, replace_use,
+    eliminate_dead_code, change, replace_use,
     replace_fn_use, remaining_fns, optimise_function, compute_trap_types,
     check_compute_trap, convert_to_type_trap, consttype, simple_equal?,
     really_useless |
+
+  nofold = '<"nofold"=()>;
 
   fold = fn (ops, op, args, dofold)
     // Types: ops: array of function
@@ -43,104 +45,98 @@ writes mc:this_function
     //   ops[op](args) is called to do the actual folding, and the
     //   result is passed to dofold.
     // Returns: true if the operation was folded
-    if (lforall?(fn (v) v[mc:v_class] == mc:v_constant, args) &&
-	op < vector_length(ops))
-      [
-	| val, doop |
+    [
+      if (!lforall?(fn (v) v[mc:v_class] == mc:v_constant, args)
+          || op >= vlength(ops))
+        exit<function> false;
 
-	doop = ops[op];
-        if (!doop)
-          exit<function> false;
-	if (args == null)
-	  val = doop()
-	else if (cdr(args) == null)
-	  val = doop(car(args)[mc:v_kvalue])
-	else if (cddr(args) == null)
-	  val = doop(car(args)[mc:v_kvalue], cadr(args)[mc:v_kvalue])
-	else
-          val = apply(doop,
-                      list_to_vector(lmap(fn (arg) arg[mc:v_kvalue], args)));
-	if (val) [ dofold(cdr(val)); true ]
-	else false
-      ]
-    else
-      false;
+      | val, doop |
+      doop = ops[op];
+      if (doop == null)
+        exit<function> false;
+      if (args == null)
+        val = doop()
+      else if (cdr(args) == null)
+        val = doop(car(args)[mc:v_kvalue])
+      else if (cddr(args) == null)
+        val = doop(car(args)[mc:v_kvalue], cadr(args)[mc:v_kvalue])
+      else
+        val = apply(doop,
+                    list_to_vector(lmap(fn (arg) arg[mc:v_kvalue], args)));
+      if (val == nofold)
+        exit<function> false;
+
+      dofold(val);
+      true
+    ];
 
   | compute_add |
-  compute_add = fn (x, y) if (integer?(x) && integer?(y)) true . x + y else false;
+  compute_add = fn (x, y) if (integer?(x) && integer?(y)) x + y else nofold;
 
-  compute_ops = sequence
-    (false,                     // sc_or
-     false,                     // sc_and
-     fn (x, y) true . x == y,
-     fn (x, y) true . x != y,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x < y else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x >= y else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x <= y else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x > y else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x | y else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x ^ y else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x & y else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x << y else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x >> y else false,
-     compute_add,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x - y else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x * y else false,
-     fn (x, y) [
-       if (!integer?(x) || !integer?(y) || y == 0)
-         false
-       else
-         true . x / y
-     ],
-     fn (x, y) [
-       if (!integer?(x) || !integer?(y) || y == 0)
-         false
-       else
-         true . x % y
-     ],
-     fn (x) if (integer?(x)) true . -x else false,
-     fn (x) true . !x,
-     fn (x) if (integer?(x)) true . ~x else false,
-     false,                     // ifelse
-     false,                     // if
-     false,                     // while
-     false,                     // loop
-     fn (x, y) [
-       if (integer?(y))
-         if (vector?(x))
-           if (y >= -vector_length(x) && y < vector_length(x)) true . x[y]
-	   else false
-         else if (string?(x))
-           if (y >= -string_length(x) && y < string_length(x)) true . x[y]
-	   else false
-         else false
-       else if (string?(y) && table?(x)) true . x[y]
-       else false
-     ],
-     false,                     // set
-     fn (x, y) false,           // cons's are mutable
-     fn (x) false,              // assign
-     fn (x) if (pair?(x)) true . car(x) else false,
-     fn (x) if (pair?(x)) true . cdr(x) else false,
-     fn (x) if (string?(x)) true . string_length(x) else false,
-     fn (x) if (vector?(x)) true . vector_length(x) else false,
-     compute_add,
-     fn (x) true . typeof(x),
-     fn () false,               // loop_count
-     fn () false,               // max_loop_count
-     fn (x) if (symbol?(x)) true . symbol_name(x) else false,
-     fn (x) if (symbol?(x)) true . symbol_get(x) else false,
-     false,                     // vectors are mutable
-     fn v true . check_immutable(protect(v)), // sequence
-     fn (x, y) true . check_immutable(pcons(x, y)), // pcons
-     fn (x, s) [
-       | sym |
-       if (table?(x) && string?(s) && (sym = table_lookup(x, s)))
-         true . sym
-       else
-         false
-     ]
-     );
+  compute_ops = indexed_sequence(
+    mc:b_eq . (fn (x, y) x == y),
+    mc:b_ne . (fn (x, y) x != y),
+    mc:b_lt . (fn (x, y) if (integer?(x) && integer?(y)) x < y else nofold),
+    mc:b_ge . (fn (x, y) if (integer?(x) && integer?(y)) x >= y else nofold),
+    mc:b_le . (fn (x, y) if (integer?(x) && integer?(y)) x <= y else nofold),
+    mc:b_gt . (fn (x, y) if (integer?(x) && integer?(y)) x > y else nofold),
+    mc:b_bitor       . (
+      fn (x, y) if (integer?(x) && integer?(y)) x | y else nofold),
+    mc:b_bitxor      . (
+      fn (x, y) if (integer?(x) && integer?(y)) x ^ y else nofold),
+    mc:b_bitand      . (
+      fn (x, y) if (integer?(x) && integer?(y)) x & y else nofold),
+    mc:b_shift_left  . (
+      fn (x, y) if (integer?(x) && integer?(y)) x << y else nofold),
+    mc:b_shift_right . (
+      fn (x, y) if (integer?(x) && integer?(y)) x >> y else nofold),
+    mc:b_add         . compute_add,
+    mc:b_subtract    . (
+      fn (x, y) if (integer?(x) && integer?(y)) x - y else nofold),
+    mc:b_multiply    . (
+      fn (x, y) if (integer?(x) && integer?(y)) x * y else nofold),
+    mc:b_divide      . (fn (x, y) [
+      if (!integer?(x) || !integer?(y) || y == 0)
+        nofold
+      else
+        x / y
+    ]),
+    mc:b_remainder   . (fn (x, y) [
+      if (!integer?(x) || !integer?(y) || y == 0)
+        nofold
+      else
+        x % y
+    ]),
+    mc:b_negate      . (fn (x) if (integer?(x)) -x else nofold),
+    mc:b_logical_not . (fn (x) !x),
+    mc:b_bitnot      . (fn (x) if (integer?(x)) ~x else nofold),
+    mc:b_ref         . (fn (x, y) [
+      if (integer?(y))
+        if (vector?(x))
+          if (y >= -vlength(x) && y < vlength(x)) x[y]
+          else nofold
+        else if (string?(x))
+          if (y >= -slength(x) && y < slength(x)) x[y]
+          else nofold
+        else nofold
+      else if (string?(y) && table?(x)) x[y]
+      else nofold
+    ]),
+    mc:b_logical_xor . (fn (a, b) a ^^ b),
+    mc:b_car         . (fn (x) if (pair?(x)) car(x) else nofold),
+    mc:b_cdr         . (fn (x) if (pair?(x)) cdr(x) else nofold),
+    mc:b_slength     . (fn (x) if (string?(x)) slength(x) else nofold),
+    mc:b_vlength     . (fn (x) if (vector?(x)) vlength(x) else nofold),
+    mc:b_iadd        . compute_add,
+    mc:b_typeof      . typeof,
+    mc:b_symbol_name . (fn (x) if (symbol?(x)) symbol_name(x) else nofold),
+    mc:b_symbol_get  . (fn (x) if (symbol?(x)) symbol_get(x) else nofold),
+    mc:b_sequence    . (fn (v...) check_immutable(protect(v))),
+    mc:b_pcons       . pcons,
+    mc:b_ffs         . (fn (x) if (integer?(x)) ffs(x) else nofold),
+    mc:b_funcarg     . null
+    );
+
   assert(vlength(compute_ops) == mc:builtins);
 
   | bit_test |
@@ -152,101 +148,104 @@ writes mc:this_function
         [
           | r |
           r = x[byte] & (1 << (y & 7));
-          true . (if (neg?) !r else r)
+          if (neg?) !r else r
         ]
       else
-        false
+        nofold
     ];
 
-  branch_ops = sequence
-    (fn () false,
-     fn () false,
-     fn (x) true . x,
-     fn (x) true . !x,
-     fn (x, y) true . (x || y),
-     fn (x, y) true . !(x || y),
-     fn (x, y) true . (x && y),
-     fn (x, y) true . !(x && y),
-     fn (x, y) bit_test(x, y, false),
-     fn (x, y) bit_test(x, y, true),
-     fn (x, y) if (integer?(x) && integer?(y)) true . (x & y) else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . !(x & y) else false,
-     fn (x, y) true . x == y,
-     fn (x, y) true . x != y,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x < y else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x >= y else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x <= y else false,
-     fn (x, y) if (integer?(x) && integer?(y)) true . x > y else false,
-     fn (x, y) if (string?(x) && integer?(y)) true . slength(x) == y else false,
-     fn (x, y) if (string?(x) && integer?(y)) true . slength(x) != y else false,
-     fn (x, y) if (string?(x) && integer?(y)) true . slength(x) < y else false,
-     fn (x, y) if (string?(x) && integer?(y)) true . slength(x) >= y else false,
-     fn (x, y) if (string?(x) && integer?(y)) true . slength(x) <= y else false,
-     fn (x, y) if (string?(x) && integer?(y)) true . slength(x) > y else false,
-     fn (x, y) if (vector?(x) && integer?(y)) true . vlength(x) == y else false,
-     fn (x, y) if (vector?(x) && integer?(y)) true . vlength(x) != y else false,
-     fn (x, y) if (vector?(x) && integer?(y)) true . vlength(x) < y else false,
-     fn (x, y) if (vector?(x) && integer?(y)) true . vlength(x) >= y else false,
-     fn (x, y) if (vector?(x) && integer?(y)) true . vlength(x) <= y else false,
-     fn (x, y) if (vector?(x) && integer?(y)) true . vlength(x) > y else false,
-     fn (x, y) true . equal?(x, y),
-     fn (x, y) true . !equal?(x, y),
-     fn (x) true . immutable?(x),
-     fn (x) true . !immutable?(x),
-     fn (x) true . readonly?(x),
-     fn (x) true . !readonly?(x),
-     fn (x) true . any_primitive?(x),
-     fn (x) true . !any_primitive?(x));
-  assert(vlength(branch_ops) == mc:branch_type?);
+  branch_ops = indexed_sequence(
+    mc:branch_true    . (fn (x) x),
+    mc:branch_false   . (fn (x) !x),
+    mc:branch_bitset  . (fn (x, y) bit_test(x, y, false)),
+    mc:branch_bitclear . (fn (x, y) bit_test(x, y, true)),
+    mc:branch_bitand  . (
+      fn (x, y) if (integer?(x) && integer?(y)) (x & y) else nofold),
+    mc:branch_nbitand . (
+      fn (x, y) if (integer?(x) && integer?(y)) !(x & y) else nofold),
+    mc:branch_xor     . (fn (x, y) x ^^ y),
+    mc:branch_xnor    . (fn (x, y) !(x ^^ y)),
+    mc:branch_vfind?  . (
+      fn (x, y) if (vector?(y)) vfind?(x, y) else nofold),
+    mc:branch_vnfind? . (
+      fn (x, y) if (vector?(y)) !vfind?(x, y) else nofold),
 
-  // false means cannot trap
+    mc:branch_eq      . (fn (x, y) x == y),
+    mc:branch_ne      . (fn (x, y) x != y),
+    mc:branch_lt      . (
+      fn (x, y) if (integer?(x) && integer?(y)) x < y else nofold),
+    mc:branch_ge      . (
+      fn (x, y) if (integer?(x) && integer?(y)) x >= y else nofold),
+    mc:branch_le      . (
+      fn (x, y) if (integer?(x) && integer?(y)) x <= y else nofold),
+    mc:branch_gt      . (
+      fn (x, y) if (integer?(x) && integer?(y)) x > y else nofold),
+
+    mc:branch_slength . (
+      fn (x, y) if (string?(x) && integer?(y)) slength(x) == y else nofold),
+    null . (
+      fn (x, y) if (string?(x) && integer?(y)) slength(x) != y else nofold),
+    null . (
+      fn (x, y) if (string?(x) && integer?(y)) slength(x) < y else nofold),
+    null . (
+      fn (x, y) if (string?(x) && integer?(y)) slength(x) >= y else nofold),
+    null . (
+      fn (x, y) if (string?(x) && integer?(y)) slength(x) <= y else nofold),
+    null . (
+      fn (x, y) if (string?(x) && integer?(y)) slength(x) > y else nofold),
+
+    mc:branch_vlength . (
+      fn (x, y) if (vector?(x) && integer?(y)) vlength(x) == y else nofold),
+    null . (
+      fn (x, y) if (vector?(x) && integer?(y)) vlength(x) != y else nofold),
+    null . (
+      fn (x, y) if (vector?(x) && integer?(y)) vlength(x) < y else nofold),
+    null . (
+      fn (x, y) if (vector?(x) && integer?(y)) vlength(x) >= y else nofold),
+    null . (
+      fn (x, y) if (vector?(x) && integer?(y)) vlength(x) <= y else nofold),
+    null . (
+      fn (x, y) if (vector?(x) && integer?(y)) vlength(x) > y else nofold),
+
+    mc:branch_equal      . equal?,
+    mc:branch_nequal     . (fn (x, y) !equal?(x, y)),
+    mc:branch_immutable  . immutable?,
+    mc:branch_mutable    . (fn (x) !immutable?(x)),
+    mc:branch_readonly   . readonly?,
+    mc:branch_writable   . (fn (x) !readonly?(x)),
+    mc:branch_any_prim   . any_primitive?,
+    mc:branch_not_prim   . (fn (x) !any_primitive?(x)));
+
+  // null means cannot trap
   // stype_any means always perform operation
   // type_xxx means both arguments have to be of this type
-  compute_trap_types = sequence
-    (false,        // sc_or
-     false,        // sc_and
-     false,        // eq
-     false,        // ne
-     type_integer, // lt
-     type_integer, // ge
-     type_integer, // le
-     type_integer, // gt
-     type_integer, // bitor
-     type_integer, // bitxor
-     type_integer, // bitand
-     type_integer, // shift_left
-     type_integer, // shift_right
-     null,         // add -- special case below
-     type_integer, // subtract
-     type_integer, // multiply
-     stype_any,    // divide -- may div zero trap
-     stype_any,    // remainder -- may div zero trap
-     type_integer, // negate
-     false,        // not
-     type_integer, // bitnot
-     false,        // ifelse
-     false,        // if
-     false,        // while
-     false,        // loop
-     stype_any,    // ref
-     false,        // set
-     false,        // cons
-     false,        // assign
-     type_pair,    // car
-     type_pair,    // cdr
-     type_string,  // slength
-     type_vector,  // vlength
-     type_integer, // iadd
-     false,        // typeof
-     false,        // loop_count
-     false,        // max_loop_count
-     type_symbol,  // symbol_name
-     type_symbol,  // symbol_get
-     false,        // vector
-     false,        // sequence
-     false,        // pcons
-     stype_any     // symbol_ref -- may read-only trap
-     );
+  compute_trap_types = indexed_sequence(
+    mc:b_lt             . type_integer,
+    mc:b_ge             . type_integer,
+    mc:b_le             . type_integer,
+    mc:b_gt             . type_integer,
+    mc:b_bitor          . type_integer,
+    mc:b_bitxor         . type_integer,
+    mc:b_bitand         . type_integer,
+    mc:b_shift_left     . type_integer,
+    mc:b_shift_right    . type_integer,
+    mc:b_add            . -1,            // special case below
+    mc:b_subtract       . type_integer,
+    mc:b_multiply       . type_integer,
+    mc:b_divide         . stype_any,    // may div zero trap
+    mc:b_remainder      . stype_any,    // may div zero trap
+    mc:b_negate         . type_integer,
+    mc:b_bitnot         . type_integer,
+    mc:b_ref            . stype_any,
+    mc:b_car            . type_pair,
+    mc:b_cdr            . type_pair,
+    mc:b_slength        . type_string,
+    mc:b_vlength        . type_vector,
+    mc:b_iadd           . type_integer,
+    mc:b_symbol_name    . type_symbol,
+    mc:b_symbol_get     . type_symbol,
+    mc:b_ffs            . type_integer,
+    mc:b_funcarg        . null); // make the vector full length
   assert(vlength(compute_trap_types) == mc:builtins);
 
   mc:fold_branch = fn (il, val) // folding function for branches
@@ -296,32 +295,6 @@ writes mc:this_function
 	];
     ];
 
-  partialfold = fn (args, pfold)
-    [
-      | arg1, arg2, t |
-
-      arg1 = car(args); arg2 = cadr(args);
-      if (arg1[mc:v_class] == mc:v_constant)
-	[
-	  t = arg1; arg1 = arg2; arg2 = t;
-	];
-      if (arg2[mc:v_class] == mc:v_constant)
-	pfold(arg1, arg2[mc:v_kvalue]);
-    ];
-
-  pfoldbranch = fn (il, bop, arg)
-    [
-      | ins |
-
-      ins = il[mc:il_ins];
-      ins[mc:i_bop] = bop;
-      ins[mc:i_bargs] = arg . null;
-      if (mc:verbose >= 3)
-	[
-	  dformat("FOLDOR %s\n", il[mc:il_number]);
-	];
-    ];
-
   // true if arg can use '==' instead of 'equal?()'; cf. itype_full_equal
   // in inference.mud
   simple_equal? = fn (arg)
@@ -329,18 +302,22 @@ writes mc:this_function
       | t |
       t = consttype(arg);
       (t >= 0
-       && !((1 << t) & (1 << type_symbol | 1 << type_vector | 1 << type_pair
-                        | 1 << type_table | 1 << type_string | 1 << type_float
-                        | 1 << type_bigint)))
+       && !((1 << t) & (TSET_SYM | TSET_VEC | TSET_PAIR
+                        | TSET_TAB | TSET_STR | (1 << type_float)
+                        | (1 << type_bigint))))
     ];
 
-  // 'ins' is a comparison branch; check if it is comparing a string/vector
-  // length to a constant integer
-  fold_length_branch = fn (il, previl, ins, bop)
+  // 'ilist' points to a comparison branch; check if it is comparing a
+  // string/vector length to a constant integer
+  fold_length_branch = fn (ilist, bop)
     [
-      if (previl == null) exit<function> null;
+      | pilist |
+      pilist = dprev(ilist);
+      if (pilist == ilist) exit<function> null;
 
-      | bvar0, bvar1, val |
+      | bvar0, bvar1, val, il, ins |
+      il = dget(ilist);
+      ins = il[mc:il_ins];
       @(bvar0 bvar1) = ins[mc:i_bargs];
       val = mc:var_value(bvar1);
       if (!integer?(val))
@@ -357,24 +334,39 @@ writes mc:this_function
       if (val < 0 || val > MAX_STRING_SIZE)
         exit<function> null;
 
-      // check if the previous instruction was {vector,string}_length
+      // check if the previous instruction was {v,s}length, skipping
+      // assignments to other variables in between
       | pins, lop |
-      pins = previl[mc:il_ins];
+      loop
+        [
+          pins = dget(pilist)[mc:il_ins];
+          if (pins[mc:i_class] != mc:i_compute)
+            exit<function> null;
 
-      if (!(pins[mc:i_class] == mc:i_compute
-            && ((lop = pins[mc:i_aop]) == mc:b_vlength
-                || lop == mc:b_slength)
-            && pins[mc:i_adest] == bvar0))
-        exit<function> null;
+          lop = pins[mc:i_aop];
+          if (lop == mc:b_vlength || lop == mc:b_slength)
+            [
+              if (pins[mc:i_adest] == bvar0)
+                exit null;
+              exit<function> null;
+            ];
+          if (lop != mc:b_assign || pins[mc:i_adest] == bvar0)
+            exit<function> null;
+          pilist = dprev(pilist);
+          if (pilist == ilist) exit<function> null;
+        ];
 
-      ins[mc:i_bop] = (bop - mc:branch_eq
-                       + (if (lop == mc:b_vlength) mc:branch_vlength
-                          else mc:branch_slength));
+      | op |
+      op = if (lop == mc:b_vlength)
+        mc:branch_vlength
+      else
+        mc:branch_slength;
+      ins[mc:i_bop] = bop - mc:branch_eq + op;
       ins[mc:i_bargs] = list(car(pins[mc:i_aargs]), bvar1);
       assert(!ins[mc:i_btypes]);
 
       | args |
-      args = previl[mc:il_arguments];
+      args = dget(pilist)[mc:il_arguments];
       il[mc:il_arguments] = if (args) bcopy(args) else false;
 
       // We have to leave the length instruction behind in case its result is
@@ -384,12 +376,27 @@ writes mc:this_function
       change = true;
     ];
 
-  fold_constants = fn (il, previl)
+  | partial_const_args |
+  // if one of 'args' is constant, return list(const-arg, other-arg);
+  // otherwise return false
+  partial_const_args = fn (args)
+    [
+      | a, b|
+      @(a b) = args;
+      if (a[mc:v_class] == mc:v_constant)
+        exit<function> args;
+      if (b[mc:v_class] == mc:v_constant)
+        exit<function> list(b, a);
+      false
+    ];
+
+  fold_constants = fn (ilist)
     // Types: il : instruction
     // Effects: Does constant folding on given instruction
     [
-      | ins, class |
+      | ins, class, il |
 
+      il = dget(ilist);
       ins = il[mc:il_ins];
       class = ins[mc:i_class];
 
@@ -408,7 +415,33 @@ writes mc:this_function
 		];
 	      change = true;
 	    ];
-	  fold(compute_ops, op, args, foldtocst)
+
+	  if (fold(compute_ops, op, args, foldtocst))
+            exit<function> null;
+
+          if (op == mc:b_subtract)
+            [
+              if (mc:var_value(car(args)) == -1)
+                [
+                  // change -1 - x to ~x
+                  ins[mc:i_aop] = mc:b_bitnot;
+                  ins[mc:i_aargs] = cdr(args);
+                ];
+            ]
+          else if (op == mc:b_logical_xor)
+            // check for partial fold of '<cst> ^^ <var>'
+            match! (partial_const_args(args))
+              [
+                ,false => null;
+                (aconst avar) => [
+                  ins[mc:i_aop] = if (aconst[mc:v_kvalue])
+                    mc:b_eq
+                  else
+                    mc:b_ne;
+                  ins[mc:i_aargs] = list(avar, mc:var_make_constant(false));
+                  change = true;
+                ]
+              ]
 	]
       else if (class == mc:i_branch)
 	[
@@ -418,29 +451,28 @@ writes mc:this_function
 	  if (!fold(branch_ops, ins[mc:i_bop], ins[mc:i_bargs],
 		    fn (val) mc:fold_branch(il, val)))
 	    // special cases for partial constant folding
-	    if (op == mc:branch_or || op == mc:branch_nor ||
-		op == mc:branch_and || op == mc:branch_nand)
-	      partialfold
-		(args,
-		 fn (arg1, x)
-		 [
-		   if (op == mc:branch_nand && !x ||
-		       op == mc:branch_or && x)
-		     mc:fold_branch(il, true)
-		   else if (op == mc:branch_and && !x ||
-			    op == mc:branch_nor && x)
-		     mc:fold_branch(il, false)
-		   else if (op == mc:branch_or || op == mc:branch_and)
-		     pfoldbranch(il, mc:branch_true, arg1)
-		   else
-		     pfoldbranch(il, mc:branch_false, arg1)
-		 ])
-          else if ((op == mc:branch_equal || op == mc:branch_nequal) &&
-                   (simple_equal?(car(args)) || simple_equal?(cadr(args))))
-            // change into regular == or !=
-            ins[mc:i_bop] += mc:branch_eq - mc:branch_equal
-          else if (op >= mc:branch_eq && op <= mc:branch_gt)
-            fold_length_branch(il, previl, ins, op);
+	    if ((op == mc:branch_equal || op == mc:branch_nequal)
+                     && (simple_equal?(car(args))
+                         || simple_equal?(cadr(args))))
+              // change into regular == or !=
+              ins[mc:i_bop] += mc:branch_eq - mc:branch_equal
+            else if (op >= mc:branch_eq && op <= mc:branch_gt)
+              fold_length_branch(ilist, op)
+            else if (op == mc:branch_xor || op == mc:branch_xnor)
+              // check for partial fold of '<cst> ^^ <var>'
+              match! (partial_const_args(args))
+                [
+                  ,false => null;
+                  (aconst avar) => [
+                    ins[mc:i_bop] = if ((op == mc:branch_xor)
+                                        != !aconst[mc:v_kvalue])
+                      mc:branch_eq
+                    else
+                      mc:branch_ne;
+                    ins[mc:i_bargs] = list(avar, mc:var_make_constant(false));
+                    change = true;
+                  ]
+                ]
 	]
       else if (class == mc:i_call)
         [
@@ -456,7 +488,7 @@ writes mc:this_function
               if (callable?(fun, vlength(args)))
                 result = trap_error(fn () apply(fun, args),
                                     fn (n) got_error = n,
-                                    call_trace_off)
+                                    call_trace_off, null)
               else
                 got_error = error_wrong_parameters;
 
@@ -466,19 +498,20 @@ writes mc:this_function
               if (got_error != null)
                 [
                   mc:warning("call to %s() causes %s error",
-                             function_name(fun), error_messages[got_error]);
+                             mc:markup_fn(fun),
+                             error_messages[got_error]);
                   exit<function> null;
                 ];
               if (!immutable?(result = check_immutable(result)))
                 [
                   mc:warning("result from %s() is not immutable",
-                             function_name(fun));
+                             mc:markup_fn(fun));
                   exit<function> null;
                 ];
               if (!readonly?(result))
                 [
                   mc:warning("result from %s() is not read-only",
-                             function_name(fun));
+                             mc:markup_fn(fun));
                   exit<function> null;
                 ];
               if (mc:verbose >= 3)
@@ -527,8 +560,8 @@ writes mc:this_function
         [
           ins[mc:i_marray] = rep(ins[mc:i_marray]);
           ins[mc:i_mindex] = rep(ins[mc:i_mindex]);
-          if (ins[mc:i_mop] == mc:memory_write ||
-              ins[mc:i_mop] == mc:memory_write_safe)
+          if (ins[mc:i_mop] == mc:memory_write
+              || ins[mc:i_mop] == mc:memory_write_safe)
             ins[mc:i_mscalar] = rep(ins[mc:i_mscalar])
         ]
       else if (class == mc:i_call)
@@ -537,8 +570,6 @@ writes mc:this_function
           if (car(ins[mc:i_cargs]) == repvar)
             mc:inline_builtin_call(use);
         ]
-      else if (class == mc:i_vref)
-        ins[mc:i_varg] = rep(ins[mc:i_varg])
       else if (class == mc:i_return)
         ins[mc:i_rvalue] = rep(ins[mc:i_rvalue])
       else if (class == mc:i_closure && closure_ok?)
@@ -559,6 +590,8 @@ writes mc:this_function
           assert(propagate_closure_constant(func, clvar, repvar, replace_use));
           func[mc:c_fclosure] = ldelete!(clvar, func[mc:c_fclosure]);
         ]
+      else if (class == mc:i_maybe_sconcat)
+        replist(ins[mc:i_scargs])
       else
         fail();
 
@@ -622,9 +655,10 @@ writes mc:this_function
                    && (any_primitive?(fun = global_value(fvar[mc:v_goffset]))
                        && (primitive_flags(fun) & OP_APPLY)))
             [
-              | fidx |
+              | fidx, args |
               @[_ fidx _] = vexists?(fn (v) v[0] == fun, mc:apply_functions);
-              if (dvar == nth(fidx + 2, ins[mc:i_cargs]))
+              args = cdr(ins[mc:i_cargs]);
+              if (llength(args) >= fidx && dvar == nth(fidx, args))
                 [
                   if (!pair?(ins[mc:i_cfunction]))
                     ins[mc:i_cfunction] = ins[mc:i_cfunction] . null;
@@ -757,18 +791,14 @@ writes mc:this_function
         vars = vector(var, replacer, value) . vars;
       ], ifn[mc:c_flocals_write]);
 
-      if (vars == null) exit<function> false;
-
-      lforeach (fn (pvar) [
+      lforeach(fn (pvar) [
         | dvar, replacer, repvar |
 
         @[dvar replacer repvar] = pvar;
 
         if (propagate_closure_constant(ifn, dvar, repvar, replacer))
           dvar[mc:v_lclosure_uses] &= ~(mc:closure_read | mc:closure_write);
-      ], vars);
-
-      false
+      ], vars)
     ];
 
   propagate_copies = fn (f)
@@ -787,7 +817,28 @@ writes mc:this_function
       propagate_copy = fn (ncopy)
 	[
 	  | cblock, dvar, cins, repvar, cfirst, uses, local_uses, nrepvar,
-	    replaceable_use?, can_repall, scan, ndvar, umap, copy, repuse |
+	    replaceable_use?, can_repall, scan, ndvar, umap, copy, repuse,
+            actually_used? |
+
+          // mc:arguments() returns ambiguous and global variables as
+          // well for i_return and i_call
+          actually_used? = fn (int class, vector ins, int nvar,
+                               ambvars, globals)
+            [
+              if (class != mc:i_return && class != mc:i_call)
+                exit<function> true;
+
+              if (bit_set?(ambvars, ndvar)
+                  || bit_set?(globals, ndvar))
+                match! (class)
+                  [
+                    ,mc:i_return => nvar == ins[mc:i_rvalue][mc:v_number];
+                    ,mc:i_call => lexists?(fn (var) nvar == var[mc:v_number],
+                                           ins[mc:i_cargs])
+                  ]
+              else
+                true
+            ];
 
           repuse = fn (use) replace_use(use, dvar, repvar, false);
 
@@ -805,36 +856,34 @@ writes mc:this_function
 	      first = ublock[mc:f_ilist];
 	      ambvars = ublock[mc:f_ambiguous_w][mc:flow_out];
 
-	      // Note: can't replace use in closures
-	      if (uclass != mc:i_closure &&
-                  uclass != mc:i_vref &&
-		  bit_set?(ublock[mc:f_copies][mc:flow_in], ncopy) &&
-		  !((uclass == mc:i_return ||
-		     uclass == mc:i_call) && // escapes from function ?
-		    (bit_set?(ambvars, ndvar) || bit_set?(globals, ndvar))))
-		loop		// there must be no prior replacements
-		  [
-		    | fil, fins, fclass |
+	      // Note: can't replace use in closures as a later assignment may
+	      // change what's read from the closure
+	      if (uclass == mc:i_closure
+		  || !bit_set?(ublock[mc:f_copies][mc:flow_in], ncopy)
+                  || !actually_used?(uclass, uins, ndvar, ambvars, globals))
+                exit<function> false;
 
-		    fil = dget(first);
-		    fins = fil[mc:il_ins];
-		    fclass = fins[mc:i_class];
-		    if (fil == use) exit true;
-		    // check if dvar or repvar is defined in this ins
-		    // (no need to check explicit def of dvar, as in that case
-		    // dvar would not be in 'uses').
-		    if (fil[mc:il_defined_var] == nrepvar ||
-			(fclass == mc:i_call && mc:call_escapes?(fins)
-                         && (bit_set?(ambvars, nrepvar)
-                             || bit_set?(globals, nrepvar)
-                             || bit_set?(ambvars, ndvar)
-                             || bit_set?(globals, ndvar))))
-		      exit false;
+              loop		// there must be no prior replacements
+                [
+                  | fil, fins, fclass |
 
-		    first = dnext(first);
-		  ]
-	      else
-		false
+                  fil = dget(first);
+                  fins = fil[mc:il_ins];
+                  fclass = fins[mc:i_class];
+                  if (fil == use) exit true;
+                  // check if dvar or repvar is defined in this ins (no need
+                  // to check explicit def of dvar, as in that case dvar
+                  // would not be in 'uses'). nrepvar is false for constants.
+                  if (nrepvar && fil[mc:il_defined_var] == nrepvar
+                      || (fclass == mc:i_call && mc:call_escapes?(fins)
+                          && (nrepvar && (bit_set?(ambvars, nrepvar)
+                                          || bit_set?(globals, nrepvar))
+                              || bit_set?(ambvars, ndvar)
+                              || bit_set?(globals, ndvar))))
+                    exit false;
+
+                  first = dnext(first);
+                ]
 	    ];
 
 	  copy = all_copies[ncopy];
@@ -860,6 +909,9 @@ writes mc:this_function
 			   else l
 			 ], null, cblock[mc:f_uses][mc:flow_out]);
 
+          | ambvars |
+          ambvars = cblock[mc:f_ambiguous_w][mc:flow_out];
+
 	  // add all local uses (in block of copy)
 	  cfirst = scan = cblock[mc:f_ilist];
 	  while (dget(scan) != copy) scan = dnext(scan);
@@ -876,20 +928,24 @@ writes mc:this_function
 	      il = dget(scan);
 	      ins = il[mc:il_ins];
 	      class = ins[mc:i_class];
-	      if ((class == mc:i_closure || class == mc:i_vref) &&
-		  bit_set?(il[mc:il_arguments], ndvar))
+	      if (class == mc:i_closure
+                  && bit_set?(il[mc:il_arguments], ndvar))
                 can_repall = false
-	      else if (((class == mc:i_return ||
-			 class == mc:i_call) && // escapes from function ?
-			(bit_set?(cblock[mc:f_ambiguous_w][mc:flow_out],
-                                  ndvar) ||
-			 bit_set?(globals, ndvar))))
-		[
-		  can_repall = false;
-		  exit 0		// and no further uses are legal
-		]
-	      else if (bit_set?(il[mc:il_arguments], ndvar))
-		local_uses = il . local_uses;
+	      else
+                [
+                  if (bit_set?(il[mc:il_arguments], ndvar)
+                      && actually_used?(class, ins, ndvar, ambvars, globals))
+                    local_uses = il . local_uses;
+
+                  if ((class == mc:i_return
+                       || class == mc:i_call && mc:call_escapes?(ins))
+                      && (bit_set?(ambvars, ndvar)
+                          || bit_set?(globals, ndvar)))
+                    [
+                      can_repall = false;
+                      exit 0		// and no further uses are legal
+                    ]
+                ]
 	    ];
 
 	  // if repvar is a constant, propagate it anywhere it reaches
@@ -906,7 +962,7 @@ writes mc:this_function
 	    ]
 	];
 
-      for (|i| i = 0; i < vector_length(all_copies); ++i)
+      for (|i| i = 0; i < vlength(all_copies); ++i)
         propagate_copy(i)
     ];
 
@@ -929,7 +985,9 @@ writes mc:this_function
 
   | noreturn_fns |
 
-  mc:register_noreturn_variant = fn "`s0 `s1 -> . Registers `s1 as a replacement function to call for function `s0 if its return value is unused." (string from, string to)
+  mc:register_noreturn_variant = fn """`s0 `s1 -> . Registers `s1 as a\
+ replacement function to call for function `s0 if its return value is\
+ unused.""" (string from, string to)
     [
       assert(minlevel() >= seclevel());
       | g, gs |
@@ -963,16 +1021,16 @@ writes mc:this_function
         exit<function> false;
 
       op = ins[mc:i_aop];
-      if (op != mc:b_assign)
-        mc:warning("result of operation (%s) unused%s",
-                   mc:builtin_names[op],
+      if (op != mc:b_assign && op != mc:b_funcarg)
+        mc:warning("result of %s unused%s",
+                   mc:builtin_long_name(op),
                    match (ins[mc:i_adest][mc:v_name]) [
                      "" => "";
-                     s => format(" (in %s)", s)
+                     s => format(" (in %s)", mc:markup_var(s))
                    ]);
 
       ttype = compute_trap_types[op];
-      if (!ttype)
+      if (ttype == null)
         exit<function> false;
 
       cargs = ins[mc:i_aargs];
@@ -990,7 +1048,7 @@ writes mc:this_function
               convert_to_type_trap(il, car(cargs), ct)
             else
               convert_to_type_trap(il, cadr(cargs), type_integer)
-          // else fallthrough
+          /* else fallthrough */
         ]
       else if (cdr(cargs) == null)              // unary op?
         if (consttype(car(cargs)) == ttype)
@@ -1021,8 +1079,9 @@ writes mc:this_function
 
       closure_uses = mc:new_varset(ifn);
       lforeach(fn (var) [
-        if (var[mc:v_class] == mc:v_local &&
-            (var[mc:v_lclosure_uses] & (mc:closure_read | mc:closure_write)))
+        if (var[mc:v_class] == mc:v_local
+            && (var[mc:v_lclosure_uses]
+                & (mc:closure_read | mc:closure_write)))
           set_bit!(closure_uses, var[mc:v_number]);
       ], ifn[mc:c_flocals]);
 
@@ -1033,7 +1092,7 @@ writes mc:this_function
              rw_amblist |
 
 	   block = graph_node_get(n);
-	   uses = bitset_to_list(block[mc:f_uses][mc:flow_out],
+	   uses = bitset_map_list(block[mc:f_uses][mc:flow_out],
 				 block[mc:f_uses][mc:flow_map]);
 	   ilist = block[mc:f_ilist];
 
@@ -1064,24 +1123,35 @@ writes mc:this_function
 
 	       ndvar = il[mc:il_defined_var];
 
-	       if (class == mc:i_branch &&
-		   ins[mc:i_bop] == mc:branch_never ||
+	       if (class == mc:i_branch && ins[mc:i_bop] == mc:branch_never
 
-		   class == mc:i_trap &&
-		   ins[mc:i_top] == mc:trap_never ||
+                   || class == mc:i_trap && ins[mc:i_top] == mc:trap_never
 
-		   (class == mc:i_compute && // a = a is useless
-		    ins[mc:i_aop] == mc:b_assign &&
-		    ins[mc:i_adest] == car(ins[mc:i_aargs])) ||
+                   || (class == mc:i_compute // a = a is useless
+                       && ins[mc:i_aop] == mc:b_assign
+                       && ins[mc:i_adest] == car(ins[mc:i_aargs]))
 
-		   (class == mc:i_compute ||
-                    class == mc:i_closure ||
-                    class == mc:i_call ||
-		    class == mc:i_memory && ins[mc:i_mop] == mc:memory_read) &&
-		   bit_clear?(local_uses, ndvar) &&
-		   (bit_set?(defined, ndvar) || !assq(vmap[ndvar], uses)))
-                 if (!check_compute_trap(il))
-                   useless = scan . useless;
+                   || ((class == mc:i_compute
+                        || class == mc:i_closure
+                        || class == mc:i_call
+                        || (class == mc:i_memory
+                            && ins[mc:i_mop] == mc:memory_read))
+                       && bit_clear?(local_uses, ndvar)
+                       && (bit_set?(defined, ndvar)
+                           || !assq(vmap[ndvar], uses)))
+
+                   || (class == mc:i_maybe_sconcat
+                       && lexists?(fn (arg) [
+                         | ct |
+                         ct = consttype(arg);
+                         ct >= 0 && ct != type_string
+                       ], ins[mc:i_scargs]))
+
+                   || class == mc:i_nop)
+                 [
+                   if (!check_compute_trap(il))
+                     useless = scan . useless;
+                 ];
 
 	       if (ndvar)
 		 [
@@ -1131,19 +1201,20 @@ writes mc:this_function
 
 	      second = dnext(first);
               il2 = dget(second);
-              for (|i| i = vlength(il2); --i >= 0; )
-                if (i != mc:il_label)
-                  il[i] = il2[i];
-              il2[mc:il_ins] = null; // note removal
-	      dremove!(second, second)
-	    ]
-	  else
-	    dremove!(ilpos, ilpos)
+              assert(!il2[mc:il_label]);
+
+              if (olabel = il[mc:il_label])
+                mc:set_label(olabel, il2);
+
+              graph_node_get(block)[mc:f_ilist] = second;
+            ];
+          dremove!(ilpos, ilpos)
 	]
       else
 	[
 	  // find fall through block
-	  nblock = graph_edge_to(graph_edges_out_exists?(graph_edge_get, block));
+	  nblock = graph_edge_to(
+            graph_edges_out_exists?(graph_edge_get, block));
 
 	  // if block was entry block, change
 	  if (car(f[mc:c_fvalue]) == block)
@@ -1202,20 +1273,25 @@ writes mc:this_function
       lforeach(fn (ins) remove_instruction(f, ins), useless);
 
       entry = car(fval);
-      // remove useless nodes (never the entry node!)
-      lforeach(fn (n) if (n != entry && graph_edges_in(n) == null)
-	       [
-		 // unreachable
-		 change = true;
-		 if (mc:verbose >= 3)
-		   [
-		     dformat(
-                       "UNREACHABLE BLOCK %d\n",
-                       dget(graph_node_get(n)[mc:f_ilist])[mc:il_number]);
-		   ];
-		 lforeach(graph_remove_edge, graph_edges_out(n));
-		 graph_remove_node(n)
-	       ], graph_nodes(fg));
+      // remove useless nodes
+      graph_nodes_apply(fn (n) [
+        // Remove the destination node if it is no longer reachable
+        if (n == entry
+            || (graph_edges_in_exists?(fn (e) graph_edge_from(e) != n, n)
+                && graph_node_reachable?(entry, n)))
+          exit<function> null;
+
+        change = true;
+        if (mc:verbose >= 3)
+          [
+            dformat(
+              "UNREACHABLE BLOCK %d\n",
+              dget(graph_node_get(n)[mc:f_ilist])[mc:il_number]);
+          ];
+        lforeach(graph_remove_edge, graph_edges_in(n));
+        lforeach(graph_remove_edge, graph_edges_out(n));
+        graph_remove_node(n)
+      ], fg);
 
       // remove aliases and useless labels
       graph_nodes_apply(
@@ -1304,8 +1380,11 @@ writes mc:this_function
                       ouse &= ~(mc:local_write_once | mc:local_write_many
                                 | mc:local_write_many_nonnull);
 
-                      if (lexists?(fn (@[var _ _]) var == dvar,
-				   ifn[mc:c_fargs]))
+                      if (lexists?(fn (farg) [
+                        | var |
+                        @[var _ _] = farg[mc:fullarg_arg];
+                        var == dvar
+                      ], ifn[mc:c_ffullargs]))
                         dvar[mc:v_lclosure_uses]
                           = (ouse | mc:local_write_many
                              | mc:local_write_many_nonnull)
@@ -1396,7 +1475,15 @@ writes mc:this_function
 
       // clear the index of argument variables (so that unused arguments
       // are easily ignored)
-      lforeach(fn (@[arg _ _]) arg[mc:v_number] = 0, ifn[mc:c_fargs]);
+      lforeach(fn (farg) [
+        | arg |
+        @[arg _ _] = farg[mc:fullarg_arg];
+        arg[mc:v_number] = 0
+      ], ifn[mc:c_ffullargs]);
+
+      // and the same for $nargs
+      if (ifn[mc:c_fnargs_var])
+        ifn[mc:c_fnargs_var][mc:vl_var][mc:v_number] = 0;
 
       // first find all variables that are written
       // then prepend those that are read (but not written)
@@ -1416,13 +1503,13 @@ writes mc:this_function
       lforeach(fn (var) var[mc:v_number] = -var[mc:v_number], allvars);
       ifn[mc:c_fallvars] = allvars = list_to_vector(null . lreverse!(allvars));
 
-      ifn[mc:c_flocals] = bitset_to_list(locals, allvars);
-      ifn[mc:c_fglobals] = bitset_to_list(globals, allvars);
-      ifn[mc:c_fclosure] = bitset_to_list(closures, allvars);
-      ifn[mc:c_flocals_write] = bitset_to_list(wlocals, allvars);
-      ifn[mc:c_fglobals_write] = wglobals = bitset_to_list(wglobals, allvars);
+      ifn[mc:c_flocals] = bitset_map_list(locals, allvars);
+      ifn[mc:c_fglobals] = bitset_map_list(globals, allvars);
+      ifn[mc:c_fclosure] = bitset_map_list(closures, allvars);
+      ifn[mc:c_flocals_write] = bitset_map_list(wlocals, allvars);
+      ifn[mc:c_fglobals_write] = wglobals = bitset_map_list(wglobals, allvars);
       ifn[mc:c_fclosure_write] = wclosures
-        = bitset_to_list(wclosures, allvars);
+        = bitset_map_list(wclosures, allvars);
       ifn[mc:c_fnvars] = vindex + 1;
 
       | escapes |
@@ -1456,16 +1543,13 @@ writes mc:this_function
 
 	  // fold constants in all basic blocks
 	  graph_nodes_apply(fn (n) [
-            | this, prev, ilist |
+            | this, ilist |
             ilist = graph_node_get(n)[mc:f_ilist];
             if (ilist == null) exit<function> null;
             this = ilist;
             loop
               [
-                | il |
-                il = dget(this);
-                fold_constants(il, prev);
-                prev = il;
+                fold_constants(this);
                 this = dnext(this);
                 if (this == ilist) exit null;
               ];
@@ -1473,11 +1557,7 @@ writes mc:this_function
 
 	  // compute basic information
 	  mc:recompute_vars(f, false);
-          if (propagate_closure_constants(f))
-            [
-              change = true;
-              exit<continue> null;
-            ];
+          propagate_closure_constants(f);
 
 	  mc:flow_ambiguous(f, mc:f_ambiguous_w);
 	  mc:flow_ambiguous(f, mc:f_ambiguous_rw);

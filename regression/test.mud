@@ -4,71 +4,75 @@
 (global-set-key "\M-[" 'execline)
 */
 
+reval = fn (s)
+  if (!eval(s))
+    [
+      warning("eval() FAILED");
+      quit(1);
+    ];
+
 regress = fn (name, x, expected)
-  dformat("%s: got %s, expected %s: %s%n",
-		 name, x, expected,
-		 if (equal?(x, expected)) "passed" else "FAILED");
+  dformat("%s: got %s, expected %s: %s\n",
+          name, x, expected,
+          if (equal?(x, expected)) "passed" else "FAILED");
 
-unparse = fn (x)
-  [
-    | sp |
+unparse = fn (x) format("%w", x);
 
-    sp = make_string_oport();
-    with_output(sp, fn () write(x));
-    port_string(sp)
-  ];
-
-eval("id = fn (x) x");
+reval("id = fn (x) x");
 
 regresseval = fn (name, x, expected)
   [
     resvar1 = 44;
     resvar2 = 445385798 . 23;
     resvar3 = "fufweoin";
-    eval("resvar1 = (" + x + ")");
-    eval("resvar2 = id(" + x + ")");
-    eval("resvar3 = [ | tmp | tmp = " + x + "; dummy(); tmp]");
-    dformat("%sv1: got %s, expected %s: %s%n",
-		   name, resvar1, expected,
-		   if (equal?(resvar1, expected)) "passed" else "FAILED");
-    dformat("%sv2: got %s, expected %s: %s%n",
-		   name, resvar2, expected,
-		   if (equal?(resvar2, expected)) "passed" else "FAILED");
-    dformat("%sv3: got %s, expected %s: %s%n",
-		   name, resvar3, expected,
-		   if (equal?(resvar3, expected)) "passed" else "FAILED");
+    reval("resvar1 = (" + x + ")");
+    reval("resvar2 = id(" + x + ")");
+    reval("resvar3 = [ | tmp | tmp = " + x + "; dummy(); tmp]");
+    dformat("%sv1: got %s, expected %s: %s\n",
+            name, resvar1, expected,
+            if (equal?(resvar1, expected)) "passed" else "FAILED");
+    dformat("%sv2: got %s, expected %s: %s\n",
+            name, resvar2, expected,
+            if (equal?(resvar2, expected)) "passed" else "FAILED");
+    dformat("%sv3: got %s, expected %s: %s\n",
+            name, resvar3, expected,
+            if (equal?(resvar3, expected)) "passed" else "FAILED");
   ];
 
 regressfail = fn (name, failingfn)
-  handle_error(fn () [ failingfn();
-		       dformat("%s FAILED to fail%n", name);
-		     ],
-	       fn (err) dformat("%s passed%n", name));
+  trap_error(fn () [ failingfn();
+                     dformat("%s FAILED to fail\n", name);
+                   ],
+	       fn (err) dformat("%s passed\n", name), call_trace_off, null);
 
 regresspass = fn (name, failingfn)
-  handle_error(fn () [ failingfn();
-		       dformat("%s passed%n", name);
-		     ],
-	       fn (err) dformat("%s FAILED%n", name));
+  trap_error(fn () [ failingfn();
+                     dformat("%s passed\n", name);
+                   ],
+	       fn (err) dformat("%s FAILED\n", name), call_trace_off, null);
 
 regressqfail = fn (name, failstr)
   [
-    eval("failfn = fn () (" + failstr + ")");
+    reval("failfn = fn () (" + failstr + ")");
     regressfail(name, failfn);
   ];
 
 regressqpass = fn (name, failstr)
   [
-    eval("failfn = fn () (" + failstr + ")");
+    reval("failfn = fn () (" + failstr + ")");
     regresspass(name, failfn);
   ];
 
-eval("dummy = fn () 1");
+reval("dummy = fn () 1");
 wrong = 0;
 regresslocal = fn (name, arg, x, expected)
   [
-    regresseval(name+"_l1", format("[ | li | li = %s; if (wrong) li = 0; dummy(); %s ]", unparse(arg), x), expected);
-    regresseval(name+"_l2", format("[ | li | li = %s; if (wrong) li = 0; %s ]", unparse(arg), x), expected);
+    regresseval(name+"_l1",
+                format("[ | li | li = %s; if (wrong) li = 0; dummy(); %s ]",
+                       unparse(arg), x), expected);
+    regresseval(name+"_l2",
+                format("[ | li | li = %s; if (wrong) li = 0; %s ]",
+                       unparse(arg), x), expected);
   ];
 
 regress2args = fn (name, a1, a2, x, expected)
@@ -81,7 +85,8 @@ regress2args = fn (name, a1, a2, x, expected)
 		       unparse(a2), x),
 		expected);
     regresseval(name + "_gl2", // global local2
-		format("[ | arg2 | arg2 = %s; if (wrong) arg2 = 0; dummy(); %s ]",
+		format("""[ | arg2 | arg2 = %s; if (wrong) arg2 = 0; dummy();\
+ %s ]""",
 		       unparse(a2), x),
 		expected);
     regresseval(name + "_l1g", // local1 global
@@ -89,23 +94,28 @@ regress2args = fn (name, a1, a2, x, expected)
 		       unparse(a1), x),
 		expected);
     regresseval(name + "_l1l1", // local1 local1
-		format("[ | arg1, arg2 | arg1 = %s; arg2 = %s; if (wrong) arg1 = arg2 = 0; %s ]",
+		format("""[ | arg1, arg2 | arg1 = %s; arg2 = %s; if (wrong)\
+ arg1 = arg2 = 0; %s ]""",
 		       unparse(a1), unparse(a2), x),
 		expected);
     regresseval(name + "_l1l2", // local1 local2
-		format("[ | arg1, arg2 | arg1 = %s; dummy(); arg2 = %s; if (wrong) arg1 = arg2 = 0; %s ]",
+		format("""[ | arg1, arg2 | arg1 = %s; dummy(); arg2 = %s; if\
+ (wrong) arg1 = arg2 = 0; %s ]""",
 		       unparse(a1), unparse(a2), x),
 		expected);
     regresseval(name + "_l2g", // local2 global
-		format("[ | arg1 | arg1 = %s; if (wrong) arg1 = 0; dummy(); %s ]",
+		format("""[ | arg1 | arg1 = %s; if (wrong) arg1 = 0; dummy();\
+ %s ]""",
 		       unparse(a1), x),
 		expected);
     regresseval(name + "_l2l1", // local2 local1
-		format("[ | arg1, arg2 | arg2 = %s; dummy(); arg1 = %s; if (wrong) arg1 = arg2 = 0; %s ]",
+		format("""[ | arg1, arg2 | arg2 = %s; dummy(); arg1 = %s; if\
+ (wrong) arg1 = arg2 = 0; %s ]""",
 		       unparse(a2), unparse(a1), x),
 		expected);
     regresseval(name + "_l2l2", // local2 local2
-		format("[ | arg1, arg2 | arg1 = %s; arg2 = %s; dummy(); if (wrong) arg1 = arg2 = 0; %s ]",
+		format("""[ | arg1, arg2 | arg1 = %s; arg2 = %s; dummy(); if\
+ (wrong) arg1 = arg2 = 0; %s ]""",
 		       unparse(a1), unparse(a2), x),
 		expected);
   ];
@@ -130,7 +140,8 @@ regress1arg = fn (name, a1, x, expected)
 		       s1, x),
 		expected);
     regresseval(name + "_l2", // local2
-		format("[ | arg1 | arg1 = %s; if (wrong) arg1 = 0; dummy(); %s ]",
+		format("""[ | arg1 | arg1 = %s; if (wrong) arg1 = 0; dummy();\
+ %s ]""",
 		       s1, x),
 		expected);
   ];

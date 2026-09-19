@@ -19,8 +19,6 @@
  * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-#include <string.h>
-
 #include "bool.h"
 #include "prims.h"
 
@@ -31,18 +29,25 @@ TYPEDOP(not, "!", "`b1 -> `b2. Returns the logical negation of `b1.",
   return makebool(isfalse(v));
 }
 
-TYPEDOP(or, "||", "`b1 `b2 -> `b3. Returns `b1 logical or `b2.",
+TYPEDOP(or, "||", "`b1 `b2 -> `b3. Returns `b1 logical OR `b2.",
         (value v1, value v2),
         OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_TRIVIAL | OP_OPERATOR, "xx.n")
 {
   return makebool(istrue(v1) || istrue(v2));
 }
 
-TYPEDOP(and, "&&", "`b1 `b2 -> `b3. Returns `b1 logical and `b2.",
+TYPEDOP(and, "&&", "`b1 `b2 -> `b3. Returns `b1 logical AND `b2.",
         (value v1, value v2),
         OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_TRIVIAL | OP_OPERATOR, "xx.n")
 {
   return makebool(istrue(v1) && istrue(v2));
+}
+
+TYPEDOP(xor, "^^", "`b1 `b2 -> `b3. Returns `b1 logical exclusive OR `b2.",
+        (value v1, value v2),
+        OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_TRIVIAL | OP_OPERATOR, "xx.n")
+{
+  return makebool(istrue(v1) != istrue(v2));
 }
 
 TYPEDOP(equal, "==", "`x1 `x2 -> `b. Returns true if `x1 and `x2"
@@ -66,6 +71,7 @@ void bool_init(void)
   DEFINE(not);
   DEFINE(or);
   DEFINE(and);
+  DEFINE(xor);
   DEFINE(equal);
   DEFINE(not_equal);
   system_define("true", makebool(true));

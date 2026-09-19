@@ -24,7 +24,6 @@
 
 #include <string.h>
 
-#include "error.h"
 #include "mvalues.h"
 
 struct table *alloc_table(ulong size);
@@ -37,7 +36,7 @@ struct table *alloc_ctable(ulong size);
    Requires: size be a power of 2, smaller or equal than 2^30.
 */
 
-static inline bool is_ctable(struct table *t)
+static ALWAYS_INLINE bool is_ctable(struct table *t)
 {
   return (long)t->used < 0;
 }
@@ -67,7 +66,7 @@ static inline struct symbol *table_mlookup(struct table *table,
 
 struct symbol *table_remove(struct table *table, const char *name);
 struct symbol *table_remove_len(struct table *table, const char *name,
-				size_t nlength);
+                                size_t nlength);
 /* Effects: Removes table[name] from data. Rehashes nescessary values.
    Modifies: table
    Returns: The removed symbol, or NULL if not found.
@@ -109,8 +108,11 @@ struct list *table_prefix(struct table *table, struct string *prefix);
      prefix (case insensitive, like all table ops)
 */
 
-void protect_table(struct table *table);
-void immutable_table(struct table *table);
+void protect_table(struct table *table);   /* shallow protect */
+void immutable_table(struct table *table); /* shallow immutable */
+struct table *try_make_table_immutable(struct table *table); /* shallow */
+/* table & symbols immutable */
+struct table *make_table_immutable(struct table *table);
 
 static inline ulong table_entries(struct table *table)
 {
@@ -118,19 +120,25 @@ static inline ulong table_entries(struct table *table)
   return n < 0 ? ~n : n;
 }
 
+size_t table_non_null_entries(struct table *table);
+
+struct vector *table_vector(struct table *table);
+struct vector *sorted_table_vector(struct table *table);
+
 struct symbol *table_exists(struct table *table,
                             bool (*check)(struct symbol *sym, void *data),
                             void *data);
-void table_foreach(struct table *table, void *data,
-                   void (*action)(struct symbol *, void *));
+void table_foreach(struct table *table,
+                   void (*action)(struct symbol *sym, void *data),
+                   void *data);
 
 struct table *table_copy(struct table *table);
 struct table *table_shallow_copy(struct table *table);
 
 void rehash_table(struct table *table);
 
-#define DEF_TABLE_SIZE 8	/* Convenient initial size */
+#define DEF_TABLE_SIZE 8        /* Convenient initial size */
 
-int table_good_size(int entries);
+ulong table_good_size(ulong entries);
 
 #endif /* TABLE_H */

@@ -21,13 +21,14 @@
 
 library ax64 // The x64 assembler
 requires mx64, dlist, sequences, misc, compiler, vars
-defines x64:assemble, x64:reset_counters
-reads mc:verbose, mc:disassemble, x64:reg_globals
+defines x64:assemble, x64:reset_counters, x64:ltype_may_indirect
+reads mc:verbose, mc:disassemble
 writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
 [
   | remove_aliases, resize_branches, increase_branches,
     assemble, ins_size, iops, ins_gen,
-    int8?, uint8?, int31?, int32?, uint32?, immediate8?, immval8, immval32,
+    int7?, int8?, uint8?, int31?, int32?, uint32?, immediate8?,
+    immval8, immval32,
     immediate_low32, immediate_high32,
     register?, regval,
     peephole,
@@ -38,10 +39,10 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
   word_size = 8;
 
   rex_op = 0x40;
-  rex_w  = 8;
-  rex_r  = 4;
-  rex_x  = 2;
-  rex_b  = 1;
+  rex_w  = 8;                   // 64-bit operand; access all byte registers
+  rex_r  = 4;                   // ModR/M reg field
+  rex_x  = 2;                   // SIB index
+  rex_b  = 1;                   // ModR/M r/m, SIB base, or Opcode reg field
 
   reg_hi = 8;                   // high bit of register number
 
@@ -65,6 +66,7 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
         (,x64:lreg . ,x64:reg_rax) => true
       ];
 
+  int7? = fn (int n) n >= -64 && n <= 63;
   int8? = fn (int n) n >= -128 && n <= 127;
   uint8? = fn (int n) (n & ~0xff) == 0;
 
@@ -79,6 +81,154 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
 
   x64:reset_counters();
 
+  | simple_equal?, high_int_equal? |
+  simple_equal? = fn (a, b) a == b;
+
+  // only accept numbers whose immediate_high32() is non-zero; the
+  // others can be loaded using 32-bit mov
+  high_int_equal? = fn (a, b)
+    [
+      | fromint |
+      fromint = fn (n) (n >> 1) . (n & 1);
+      if (integer?(a))
+        a = fromint(a);
+      if (integer?(b))
+        b = fromint(b);
+      (car(a) == car(b) && cdr(a) == cdr(b)
+       && ((car(a) >> 31) & 0xffffffff) != 0)
+    ];
+
+  // indices into x64:ltype_info entries
+  | ltype_info, lti_size, lti_aidx, lti_eq? |
+  lti_size = 0;               // size in bytes of operand
+  lti_aidx = 1;               // mc:a_xxx list where operand is stored
+  lti_eq?  = 2;               // equality check for operands
+
+  ltype_info = indexed_sequence(
+    x64:limm             . '[4 ()                 ()],
+    x64:lcst             . '[8 ,mc:a_constants    ,simple_equal?],
+    x64:lfunction        . '[8 ()                 ()],
+    x64:lcalled          . '[8 ()                 ()],
+    x64:lcalled_global   . '[8 ,mc:a_kglobal_code ,string_iequal?],
+    x64:lprimitive       . '[8 ,mc:a_primitives   ,string_iequal?],
+    x64:lclosure         . '[8 ()                 ()],
+    x64:lglobal          . '[4 ,mc:a_globals      ()],
+    x64:lglobal_constant . '[8 ,mc:a_kglobals     ,simple_equal?],
+    x64:lglobal_index    . '[4 ,mc:a_globals      ()],
+    x64:lseclev          . '[4 ,mc:a_seclevs      ()],
+    x64:lindirect        . '[4 ()                 ()],
+    x64:limm64           . '[8 ()                 ,high_int_equal?],
+    x64:lbuiltin         . '[8 ,mc:a_builtins     ,string_equal?],
+    x64:lprimop          . '[8 ,mc:a_primops      ,string_iequal?],
+    x64:lnone . null);
+
+  // true if 'ltype' (x64:lxxx) may be converted to a move to %r11 and
+  // then a register access
+  x64:ltype_may_indirect = fn (int ltype)
+    [
+      | linfo |
+      linfo = ltype_info[ltype];
+      linfo != null && linfo[lti_eq?] != null
+    ];
+
+  | make_ilpos_indirect, make_ilpos_direct |
+  make_ilpos_indirect = fn (ilpos)
+    [
+      | il, ins, op |
+      il = dget(ilpos);
+      ins = il[x64:il_ins];
+      op = ins[x64:i_op];
+
+      if (op == x64:op_mov)
+        assert(car(ins[x64:i_arg2]) == x64:lreg);
+      | arg1 |
+      arg1 = ins[x64:i_arg1];
+      assert(car(arg1) != x64:lindirect);
+      ins[x64:i_arg1] = x64:lindirect . arg1;
+    ];
+
+  make_ilpos_direct = fn (fcode, ilpos)
+    [
+      | il, ins |
+      il = dget(ilpos);
+      ins = il[x64:il_ins];
+
+      // insert mov <arg>,%r11 before this instruction and change our
+      // argument to be %r11
+      | treg, old_insert, old_loc |
+      old_insert = x64:get_instructions(fcode);
+      old_loc = mc:get_loc();
+
+      mc:set_loc(il[x64:il_loc]);
+      x64:set_instruction(fcode, dnext(ilpos));
+
+      x64:copy_instruction(fcode, il);
+      treg = x64:lreg . x64:reg_r11;
+      il[x64:il_ins] = vector(x64:op_mov, ins[x64:i_arg1], treg);
+      ins[x64:i_arg1] = treg;
+
+      x64:set_instruction(fcode, old_insert);
+      mc:set_loc(old_loc);
+    ];
+
+  | finish_indirect |
+  finish_indirect = fn (fcode)
+    [
+      | idata, ilist, ilpos |
+      idata = make_vector(x64:lbuiltin + 1);
+      ilist = x64:get_instructions(fcode);
+      ilpos = ilist;
+      loop
+        [
+          | il, ins, arg1, ltype, linfo, eq?, op |
+          il = dget(ilpos);
+          ins = il[x64:il_ins];
+          arg1 = ins[x64:i_arg1];
+          op = ins[x64:i_op];
+
+          <done> [
+            | no_arg1_ops |
+            no_arg1_ops = sequence(
+              x64:op_jmp, x64:op_jcc, x64:op_jmp32, x64:op_jcc32);
+            if (arg1 == null || vfind?(op, no_arg1_ops))
+              exit<done> null;
+
+            ltype = car(arg1);
+            linfo = ltype_info[ltype];
+            if (linfo == null) exit<done> null;
+            eq? = linfo[lti_eq?];
+            if (eq? == null) exit<done> null;
+
+            | entry, aval, mov? |
+            aval = cdr(arg1);
+            entry = lexists?(fn (@[v ...]) eq?(v, aval), idata[ltype]);
+            mov? = ins[x64:i_op] == x64:op_mov;
+            if (!entry)
+              idata[ltype] = vector(
+                aval, if (mov?) ilpos else null,
+                if (mov?) null else list(ilpos)) . idata[ltype]
+            else if (entry[1] == null && mov?)
+              entry[1] = ilpos
+            else
+              entry[2] = ilpos . entry[2];
+          ];
+
+          ilpos = dnext(ilpos);
+          if (ilpos == ilist) exit null;
+        ];
+
+      vforeach(fn (entries) [
+        lforeach(fn (@[_ mov seen]) [
+          if (mov == null)
+            [
+              @(mov . seen) = lreverse!(seen);
+              make_ilpos_direct(fcode, mov);
+            ];
+          lforeach(make_ilpos_indirect, seen)
+        ], entries)
+      ], idata);
+    ];
+
   x64:assemble = fn "x64code -> x64asm" (fcode)
     [
       | ilist |
@@ -90,7 +240,10 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
 	  x64:ins_list(fcode);
 	  newline();
 	];
+
       ilist = peephole(ilist);
+      finish_indirect(fcode);
+
       if (mc:verbose >= 4 || mc:disassemble)
 	[
 	  x64:ins_list(fcode);
@@ -135,6 +288,17 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
         (,x64:lidx . ((,x64:reg_rsp || ,x64:reg_rbp) . _)) => true;
       ];
 
+  | cc_unops, cc_binops, no_cc_ops |
+  // these operations set condition codes (ZF, PF, SF at least)
+  cc_unops = '[,x64:op_dec ,x64:op_inc ,x64:op_neg];
+  cc_binops = '[,x64:op_add ,x64:op_and ,x64:op_or ,x64:op_sub ,x64:op_xor];
+  // these don't change conditions codes (but write to a destination)
+  no_cc_ops = '[,x64:op_mov ,x64:op_lea];
+
+  | same_reg? |
+  same_reg? = fn (@(ca . va), @(cb . vb))
+    ca == x64:lreg && cb == x64:lreg && va == vb;
+
   peephole = fn (ilist)
     // Types: ilist: list of x64 instructions
     // Requires: ilist != null, no aliased labels
@@ -173,7 +337,76 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
 	      ++mc:labeled_jmp;
 	    ];
 
-          if (!ilabel && (jmp != null || noreturn != null))
+          if (op == x64:op_test
+              && !ilabel && jmp == null && jcc == null && noreturn == null
+              && same_reg?(ins[x64:i_arg1], ins[x64:i_arg2]))
+            <skip> [
+              // this is 'test %reg,%reg'; remove if the previous instruction
+              // was an arithmetic instruction with %reg as destination, and
+              // the following instruction is a suitable jcc or cmovcc
+              | previ, previl, previns, prevop, reg |
+              reg = ins[x64:i_arg1];
+              previ = iscan;
+              loop
+                [
+                  previ = dprev(previ);
+                  previl = dget(previ);
+                  previns = previl[x64:il_ins];
+                  prevop = previns[x64:i_op];
+                  if (!vfind?(prevop, no_cc_ops))
+                    exit null;
+                  if (previl[x64:il_label])
+                    exit<skip> null;
+                  if (same_reg?(reg, previns[x64:i_arg2]))
+                    exit<skip> null;
+                ];
+
+              if (((vfind?(prevop, cc_binops)
+                    // special case below
+                    || (prevop == x64:op_orbyte
+                        && car(previns[x64:i_arg1]) == x64:limm))
+                   && same_reg?(reg, previns[x64:i_arg2]))
+                  || (vfind?(prevop, cc_unops)
+                      && same_reg?(reg, previns[x64:i_arg1])))
+                <skip> [
+                  | nextins, nextop, cop |
+                  nextins = dget(dnext(iscan))[x64:il_ins];
+                  nextop = nextins[x64:i_op];
+                  if (nextop == x64:op_jcc)
+                    cop = nextins[x64:i_arg2]
+                  else if (nextop == x64:op_cmovcc)
+                    @(,x64:lidx . (_ . cop)) = nextins[x64:i_arg2];
+
+                  if (cop == null
+                      || !vfind?(cop, '[ ,x64:be ,x64:bne ,x64:bs ,x64:bns ]))
+                    [
+                      // unsupported trailing instruction; branch ops cannot
+                      // use OF/CF which are cleared by 'test'
+                      if (mc:verbose > 0)
+                        [
+                          display("UNEXPECTED next instruction after ");
+                          x64:print_ins(ins);
+                          display(" : ");
+                          x64:print_ins(nextins);
+                          newline();
+                        ];
+                      exit<skip> null;
+                    ];
+
+                  if (prevop == x64:op_orbyte)
+                    [
+                      // upgrade 'or8 <imm>,%reg' to 'or <imm>,%reg'
+                      previns[x64:i_op] = x64:op_or;
+                      previns[x64:i_arg1] =
+                        x64:limm . immval8(previns[x64:i_arg1]);
+                    ];
+
+                  // remove this unnecessary test instruction
+                  dremove!(iscan, ilist);
+                  iscan = previ;
+                ];
+            ]
+          else if (!ilabel && (jmp != null || noreturn != null))
             [
               dremove!(iscan, ilist);
               iscan = if (noreturn != null) noreturn else jmp;
@@ -236,13 +469,11 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
                     iscan = previ;
                   ];
 
+                  | cc |
+                  cc = jcc[x64:i_arg2] ^ 1; // inverse cc
                   jcc[x64:i_op] = x64:op_cmovcc;
                   jcc[x64:i_arg1] = ins[x64:i_arg1];
-                  jcc[x64:i_arg2] = cons(
-                    x64:lidx,
-                    cons(
-                      cdr(ins[x64:i_arg2]),
-                      jcc[x64:i_arg2] ^ 1)); // inverse cc
+                  jcc[x64:i_arg2] = x64:lidx . (cdr(ins[x64:i_arg2]) . cc);
 
                   if (mc:verbose >= 3)
                     [
@@ -324,10 +555,41 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
     while (increase_branches(ilist))
       null;
 
-  | pri_used, pri_ofs |
+  | insert_int |
+  insert_int = fn (code, offset, nbytes, val)
+    while (nbytes > 0)
+      [
+        code[offset++] = val;
+        val >>= 8;
+        --nbytes;
+      ];
+
+  | pri_used, pri_ofs, pri_absv, pri_indv |
   // data for PC-relatative (%rip-relative) addressing
   pri_used = 0;                 // number of slots used
   pri_ofs  = 1;                 // code offset of the first slot
+  pri_absv = 2;                 // vector of offsets for immediate uses
+  pri_indv = 3;                 // vector of offsets for %rip-relative uses
+
+  | patch_indirects |
+  patch_indirects = fn (code, info, pcrel_info)
+    [
+      vforeachi(fn (ltype, l) [
+        if (l == null) exit<function> null;
+
+        | linfo, eq?, absv |
+        linfo = ltype_info[ltype];
+        eq? = linfo[lti_eq?];
+        assert(eq? != null);
+        absv = pcrel_info[pri_absv][ltype];
+
+        lforeach(fn (@(x . offset)) [
+          | absofs |
+          absofs = cdr(lexists?(fn (@(v . _)) eq?(x, v), absv));
+          insert_int(code, offset, 4, absofs - (offset + 4))
+        ], l);
+      ], pcrel_info[pri_indv]);
+    ];
 
   assemble = fn (ilist)
     [
@@ -346,7 +608,11 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
       info = make_vector(mc:a_info_fields);
 
       | pcrel_info |
-      pcrel_info = vector(0, reloc_start);
+      pcrel_info = indexed_vector(
+        pri_used . 0,
+        pri_ofs  . reloc_start,
+        pri_absv . make_vector(x64:lnone),
+        pri_indv . make_vector(x64:lnone));
 
       | last_line, linenos |
 
@@ -364,50 +630,63 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
       linenos = (code_end . last_line) . linenos;
       dforeach(fn (il) il[x64:il_offset] = il[x64:il_offset][0], ilist);
 
+      patch_indirects(code, info, pcrel_info);
+
       info[mc:a_linenos] = vreverse!(list_to_vector(linenos));
-      info[mc:a_rel_primitives] = pcrel_info[pri_used];
+      info[mc:a_npcrel] = pcrel_info[pri_used];
 
       code . info
     ];
 
   immval8 = fn (arg)
-    [
-      | i |
+    match! (cdr(arg))
+      [
+        {int} i => [
+          assert(int8?(i));
+          i
+        ];
+        ({int} i . e) => [
+          assert(int7?(i));
+          i * 2 + e
+        ];
+      ];
 
-      i = cdr(arg);
-      if (integer?(i)) i
-      else if (int8?(car(i))) // arithmetic fails on large numbers
-	2 * car(i) + cdr(i)
-      else
-        0xbad; // something that is false for int8? !
-    ];
   immval32 = fn (arg)
     match! (cdr(arg))
       [
-        i && integer?(i) => [
+        {int} i => [
           assert(int32?(i));
           i
         ];
-        (i . e) && integer?(i) => [
+        ({int} i . e) => [
           assert(int31?(i));
           i * 2 + e
         ];
       ];
+
   immediate_low32 = fn (arg)
-    (match (cdr(arg))
-      [
-        i && integer?(i) => i;
-        (i . e) && integer?(i) => (i * 2) + e
-      ]) & 0xffffffff;
+    (match! (cdr(arg))
+     [
+       {int} i => i;
+       ({int} i . e) => (i * 2) + e
+     ]) & 0xffffffff;
 
   immediate_high32 = fn (arg)
-    (match (cdr(arg))
-      [
-        i && integer?(i) => i >> 32;
-        (i . _) && integer?(i) => i >> 31;
-      ]) & 0xffffffff;
+    (match! (cdr(arg))
+     [
+       {int} i => i >> 32;
+       ({int} i . _) => i >> 31;
+     ]) & 0xffffffff;
 
-  immediate8? = fn (arg) car(arg) == x64:limm && int8?(immval8(arg));
+  immediate8? = fn (arg)
+    if (car(arg) != x64:limm)
+      false
+    else
+      match! (cdr(arg))
+        [
+          {int} i => int8?(i);
+          ({int} i . _) => int7?(i);
+        ];
 
   register? = fn (arg) car(arg) == x64:lreg;
   regval = cdr;
@@ -593,13 +872,13 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
           ,x64:lglobal => [
             vector(iop_rex_modrm(op, rex, 0x80, reg1, x64:reg_globals), a2)
           ];
-          ,x64:lcst || ,x64:lglobal_constant || ,x64:lindirect => [
-            if (car(a2) != x64:lindirect)
-              a2 = x64:lindirect . a2;
+          ,x64:lindirect => [
+            // %rip-relative addressing
             vector(iop_rex_modrm(op, rex, 0, reg1, 5), a2)
           ];
         ]
     ];
+
   iops[x64:op_push] = fn (a1, a2)
     match (car(a1))
       [
@@ -623,6 +902,29 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
 
   iops[x64:op_leave] = fn (a1, a2) iop_op(0xc9);
   iops[x64:op_ret] = fn (a1, a2) iop_op(0xc3);
+
+  iops[x64:op_bsf] = fn (a1, a2)
+    [
+      assert(register?(a2));
+      iop_rex_reg_modrm(0xbc0f, rex_op | rex_w, regval(a2), a1);
+    ];
+
+  iops[x64:op_bt] = fn (a1, a2)
+    [
+      if (immediate8?(a1))
+        [
+          | v, rex |
+          v = immval8(a1);
+          assert(v >= 0 && v < 64);
+          rex = if (v < 32) 0 else rex_op | rex_w;
+          vector(iop_rex_reg_modrm(0xba0f, rex, 4, a2), op_int8(v))
+        ]
+      else
+        [
+          assert(register?(a1));
+          iop_rex_reg_modrm(0xa30f, rex_op | rex_w, regval(a1), a2);
+        ]
+    ];
 
   iops[x64:op_movzxbyte] = fn (a1, a2)
     [
@@ -652,8 +954,9 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
           vector(iop_rex_reg(0xb8, 0, regval(a2)),
                  op_int32(immediate_low32(a1)))
         ];
-        ,x64:lcst || ,x64:lglobal_constant || ,x64:lspecial || ,x64:lclosure
-        || ,x64:lfunction || ,x64:lprimitive || ,x64:limm64 => [
+        ,x64:lcst || ,x64:lglobal_constant || ,x64:lclosure || ,x64:lbuiltin
+          || ,x64:lfunction || ,x64:lcalled || ,x64:lcalled_global
+          || ,x64:lprimitive || ,x64:lprimop || ,x64:limm64 => [
             // 64-bit immediate mov
             assert(register?(a2));
             vector(iop_rex_reg(0xb8, rex_op | rex_w, regval(a2)), a1)
@@ -685,9 +988,13 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
       [
         ,x64:limm => [
           | imm, rex |
-          imm = immval32(a1);
-
           rex = dflt_rex;
+
+          // 'and' immediate can be unsigned 32-bit
+          imm = if (modrm_reg == 4 && immediate_high32(a1) == 0)
+            immediate_low32(a1)
+          else
+            immval32(a1);
 
           // special-case and $imm,%rXd
           if (modrm_reg == 4 && register?(a2) && uint32?(imm))
@@ -736,6 +1043,8 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
 
   iop_math_byte = fn (modrm_reg) fn (a1, a2)
     [
+      | rex |
+      rex = reg8_rex(a1) | reg8_rex(a2);
       if (immediate8?(a1))
         [
           | imm |
@@ -743,24 +1052,26 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
           if (rax?(a2))
             vector(iop_op(0x04 + (modrm_reg << 3)), op_int8(imm))
           else
-            vector(iop_rex_reg_modrm(0x80, 0, modrm_reg, a2), imm)
+            vector(iop_rex_reg_modrm(0x80, rex, modrm_reg, a2), imm)
         ]
       else if (register?(a1))
-        iop_rex_reg_modrm(modrm_reg << 3, 0, regval(a1), a2)
+        iop_rex_reg_modrm(modrm_reg << 3, rex, regval(a1), a2)
       else
         [
           assert(register?(a2));
-          iop_rex_reg_modrm(2 + (modrm_reg << 3), 0, regval(a2), a1)
+          iop_rex_reg_modrm(2 + (modrm_reg << 3), rex, regval(a2), a1)
         ];
     ];
 
   iops[x64:op_orbyte] = iop_math_byte(1);
+  iops[x64:op_xorbyte] = iop_math_byte(6);
   iops[x64:op_cmpbyte] = iop_math_byte(7);
 
   iop_unary_math = fn (op, modrm_reg) fn (a1, a2)
     iop_rex_reg_modrm(op, rex_op | rex_w, modrm_reg, a1);
 
   iops[x64:op_dec] = iop_unary_math(0xff, 1);
+  iops[x64:op_inc] = iop_unary_math(0xff, 0);
   iops[x64:op_not] = iop_unary_math(0xf7, 2);
   iops[x64:op_neg] = iop_unary_math(0xf7, 3);
 
@@ -799,8 +1110,24 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
 
   iops[x64:op_movbyte] = fn (a1, a2)
     [
-      assert(register?(a1));
-      iop_rex_reg_modrm(0x88, reg8_rex(a1), regval(a1), a2);
+      | rex |
+      rex = reg8_rex(a1) | reg8_rex(a2);
+      if (car(a1) == x64:limm)
+        [
+          | op, val |
+          val = immval32(a1);
+          assert(val >= -128 && val <= 255);
+          op = if (register?(a2))
+            iop_rex_reg(0xb0, rex, regval(a2))
+          else
+            iop_rex_reg_modrm(0xc6, rex, 0, a2);
+          vector(op, op_int8(val))
+        ]
+      else
+        [
+          assert(register?(a1));
+          iop_rex_reg_modrm(0x88, rex, regval(a1), a2);
+        ]
     ];
 
   iops[x64:op_test] = fn (a1, a2)
@@ -809,7 +1136,10 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
         [
           | iop, val, rax |
           rax = rax?(a2);
-          val = immval32(a1);
+          val = if (immediate_high32(a1) == 0)
+            immediate_low32(a1)
+          else
+            immval32(a1);
           if (uint8?(val))
             [
               iop = if (rax)
@@ -849,14 +1179,19 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
       iop_rex_reg_modrm(0x8d, 0, regval(a2), a1);
     ];
 
-  iops[x64:op_setcc] = fn (a1, a2)
+  iops[x64:op_setcc] = fn (@(,x64:lnone . a1), a2)
     iop_rex_reg_modrm(0x900f | (a1 << 8), reg8_rex(a2), 0, a2);
-  iops[x64:op_cmovcc] = fn (a1, a2)
+
+  | iop_cmovcc |
+  iop_cmovcc = fn (rex) fn (a1, a2)
     [
       | r2, cc |
       @(,x64:lidx . (r2 . cc)) = a2;
-      iop_rex_reg_modrm(0x400f | (cc << 8), rex_op | rex_w, r2, a1);
+      iop_rex_reg_modrm(0x400f | (cc << 8), rex, r2, a1);
     ];
+
+  iops[x64:op_cmovcc]   = iop_cmovcc(rex_op | rex_w);
+  iops[x64:op_cmovcc32] = iop_cmovcc(0);
 
   iops[x64:op_jmp] = fn (a1, a2)
     vector(iop_op(0xeb), imm_jmp8);
@@ -873,6 +1208,12 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
   | iop_shift |
   iop_shift = fn (op) fn (a1, a2)
     [
+      if (register?(a1))
+        [
+          assert(regval(a1) == x64:reg_rcx);
+          exit<function> iop_rex_reg_modrm(0xd3, rex_op | rex_w, op, a2);
+        ];
+
       assert(immediate8?(a1));
       match (immval8(a1))
         [
@@ -885,6 +1226,12 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
   iops[x64:op_shl] = iop_shift(4);
   iops[x64:op_shr] = iop_shift(5);
   iops[x64:op_sar] = iop_shift(7);
+
+  | ltype_to_subfn |
+  ltype_to_subfn = indexed_sequence(
+    x64:lclosure  . mc:subfn_closure,
+    x64:lfunction . mc:subfn_code,
+    x64:lcalled   . mc:subfn_called);
 
   ins_size = fn (val)
     [
@@ -900,25 +1247,8 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
       else if (function?(val))
         val(0)
       else
-        match (car(val))
-          [
-            ,x64:lindirect || ,x64:lglobal_index || ,x64:lglobal
-              || ,x64:lseclev || ,x64:limm => 4;
-            ,x64:lspecial || ,x64:lclosure
-              || ,x64:limm64 || ,x64:lcst || ,x64:lglobal_constant
-              || ,x64:lfunction || ,x64:lprimitive => 8;
-            _ => fail_message(format("unknown op %w", val))
-          ]
+        ltype_info[car(val)][lti_size]
     ];
-
-  | insert_int |
-  insert_int = fn (code, offset, nbytes, val)
-    while (nbytes > 0)
-      [
-        code[offset++] = val;
-        val >>= 8;
-        --nbytes;
-      ];
 
   ins_gen = fn (code, il, ops, offset, size, info, pcrel_info)
     [
@@ -938,13 +1268,13 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
           v = 0;
           nbytes = match (val)
             [
-              n && integer?(n) => [
+              {int} n => [
                 v = n;
                 nbytes = n >> 32;
                 assert(nbytes >= 0 && nbytes <= 4);
                 nbytes
               ];
-              f && function?(f) => [
+              {function} f => [
                 v = f(1);
                 nbytes = f(0);
                 assert(nbytes >= 0 && nbytes <= 4);
@@ -964,36 +1294,11 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
               ];
               (vop . varg) => [
                 match! (vop) [
-                  ,x64:lindirect => <done> [
-                    | info_list, x |
-                    if (string?(varg))
-                      [
-                        info_list = mc:a_builtins;
-                        x = varg;
-                      ]
-                    else
-                      [
-                        info_list = match! (car(varg))
-                          [
-                            ,x64:lcst => mc:a_constants;
-                            ,x64:lglobal_constant => mc:a_kglobals;
-                            ,x64:lprimitive => mc:a_primitives;
-                          ];
-                        x = cdr(varg);
-                      ];
-                    v = match (assq(x, info[info_list]))
-                      [
-                        (_ . o) => o;
-                        _ => [
-                          | indofs |
-                          indofs = (pcrel_info[pri_used] * word_size
-                                    + pcrel_info[pri_ofs]);
-                          info[info_list] = (x . indofs) . info[info_list];
-                          ++pcrel_info[pri_used];
-                          indofs
-                        ];
-                      ];
-                    v -= offset + 4;
+                  ,x64:lindirect => [
+                    | ltype, x |
+                    @(ltype . x) = varg;
+                    pcrel_info[pri_indv][ltype]
+                      = (x . offset) . pcrel_info[pri_indv][ltype];
                     4
                   ];
                   ,x64:limm => [
@@ -1001,57 +1306,27 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
                     4
                   ];
                   ,x64:limm64 => [
+                    pcrel_info[pri_absv][x64:limm64]
+                      = (varg . offset) . pcrel_info[pri_absv][x64:limm64];
+
                     insert_int(code, offset, 4, immediate_low32(val));
                     offset += 4;
                     v = immediate_high32(val);
                     4
                   ];
-                  ,x64:lglobal || ,x64:lglobal_index => [
-                    // varg is name for the byte offset into the global array
-                    // varg is name . x64:gl_c for the global index as a
-                    //   native integer
-                    // varg is name . x64:gl_mudlle for the global index as
-                    //   a mudlle integer
-                    info[mc:a_globals] = (varg . offset) . info[mc:a_globals];
-                    4
-                  ];
-                  ,x64:lseclev => [
-                    info[mc:a_seclevs] = (varg . offset) . info[mc:a_seclevs];
-                    4
-                  ];
-                  ,x64:lspecial => [
-                    info[mc:a_builtins]
-                      = (varg . offset) . info[mc:a_builtins];
+                  ,x64:lclosure || ,x64:lfunction || ,x64:lcalled => [
+                    info[mc:a_subfns] = vector(
+                      varg, offset, ltype_to_subfn[vop]) . info[mc:a_subfns];
                     8
                   ];
-                  ,x64:lclosure => [
-                    // negative offset = closure
-                    info[mc:a_subfns] = (varg . -offset) . info[mc:a_subfns];
-                    8
-                  ];
-                  ,x64:lfunction => [
-                    if (string?(varg))
-                      info[mc:a_kglobal_code]
-                        = (varg . offset) . info[mc:a_kglobal_code]
-                    else
-                      // positive offset = code
-                      info[mc:a_subfns] = (varg . offset) . info[mc:a_subfns];
-                    8
-                  ];
-                  ,x64:lprimitive => [
-                    info[mc:a_primitives]
-                      = (varg . offset) . info[mc:a_primitives];
-                    8
-                  ];
-                  ,x64:lcst => [
-                    info[mc:a_constants]
-                      = (varg . offset) . info[mc:a_constants];
-                    8
-                  ];
-                  ,x64:lglobal_constant => [
-                    info[mc:a_kglobals]
-                      = (varg . offset) . info[mc:a_kglobals];
-                    8
+                  ltype => [
+                    | linfo, aidx |
+                    linfo = ltype_info[ltype];
+                    aidx = linfo[lti_aidx];
+                    pcrel_info[pri_absv][ltype]
+                      = (varg . offset) . pcrel_info[pri_absv][ltype];
+                    info[aidx] = (varg . offset) . info[aidx];
+                    linfo[lti_size]
                   ];
                 ]
               ];
@@ -1067,7 +1342,7 @@ writes mc:nins, mc:nbytes, mc:jccjmp_count, mc:labeled_jmp
       if (oofs + size != offset)
         [
           x64:print_ins(il[x64:il_ins]); newline();
-          fail_message(format("bad size; expected %d got %d: ",
+          fail_message(format("bad size; expected %d got %d",
                               size, offset - oofs))
         ]
     ];

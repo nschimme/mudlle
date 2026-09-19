@@ -53,6 +53,8 @@
   #endif
 
 #else
+  #define RUNNING_ON_VALGRIND 0
+
   #define VALGRIND_CREATE_MEMPOOL(pool, rzB, is_zeroed) ((void)0)
   #define VALGRIND_DESTROY_MEMPOOL(pool) ((void)0)
   #define VALGRIND_DISCARD_TRANSLATIONS(_qzz_addr,_qzz_len) ((void)0)

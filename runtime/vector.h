@@ -24,11 +24,14 @@
 
 #include "../types.h"
 
-value code_vector_ref(struct vector *vec, value i);
-value code_vector_set(struct vector *vec, value i, value c);
+value vector_ref(struct vector *vec, value midx, const struct prim_op *op);
+value vector_set(struct vector *vec, value midx, value x,
+                 const struct prim_op *op);
 
 void vector_init(void);
 
 extern struct vector *empty_vector;
+
+extern const struct prim_op *const indexed_sequence_ext;
 
 #endif /* RUNTIME_VECTOR_H */

@@ -22,35 +22,46 @@
 #ifndef COMPILE_H
 #define COMPILE_H
 
-#include <stdbool.h>
-
 #include "types.h"
 
-struct constant;
-struct filename;
+struct mcallback;
 struct mfile;
+struct parser_config;
 
 extern struct component *component_undefined;
 extern struct component *component_true, *component_false;
+#define component_one component_true
 
 extern struct constant *constant_null;
 
-void init_string_cache(void);
-void free_string_cache(void);
-struct string *scache_alloc_str_len(const char *str, size_t len);
-struct string *scache_alloc_str(const char *str);
-
-value make_constant(const struct constant *c);
-value make_shared_string_constant(const struct constant *c,
-                                  struct table *cache);
-bool interpret(value *result, seclev_t seclev, bool reload);
+bool interpret(value *result, seclev_t seclev, bool reload,
+               const struct parser_config *pconfig);
 struct closure *compile_code(struct mfile *f, seclev_t seclev);
+
+/* returns a closure fn() that calls cb->f(cb->cbarg) */
+struct closure *make_primitive_closure(
+  struct mcallback *cb, const char *funcname, struct string *help,
+  const char *filename, int line);
 
 void compile_init(void);
 
-extern struct mfile *this_mfile;
+struct compiler_state {
+  struct compiler_state *prev;
+  struct mfile *prev_mfile;
+  struct alloc_block *block;
+  const struct parser_config *pconfig;
+};
 
-bool load_file(const char *fullname, const struct filename *fname,
-               seclev_t seclev, bool reload);
+void push_compiler_state(struct compiler_state *cstate,
+                         const struct parser_config *pconfig);
+void pop_compiler_state(struct compiler_state *cstate);
+
+void get_compiler_line(struct strbuf *dst, size_t pos);
+
+bool should_suppress_compiler_messages(void);
+
+bool load_file(const char *fullname, seclev_t seclev, bool throw_errors,
+               bool reload);
+const char *loading_file(void);
 
 #endif

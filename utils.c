@@ -21,126 +21,188 @@
 
 #include "mudlle-config.h"
 
-#include <ctype.h>
-#include <stdlib.h>
-#include <string.h>
+#ifdef __linux__
+  #define _GNU_SOURCE           /* for qsort_r() */
+#endif
 
+#include <ctype.h>
+#include <fenv.h>
+#include <math.h>
+#include <unistd.h>
+
+#include <sys/stat.h>
+
+#include "array.h"
 #include "compile.h"
 #include "context.h"
-#include "lexer.h"
 #include "ports.h"
-#include "strbuf.h"
+#include "strbuf.h"             /* redundant include in MUME */
 #include "tree.h"
 #include "utils.h"
+
 
 bool use_nicename;
 bool erred;
 
-static void vlog_message(const struct loc *loc, bool is_warning,
-                         const char *msg, va_list va)
+enum log_type {
+  vlog_error,
+  vlog_warning,
+  vlog_note
+};
+
+size_t pagesize;
+
+void init_pagesize(void)
 {
+  long sz = sysconf(_SC_PAGESIZE);
+  assert(sz > 0);
+  pagesize = sz;
+}
+
+static struct {
+  bool collecting;
+  ARRAY_T(char *) m;
+} compiler_messages;
+
+void collect_compiler_messages(void)
+{
+  assert(!compiler_messages.collecting);
+  compiler_messages.collecting = true;
+}
+
+static void send_one_compiler_message(const char *msg)
+{
+  pflush(mudout());
+
+  pputs(msg, muderr());
+  pputc('\n', muderr());
+  pflush(muderr());
+}
+
+void send_compiler_messages(void)
+{
+  assert(compiler_messages.collecting);
+  compiler_messages.collecting = false;
+
+  ARRAY_FOR (compiler_messages.m, , char *, m)
+    {
+      send_one_compiler_message(m);
+      free(m);
+    }
+  ARRAY_FREE(compiler_messages.m);
+}
+
+static FMT_PRINTF(3, 0) void vlog_message(
+  const struct loc *loc, enum log_type ltype, const char *fmt, va_list va)
+{
+  if (should_suppress_compiler_messages())
+    return;
+
   struct strbuf sb = SBNULL;
 
   bool use_fname = !use_nicename;
 
-  if (loc->fname == NULL)
+  unsigned col0 = loc->col - 1; /* zero-based column */
+  if (loc != NULL && loc->line > 0 && loc->col > 0 && loc->pos >= col0
+      && port_is_interactive(mudout_port))
+    {
+      get_compiler_line(&sb, loc->pos - col0);
+      if (sb_len(&sb) > 0 && sb_len(&sb) >= col0)
+        {
+          if (compiler_messages.collecting)
+            ARRAY_ADD(compiler_messages.m, sb_detach(&sb));
+          else
+            sb_addc(&sb, '\n');
+
+          /* copy space characters verbatim in case they contain tabs */
+          bool add_nl = !compiler_messages.collecting;
+          size_t dstloc = sb_add_noinit(&sb, col0 + 1 + add_nl);
+          char *dst = sb_mutable_str(&sb) + dstloc;
+          for (const char *s = sb_str(&sb); col0 > 0; --col0, ++s)
+            *dst++ = isspace((unsigned char)*s) ? *s : ' ';
+          *dst++ = '^';
+          if (add_nl)
+            *dst++ = '\n';
+          assert(dst == sb_str(&sb) + sb_len(&sb));
+
+          if (compiler_messages.collecting)
+            ARRAY_ADD(compiler_messages.m, sb_detach(&sb));
+          else
+            {
+              port_write(muderr(), sb_str(&sb), sb_len(&sb));
+              sb_empty(&sb);
+            }
+        }
+    }
+
+  if (loc == NULL || loc->fname == NULL)
     {
       abort();
     }
-  else
-    sb_printf(&sb, "%s:", use_fname ? loc->fname->path : loc->fname->nice);
+
+  sb_addstr(&sb, mudlle_markup(mudlle_markup_loc, true));
+  sb_addstr(&sb, use_fname ? loc->fname->filename : loc->fname->nicename);
+  sb_addc(&sb, ':');
   if (loc->line > 0)
     {
       sb_printf(&sb, "%d:", loc->line);
       if (loc->col > 0)
         sb_printf(&sb, "%d:", loc->col);
     }
+  sb_addstr(&sb, mudlle_markup(mudlle_markup_loc, false));
   sb_addc(&sb, ' ');
 
-  if (is_warning)
-    sb_addstr(&sb, "warning: ");
-  if (use_fname && strcmp(loc->fname->nice, loc->fname->path) != 0)
-    sb_printf(&sb, "[%s] ", loc->fname->nice);
-  sb_vprintf(&sb, msg, va);
-  pflush(mudout);
-  pprintf(muderr, "%s\n", sb_str(&sb));
-  pflush(muderr);
-  sb_free(&sb);
-  if (!is_warning)
-    erred = true;
-}
 
-void compile_error(const struct loc *loc, const char *msg, ...)
-{
-  va_list args;
-  va_start(args, msg);
-  vlog_message(loc, false, msg, args);
-  va_end(args);
-}
-
-void compile_warning(const struct loc *loc, const char *msg, ...)
-{
-  va_list args;
-  va_start(args, msg);
-  vlog_message(loc, true, msg, args);
-  va_end(args);
-}
-
-#ifdef DEBUG_MEMORY
-void *debug_xmalloc(const char *file, int line, int size)
-{
-  void *newp = debug_malloc(file, line, size);
-
-  if (!newp)
+  switch (ltype)
     {
-      fprintf(stderr, "No memory!\n");
-      abort();
+    case vlog_error: erred = true; break;
+    case vlog_warning: sb_addstr(&sb, "warning: "); break;
+    case vlog_note: sb_addstr(&sb, "note: "); break;
     }
+  if (use_fname && strcmp(loc->fname->nicename, loc->fname->filename) != 0)
+    sb_printf(&sb, "[%s] ", loc->fname->nicename);
 
-  return newp;
+  if (ltype == vlog_error)
+    sb_addstr(&sb, mudlle_markup(mudlle_markup_error, true));
+  sb_vprintf(&sb, fmt, va);
+  if (ltype == vlog_error)
+    sb_addstr(&sb, mudlle_markup(mudlle_markup_error, false));
+
+  if (compiler_messages.collecting)
+    ARRAY_ADD(compiler_messages.m, sb_detach(&sb));
+  else
+    {
+      send_one_compiler_message(sb_str(&sb));
+      sb_free(&sb);
+    }
 }
 
-void *debug_xrealloc(const char *file, int line, void *old, int size)
+void compile_error(const struct loc *loc, const char *fmt, ...)
 {
-  void *newp = debug_realloc(file, line, old, size);
-
-  if (!newp) abort();
-
-  return newp;
+  va_list args;
+  va_start(args, fmt);
+  vlog_message(loc, vlog_error, fmt, args);
+  va_end(args);
 }
 
-char *debug_xstrdup(const char *file, int line, const char *s)
+void compile_warning(const struct loc *loc, const char *fmt, ...)
 {
-  char *newp = debug_xmalloc(file, line, strlen(s) + 1);
-
-  return strcpy(newp, s);
-}
-#else
-void *xmalloc(int size)
-{
-  void *newp = malloc(size);
-  assert(newp != NULL);
-  return newp;
+  va_list args;
+  va_start(args, fmt);
+  vlog_message(loc, vlog_warning, fmt, args);
+  va_end(args);
 }
 
-void *xrealloc(void *old, int size)
+void compile_note(const struct loc *loc, const char *fmt, ...)
 {
-  void *newp = realloc(old, size);
-  assert(newp != NULL);
-  return newp;
+  va_list args;
+  va_start(args, fmt);
+  vlog_message(loc, vlog_note, fmt, args);
+  va_end(args);
 }
-
-char *xstrdup(const char *s)
-{
-  size_t size = strlen(s) + 1;
-  char *newp = xmalloc(size);
-  memcpy(newp, s, size);
-  return newp;
-}
-#endif
 
 /* ofs is the offset to the 'next' field */
-void *internal_reverse_list(void *l, size_t ofs)
+void *reverse_list_ofs(void *l, size_t ofs)
 {
   void *prev = NULL;
   while (l != NULL)
@@ -152,19 +214,6 @@ void *internal_reverse_list(void *l, size_t ofs)
       l = next;
     }
   return prev;
-}
-
-void ary_grow(struct ary *a)
-{
-  ary_set_size(a, a->size ? a->size * 2 : 32);
-}
-
-void ary_set_size(struct ary *a, size_t size)
-{
-  a->size = size;
-  a->data = realloc(a->data, a->size * sizeof a->data[0]);
-  if (a->used > a->size)
-    a->used = a->size;
 }
 
 #ifndef __GNUC__
@@ -184,9 +233,9 @@ int popcountl(unsigned long u)
 }
 
 /* count leading zeros */
-int clz(int i)
+int clz(unsigned u)
 {
-  CASSERT_EXPR(sizeof (i) == sizeof (uint32_t));
+  CASSERT(sizeof (u) == sizeof (uint32_t));
 
   /* from https://en.wikipedia.org/wiki/Find_first_set */
   static const uint8_t count[16] = {
@@ -194,9 +243,235 @@ int clz(int i)
   };
 
   unsigned n = 0;
-  if ((i & 0xffff0000) == 0) {n += 16; i <<= 16;}
-  if ((i & 0xff000000) == 0) {n +=  8; i <<=  8;}
-  if ((i & 0xf0000000) == 0) {n +=  4; i <<=  4;}
-  return n + count[(i >> (32 - 4)) & 15];
+  if ((u & 0xffff0000) == 0) {n += 16; u <<= 16;}
+  if ((u & 0xff000000) == 0) {n +=  8; u <<=  8;}
+  if ((u & 0xf0000000) == 0) {n +=  4; u <<=  4;}
+  return n + count[(u >> (32 - 4)) & 15];
 }
+
+int clzl(unsigned long u)
+{
+  int r = CHAR_BIT * (sizeof (u) - sizeof (unsigned));
+  while (u > UINT_MAX)
+    {
+      r -= CHAR_BIT * sizeof (unsigned);
+      u >>= CHAR_BIT * sizeof (unsigned);
+    }
+  return r + clz(u);
+}
+
+int clzll(unsigned long long u)
+{
+  int r = CHAR_BIT * (sizeof (u) - sizeof (unsigned));
+  while (u > UINT_MAX)
+    {
+      r -= CHAR_BIT * sizeof (unsigned);
+      u >>= CHAR_BIT * sizeof (unsigned);
+    }
+  return r + clz(u);
+}
+
+int ffsl(long l)
+{
+  unsigned long u = l;
+  const int INT_BIT = CHAR_BIT * sizeof (int);
+  for (int add = 0; u; u >>= INT_BIT, add += INT_BIT)
+    {
+      int i = ffs(u);
+      if (i > 0)
+        return i + add;
+    }
+  return 0;
+}
+
+#endif  /* ! __GNUC__ */
+
+/* truncate 'src' to 'dst'; return true if successful */
+bool double_to_long(long *dst, double src)
+{
+#if !((defined __STDC_IEC_559__ || defined __MACH__) && defined FE_INVALID)
+  #error Find an alternative.
 #endif
+  feclearexcept(FE_INVALID);
+  *dst = lrint(trunc(src));
+  return !fetestexcept(FE_INVALID);
+}
+
+mode_t get_umask(void)
+{
+  mode_t um = umask(0);
+  umask(um);
+  return um;
+}
+
+uint64_t read_leb_u(const uint8_t **pos)
+{
+  uint64_t r = 0;
+  int bit = 0;
+  for (;;)
+    {
+      uint8_t n = *(*pos)++;
+      r |= (uint64_t)(n & 0x7f) << bit;
+      if (!(n & 0x80))
+        return r;
+      bit += 7;
+    }
+}
+
+int64_t read_leb_s(const uint8_t **pos)
+{
+  int64_t r = 0;
+  unsigned bit = 0;
+  for (;;)
+    {
+      uint8_t n = *(*pos)++;
+      r |= (int64_t)(n & 0x7f) << bit;
+      bit += 7;
+      if (!(n & 0x80))
+        {
+          if ((n & 0x40) && bit < 64)
+            r |= ~UINT64_C(0) << bit;
+          return r;
+        }
+    }
+}
+
+void sb_add_leb_u(struct strbuf *sb, uint64_t u)
+{
+  do
+    {
+      uint8_t u8 = u & 0x7f;
+      u >>= 7;
+      if (u != 0)
+        u8 |= 0x80;
+      sb_add_u8(sb, u8);
+    }
+  while (u);
+}
+
+void sb_add_leb_s(struct strbuf *sb, int64_t i)
+{
+  for (;;)
+    {
+      uint8_t u8 = i & 0x7f;
+      i >>= 7;
+      bool done = (i == ((u8 & 0x40) ? -1 : 0));
+      if (!done)
+        u8 |= 0x80;
+      sb_add_u8(sb, u8);
+      if (done)
+        break;
+    }
+}
+
+unsigned leb_u_len(uint64_t u)
+{
+  unsigned len = 0;
+  do
+    {
+      ++len;
+      u >>= 7;
+    }
+  while (u);
+  return len;
+}
+
+unsigned leb_s_len(int64_t i)
+{
+  unsigned len = 0;
+  for (;;)
+    {
+      ++len;
+      uint8_t u8 = i & 0x7f;
+      i >>= 7;
+      if (i == ((u8 & 0x40) ? -1 : 0))
+        return len;
+    }
+}
+
+static void FMT_PRINTF(1, 0) stderr_log_fn(const char *fmt, va_list va)
+{
+  fputs("MUDLLE: ", stderr);
+  vfprintf(stderr, fmt, va);
+  fputc('\n', stderr);
+}
+
+static mudlle_log_fn log_cb = stderr_log_fn;
+
+void mudlle_log(const char *fmt, ...)
+{
+  va_list va;
+  va_start(va, fmt);
+  log_cb(fmt, va);
+  va_end(va);
+}
+
+void set_mudlle_log_callback(mudlle_log_fn fn)
+{
+  log_cb = fn;
+}
+
+struct cstrlen cstrlen_from_mstr(struct string *s)
+{
+  return (struct cstrlen){ .str = s->str, .len = string_len(s) };
+}
+
+static const char *markup_strs[mudlle_markup_types][2];
+
+const char *mudlle_markup(enum mudlle_markup mm, bool start)
+{
+  const char *s = markup_strs[mm][start];
+  return s ? s : "";
+}
+
+void set_mudlle_markup(enum mudlle_markup mm,
+                       const char *start, const char *end)
+{
+  markup_strs[mm][true]  = start;
+  markup_strs[mm][false] = end;
+}
+
+#define IS_UNORDERED(a, b) (assert(!isunordered((a), (b))), false)
+
+/* the following are declared in mudlle-macros.h */
+int cmp_f(float a, float b)
+{
+  if (IS_UNORDERED(a, b))
+    return CMP(!isnan(b), !isnan(a));
+  return a < b ? -1 : a > b;
+}
+
+int cmp_d(double a, double b)
+{
+  if (IS_UNORDERED(a, b))
+    return CMP(!isnan(b), !isnan(a));
+  return a < b ? -1 : a > b;
+}
+
+float max_f(float a, float b)
+{
+  if (IS_UNORDERED(a, b))
+    return isnan(a) ? b : a;
+  return a > b ? a : b;
+}
+
+double max_d(double a, double b)
+{
+  if (IS_UNORDERED(a, b))
+    return isnan(a) ? b : a;
+  return a > b ? a : b;
+}
+
+float min_f(float a, float b)
+{
+  if (IS_UNORDERED(a, b))
+    return isnan(a) ? b : a;
+  return a < b ? a : b;
+}
+
+double min_d(double a, double b)
+{
+  if (IS_UNORDERED(a, b))
+    return isnan(a) ? b : a;
+  return a < b ? a : b;
+}

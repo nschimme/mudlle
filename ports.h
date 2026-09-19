@@ -22,7 +22,6 @@
 #ifndef PORTS_H
 #define PORTS_H
 
-#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -56,20 +55,16 @@ struct oport /* A generic output port */
 
 struct oport *alloc_oport(size_t nfields, const struct oport_methods *m);
 
-struct oport *make_string_oport(void);
+struct oport *make_string_port(void);
 /* Returns: A new string-type output port, with nothing in it.
 */
 
-struct oport *make_file_oport(FILE *f);
+struct oport *make_file_oport(FILE *f, bool file_owned);
 /* Returns: A new file-type output port on file f.
    Note: As there is no finalization, you are responsible for closing f,
      either by closing the port or by closing f.
      Also there is no report of any errors that may occur on f
 */
-
-struct oport *make_capped_oport(struct oport *oport, size_t n);
-
-bool capped_port_overflow(const struct oport *oport);
 
 struct line_oport_methods {
   /* the contents of 'str' can mutate across calls to swrite() */
@@ -82,6 +77,7 @@ struct oport *make_line_oport(const struct line_oport_methods *methods,
 
 struct oport *make_sink_oport(void);
 
+struct string *port_substring(struct oport *p, size_t from, size_t nchars);
 struct string *port_string(struct oport *p, size_t maxlen);
 /* Returns: A mudlle string representing all the data send to port p.
    Requires: p be a string-type output port
@@ -102,10 +98,10 @@ void empty_string_oport(struct oport *_p);
 
 void string_port_copy(char *s, struct oport *p, size_t maxlen);
 
-void port_append(struct oport *p1, struct oport *p2);
-/* Effects: The characters of port p2 are appended to the end of port p1.
-   Modifies: p1
-   Requires: p2 be a string-type output port
+void port_append(struct oport *dst, struct oport *src);
+/* Effects: The characters of port 'src' are appended to the end of port 'dst'.
+   Modifies: 'dst'
+   Requires: 'src' be a string-type output port
 */
 
 /* Call f(data, buf, len) for each data block in string port p, or
@@ -122,10 +118,10 @@ static inline const struct oport_methods *oport_methods(struct oport *p)
   return get_tagged_ptr(&p->methods);
 }
 
-static inline const char *oport_name(struct oport *op)
+static inline const char *port_name(struct oport *op)
 {
   const struct oport_methods *m = oport_methods(op);
-  return m && m->name ? m->name : "unknown";
+  return m == NULL ? "closed" : m->name ? m->name : "unknown";
 }
 
 static inline void set_oport_methods(struct oport *p,
@@ -134,7 +130,7 @@ static inline void set_oport_methods(struct oport *p,
   set_tagged_ptr(&p->methods, (void *)m);
 }
 
-static inline void opclose(struct oport *op)
+static inline void port_close(struct oport *op)
 {
   const struct oport_methods *m = oport_methods(op);
   if (m) m->close(op);
@@ -142,6 +138,7 @@ static inline void opclose(struct oport *op)
 
 static inline void pputnc(int c, size_t n, struct oport *op)
 {
+  if (n == 0) return;
   const struct oport_methods *m = oport_methods(op);
   if (m) m->putnc(op, c, n);
 }
@@ -151,18 +148,19 @@ static inline void pputc(int c, struct oport *op)
   pputnc(c, 1, op);
 }
 
-static inline void opwrite(struct oport *op, const char *s, size_t nchars)
+static inline void port_write(struct oport *op, const char *s, size_t nchars)
 {
+  if (nchars == 0) return;
   const struct oport_methods *m = oport_methods(op);
   if (m) m->write(op, s, nchars);
 }
 
 static inline void pputs(const char *s, struct oport *op)
 {
-  opwrite(op, s, strlen(s));
+  port_write(op, s, strlen(s));
 }
 
-static inline void opstat(struct oport *op, struct oport_stat *buf)
+static inline void port_stat(struct oport *op, struct oport_stat *buf)
 {
   const struct oport_methods *m = oport_methods(op);
   if (m)
@@ -174,6 +172,7 @@ static inline void opstat(struct oport *op, struct oport_stat *buf)
 static inline void pswrite_substring(struct oport *op, struct string *s,
                                      size_t from, size_t nchars)
 {
+  if (nchars == 0) return;
   const struct oport_methods *m = oport_methods(op);
   if (m) m->swrite(op, s, from, nchars);
 }
@@ -199,14 +198,17 @@ size_t string_port_length(struct oport *oport);
 bool is_string_port(struct oport *oport);
 bool is_file_port(struct oport *oport);
 
+bool port_is_interactive(struct oport *oport);
+
 struct intstr {
-  /* integer bits + sign + null */
-  char s[CHAR_BIT * sizeof (unsigned long long) + 1 + 1];
+  /* integer bits (one can be sign) + null */
+  char s[CHAR_BIT * sizeof (unsigned long long) + 1];
 };
 
-/* These return a pointer into 'str'. 'base' must be in [2, 8, 10, 16] */
-char *longtostr(struct intstr *str, unsigned base, long n);
-char *ulongtostr(struct intstr *str, unsigned base, ulong n);
+/* These return a pointer into 'str'.
+   'base' must be in [2..36] or [-2..-36] (uppercase) */
+char *longtostr(struct intstr *str, int base, long l);
+char *ulongtostr(struct intstr *str, int base, ulong u);
 char *longtostr_wide(struct intstr *str, long n);
 char *ulongtostr_wide(struct intstr *str, ulong n);
 
@@ -216,6 +218,6 @@ void ports_init(void);
 extern struct oport *mudout_port;
 
 /* use with pprintf %s to capitalize the next conversion */
-extern const char *const CAPITALIZE;
+extern const char CAPITALIZE[];
 
 #endif

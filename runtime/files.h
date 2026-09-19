@@ -22,6 +22,13 @@
 #ifndef RUNTIME_FILES_H
 #define RUNTIME_FILES_H
 
+#include <stdio.h>
+
+#include "../alloc.h"
+
+#define MAX_ASYNC_PROCESSES 16
+#define MAX_MUDLLE_OPEN_FILES 128
+
 enum {
   FS_DEV     =  0,
   FS_INO     =  1,
@@ -84,7 +91,40 @@ enum {
   MOUNT_ENTRY_FIELDS
 };
 
+/* end mudlle const */
+
 void files_init(void);
 void poll_async_processes(void);
+
+struct mudlle_file_data {
+  FILE *f;                         /* NULL if the file is closed */
+  union dynpro_port oport;         /* optional file_oport */
+  char *filename;                  /* malloc'ed */
+  bool readable : 1, writable : 1; /* permissions */
+};
+
+bool is_mudlle_file(value v, struct mudlle_file_data **data);
+
+struct oport *mudlle_file_oport(value mfile);
+
+enum runtime_error ct_mfile(
+  value mfile, const char **errmsg, FILE **dstfile,
+  struct mudlle_file_data **dstfdata);
+
+#define _CT_FILE(mfile, errmsg, dst)                                    \
+  ct_mfile(mfile, errmsg,                                               \
+           _Generic((dst),                                              \
+                    FILE *: &(dst),                                     \
+                    struct mudlle_file_data *: NULL),                   \
+           _Generic((dst),                                              \
+                    FILE *: NULL,                                       \
+                    struct mudlle_file_data *: &(dst)))
+
+/* 'dst' can be 'FILE *' or 'struct mudlle_file_data *' */
+#define CT_FILE(dst) F2(TSET(file), _CT_FILE, (dst))
+
+enum runtime_error ct_pathname(struct string *mstr, const char **errmsg);
+#define _CT_PATHNAME(var, msg, arg) ct_pathname((var), (msg))
+#define CT_PATHNAME F2(TSET(string), _CT_PATHNAME, )
 
 #endif /* RUNTIME_FILES_H */

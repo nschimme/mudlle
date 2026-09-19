@@ -23,21 +23,25 @@ library mp
 requires ax64, genx64, mx64
 defines mp:nscratch, mp:ncaller, mp:ncallee, mp:nregargs, mp:new_label,
   mp:ins_list, mp:assemble, mp:mgen_preamble, mp:mgen_instruction,
-  mp:select_registers, mp:migrate, mp:uses_scratch?, mp:reset_counters
+  mp:select_registers, mp:migrate, mp:uses_regclass, mp:reset_counters
 [
-  mp:nscratch = fn (ifn) x64:nscratch(ifn);
-  mp:ncaller = fn (ifn) x64:ncaller(ifn);
-  mp:ncallee = fn (ifn) x64:ncallee(ifn);
-  mp:nregargs = fn (ifn) x64:nregargs(ifn);
+  mp:nscratch = x64:nscratch;
+  mp:ncaller = x64:ncaller;
+  mp:ncallee = x64:ncallee;
+  mp:nregargs = x64:nregargs;
 
-  mp:new_label = fn (x) x64:new_label(x);
-  mp:ins_list = fn (x) x64:ins_list(x);
-  mp:assemble = fn (x) x64:gassemble(x);
-  mp:mgen_preamble = fn (x1, x2) x64:mgen_preamble(x1, x2);
-  mp:mgen_instruction = fn (x1, x2, x3, x4)
-    x64:mgen_instruction(x1, x2, x3, x4);
-  mp:select_registers = fn (x1, x2) x64:select_registers(x1, x2);
-  mp:migrate = fn v apply(x64:migrate, v);
-  mp:uses_scratch? = fn (ins) x64:uses_scratch?(ins);
-  mp:reset_counters = fn () x64:reset_counters();
+  mp:new_label = x64:new_label;
+  mp:ins_list = x64:ins_list;
+  mp:assemble = x64:gassemble;
+  mp:mgen_preamble = x64:mgen_preamble;
+  mp:mgen_instruction = x64:mgen_instruction;
+  mp:select_registers = x64:select_registers;
+  mp:migrate = x64:migrate;
+  mp:uses_regclass = x64:uses_regclass;
+
+  mp:reset_counters = fn ()
+    [
+      x64:reset_counters();
+      x64:reset_ins_count();
+    ];
 ];

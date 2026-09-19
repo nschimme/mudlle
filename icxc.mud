@@ -19,35 +19,37 @@
  * ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-| arch |
-arch = if (INTBITS == 31) "x86" else "x64";
+| srcdir |
+if (INTBITS != 63) error(error_bad_value);
+srcdir = dirname(loading_file()) + "/";
 
-// Load inferring, compiled x86 compiler
+// Load inferring, compiled compiler
 // Bootstrap via interpreter (load minimum for linker)
 garbage_collect(700000);
 
-load("lib.mud") &&
-load("link.mud") &&
-load("interface.mud") &&
+if (!string?(objdir)) objdir = "./";
+
+load(srcdir + "lib.mud") &&
+load(srcdir + "link.mud") &&
+load(srcdir + "interface.mud") &&
 
 [
   load_library = fn (s)
     [
       silent == true || dformat("loading %s\n", s);
-      fload(s + ".obj");
+      fload(objdir + s + ".obj");
     ];
 ] &&
 
 // reload compiled modules
-fload("dlist.obj") &&
-fload("sequences.obj") &&
-fload("misc.obj") &&
-fload("vars.obj") &&
-fload("compiler.obj") &&
-fload("link.obj") &&
+fload(objdir + "dlist.obj") &&
+fload(objdir + "sequences.obj") &&
+fload(objdir + "misc.obj") &&
+fload(objdir + "vars.obj") &&
+fload(objdir + "compiler.obj") &&
+fload(objdir + "link.obj") &&
 
-fload("inference.obj") &&
-fload(arch + ".obj") &&
-fload("compile.obj") &&
-fload("dihash.obj");
+fload(objdir + "inference.obj") &&
+fload(objdir + mc:archname + ".obj") &&
+fload(objdir + "compile.obj");
 mc:verbose = 0;

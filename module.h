@@ -79,7 +79,8 @@ enum vstatus module_vstatus(long n, struct string **name);
    Requires: n be a valid global variable offset
 */
 
-bool module_vset(long n, enum vstatus status, struct string *name);
+bool module_vset(long n, enum vstatus status, struct string *name,
+                 bool dry_run);
 /* Effects: Sets status of global variable n to status.
      name is the module name for status var_module
    Returns: true if successful, false if the change is impossible

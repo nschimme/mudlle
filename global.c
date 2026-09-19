@@ -19,11 +19,8 @@
  * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-#include <string.h>
-
 #include "alloc.h"
 #include "context.h"
-#include "error.h"
 #include "global.h"
 #include "module.h"
 #include "table.h"
@@ -32,8 +29,7 @@
 
 struct env *environment;
 struct vector *env_values;
-/* map from global name to its index in mvars, env_values, and
-   global_names */
+/* map from global name to its index in mvars, env_values, and global_names */
 struct table *global;
 /* variable type and ownership: NULL is var_system_write; type_string
    is owning module; and integer is var_xxx (writable)*/
@@ -41,8 +37,7 @@ struct vector *mvars;
 struct vector *global_names;
 
 void global_init(void)
-/* Effects: Initialises the global environment before use.
-*/
+/* Effects: Initialises the global environment before use. */
 {
   environment = alloc_env(GLOBAL_SIZE);
   staticpro(&environment);
@@ -54,6 +49,10 @@ void global_init(void)
   staticpro(&mvars);
   global_names = alloc_vector(GLOBAL_SIZE);
   staticpro(&global_names);
+
+  STATIC_STRING(sstr_null, "null");
+  if (mglobal_lookup(GET_STATIC_STRING(sstr_null)) != 0)
+    abort();
 }
 
 static ulong global_add(struct string *name, value val)
@@ -85,7 +84,7 @@ static ulong global_add(struct string *name, value val)
 
 #ifndef NOCOMPILER
       /* This is evil, but the alternative is to lose a scarce, callee-save
-	 register */
+         register */
       patch_globals_stack(old_values, environment->values);
 #endif
     }
@@ -150,10 +149,10 @@ ulong mglobal_lookup(struct string *name)
  */
 static inline seclev_t seclevel_for_globals(void)
 {
-  return intval(maxseclevel);
+  return c_maxseclevel();
 }
 
-void check_global_write(value val, ulong goffset)
+void check_global_write(ulong goffset, value val)
 {
   /* called from mudlle; must not allocate if it returns */
   assert(goffset < vector_len(global_names));
@@ -183,7 +182,7 @@ void check_global_read(ulong goffset)
    *
    * Caveat: sometimes non-immutable defines slip through.
    */
-  struct string *module_name = NULL;
+  struct string *module_name;
   enum vstatus status = module_vstatus(goffset, &module_name);
   if (status != var_system_mutable && status != var_system_write
       && status != var_module)

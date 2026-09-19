@@ -30,9 +30,17 @@ void list_init(void);
 value code_set_carb(struct list *l, value x);
 value code_set_cdrb(struct list *l, value x);
 
+value code_car(struct list *l);
+value code_cdr(struct list *l);
+
 static inline struct list *mudlle_reverse_list(struct list *l)
 {
-  return internal_reverse_list(l, offsetof(struct list, cdr));
+  return reverse_list_ofs(l, offsetof(struct list, cdr));
 }
+
+/* check that 'l' is a list with at most MAX_VECTOR_SIZE elements, and that
+   each entry is of a type in 'typeset' */
+enum runtime_error check_proper_list(struct list *l, typeset_t typeset,
+                                     size_t *elems, const char **errmsg);
 
 #endif /* RUNTIME_LIST_H */

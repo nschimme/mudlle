@@ -23,21 +23,67 @@
 #define MPARSER_H
 
 #include <stdbool.h>
+#include <stdio.h>
 
-struct alloc_block;
+struct component;
 struct constant;
 struct mfile;
 
-bool parse(struct alloc_block *heap, struct mfile **f);
-bool parse_constant(struct alloc_block *heap, struct constant **c);
+enum parser_mode {
+  parser_mode_undefined,
+  parser_mode_file,
+  parser_mode_constant,
+  parser_mode_storable,         /* "constant" with #ro, #rw, ... markup */
+  parser_mode_any_expr,
+  parser_mode_paren_expr,
+  parser_mode_primary_expr
+};
+
+struct filename {
+  const char *filename;
+  const char *nicename;
+};
+
+struct parser_config {
+  struct filename filename;
+  enum parser_mode pmode;
+  bool allow_empty, comments, purse_ast, user_syms, no_messages;
+  FILE *f;                      /* NULL if nstrs/strs are used */
+  size_t nstrs;
+  const struct cstrlen *strs;
+};
+
+bool parse(struct mfile **f, const struct parser_config *pconfig);
+bool parse_constant(struct constant **c, const struct parser_config *pconfig);
+bool parse_expression(struct component **e, int *end_pos, bool allow_tail,
+                      const struct parser_config *pconfig);
+
+bool const_rwmode_is_dynamic(void);
+
+struct loc {
+  const struct filename *fname;
+  int line, col;
+  size_t pos;
+};
 
 #define YYLTYPE YYLTYPE
 typedef struct {
-  int first_line;
-  int first_column;
+  struct loc first;
   int last_line;
   int last_column;
-  const struct filename *fname;
+  size_t last_pos;
 } YYLTYPE;
+
+#define INIT_LOC { .line = -1, .col = -1 }
+#define NO_LOC &(const struct loc)INIT_LOC
+
+#define LLOC_LOC(lloc) (&(lloc).first)
+
+#define LLOC_LAST_LOC(lloc) &(const struct loc){        \
+  .line  = (lloc).last_line,                            \
+  .col   = (lloc).last_column,                          \
+  .pos   = (lloc).last_pos,                             \
+  .fname = (lloc).first.fname                           \
+}
 
 #endif /* MPARSER_H */

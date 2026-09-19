@@ -165,7 +165,8 @@ contains 'string', for example
   apropos("sub")
   RESULT:
     substring
-    Primitive: s1 n1 n2 -> s2. Extract substring of s starting at n1 of length n2.
+    Primitive: s1 n1 n2 -> s2. Extract substring of s starting at n1 of
+    length n2.
     The first character is numbered 0
 
 
@@ -289,9 +290,9 @@ Mudlle has C like operators:
 -: subtraction
 <<: bitwise left shift
 >>: bitwise right shift
-&: bitwise and
-|: bitwise or
-^: bitwise exclusive or
+&: bitwise AND
+|: bitwise OR
+^: bitwise exclusive OR
 ==: equality comparison
 !=: inequality
 <, <=, >, >=: as usual, but apply to numbers only
@@ -376,7 +377,7 @@ return an expression, for example:
 
 is a function which adds one to x and returns the result.
 
-  fn v vector_length(v)
+  fn (v...) vlength(v)
   RESULT: {closure}
 
 takes any number of arguments. It returns the number of arguments that
@@ -817,7 +818,7 @@ The full syntax is:
   writes <w1>, <w2>, ...
 
 The above order must be used, and the defines clause may not be
-ommitted. If a variable is present in the writes clause it may also be
+omitted. If a variable is present in the writes clause it may also be
 read.
 
 Libraries are normally loaded only once. If you load a library l1 that
@@ -1053,9 +1054,9 @@ one of the functions below. It is illegal to modify a constant string.
   make_string: n -> s. Creates a new string of length n. The contents
   are undefined.
 
-  string_length: s -> n. Returns the length of string s.
+  slength: s -> n. Returns the length of string s.
 
-  string_fill!: s n -> . Sets all the characters in s to ascii code n. s
+  sfill!: s n -> . Sets all the characters in s to ascii code n. s
   must not be a constant. The result is undefined.
 
   string_cmp: s1 s2 -> n. Compare 2 strings. Returns 0 if s1 = s2, < 0
@@ -1074,10 +1075,7 @@ one of the functions below. It is illegal to modify a constant string.
   substring: s1 n1 n2 -> s2. Extract substring of s starting
   at n1 of length n2. The returned string is modifiable.
 
-  string_append: s1 s2 -> s. Concatenate s1 and s2. The returned string
-  is modifiable.
-
-  s1 + s2 -> s. Same as string_append.
+  s1 + s2 -> s. Same as sconcat(s1, s2)
 
 LISTS
 
@@ -1214,9 +1212,9 @@ However, it is illegal to modify the elements of a constant array.
   make_vector: n -> v. Create an empty vector of length n (all elements
   are set to null).
 
-  vector_length: v -> n. Returns the length of the vector.
+  vlength: v -> n. Returns the length of the vector.
 
-  vector_fill!: v x -> . Sets all elements of vector v to x. This is
+  vfill!: v x -> . Sets all elements of vector v to x. This is
   illegal if v is a constant array.
 
   vector: x1 ... -> v. Returns a vector of the arguments
@@ -1410,35 +1408,8 @@ However, 2 integers are '==' if they have the same value. So:
 ERROR HANDLING
 
 It is sometimes useful to execute a piece of code that may cause
-a runtime error, without having your whole computation fail. Two
-functions are provided for this purpose:
-
-  catch_error: fn b -> x. Executes fn() and returns its result. If an
-  error occurs, returns the error number. If b is true, error messages
-   are suppressed
-
-  handle_error: fn1 fn2 -> x. Executes fn1(). If an error occurs, calls
-  fn2(errno). Returns result of fn1 or fn2
-
-handle_error is the more useful of these two functions as it allows easy
-recovery when errors occur. For example, if you have some data saved on
-disk you will want to load it during initialisation:
-
-  data = load_data("mydata")
-
-But this will fail with a runtime error if file "mydata" doesn't exist. So
-instead you could do:
-
-  data = handle_error(fn () load("mydata"),
-		      fn (error) list(1, 2, "fun"))
-
-If "mydata" exists, it is loaded. If it doesn't, the second function is
-called and returns (1 2 "fun"), which is presumably a default value for
-data.
-
-catch_error is mostly useful for lower-level functions (eg load, load_room
-in MUME). It allows code to preserve itself from possible errors in
-external functions.
+a runtime error, without having your whole computation fail. Use
+trap_error() for this purpose.
 
 
 DEVELOPMENT AND DEBUGGING
@@ -1451,9 +1422,6 @@ DEVELOPMENT AND DEBUGGING
 
   apropos: s -> . Finds all global variables whose name contains
   substring s and prints them (with help)
-
-  profile: fn -> x. Returns profiling information for function fn:
-  (#calls #instructions) for mudlle functions, #calls for primitives
 
   debug: n -> . Set debug level (0 = no debug). This is most useful if
   you know how the mudlle internals work ...
@@ -1521,12 +1489,11 @@ The possible errors are:
     a = '[1]; a[0] = 99
     RESULT: error: value is read-only
 
-  function probably has an infinite loop -- your code took to
-    long to execute. Either it has an infinite loop or you should
-    make it simpler.
+  loop limit reached -- your code took to long to execute. Either it
+    has an infinite loop or you should make it simpler.
 
-  function probably has an infinite recursion -- the depth of
-    recursive calls exceeded a predefined limit, currently 400.
+  recursion limit reached -- the depth of recursive calls exceeded a
+    predefined limit, currently 400.
 
   wrong number of parameters -- example:
 

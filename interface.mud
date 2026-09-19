@@ -21,9 +21,11 @@
 
 eval = fn (s)
   [
-    | prelinked |
-
-    if (prelinked = mc:compile(mudlle_parse(s, null), false, 1))
+    | prelinked, tree |
+    tree = mudlle_parse(s, null, false);
+    if (!tree)
+      false
+    else if (prelinked = mc:compile(tree, false, 1, mc:source_code(s)))
       mc:linkrun(prelinked, 1, true)
     else
       false
@@ -31,17 +33,26 @@ eval = fn (s)
 
 lcompile = fn (s, protect)
   [
-    | objname, dot, prelinked |
+    | objname, dot |
 
-    dot = string_index(s, ?.);
-    if (dot < 0) objname = s + ".obj"
-    else objname = substring(s, 0, dot) + ".obj";
+    objname = basename(s);
+    dot = string_index(objname, ?.);
+    if (dot >= 0)
+      objname = substring(objname, 0, dot);
+    objname += ".obj";
+    if (string?(dstdir))
+      objname = dstdir + objname;
 
     silent == true || dformat("compiling %s\n", s);
-    | cs |
-    cs = "compiler/" + s;
-    if (prelinked = mc:compile(mudlle_parse_file(s, cs, cs),
-                               protect, 1))
+    | cs, tree, prelinked |
+    prelinked = false;
+    cs = "compiler/" + basename(s);
+    tree = mudlle_parse_file(s, cs, cs, false);
+    if (!tree)
+      null
+    else if (tree == true)
+      dformat("%s does not contain code\n", s)
+    else if (prelinked = mc:compile(tree, protect, 1, mc:source_file(s)))
       save_data(objname, prelinked);
     !!prelinked
   ];
@@ -49,38 +60,20 @@ lcompile = fn (s, protect)
 fcompile = fn (s) lcompile(s, false);
 pcompile = fn (s) lcompile(s, true);
 fload = fn (s) mc:linkrun(load_data(s), 1, true);
-test = fn (s) mc:compile(mudlle_parse(s, null), false, 1);
-ftest = fn (s) mc:compile(mudlle_parse_file(s, s, s), false, 1);
+test = fn (s) mc:compile(mudlle_parse(s, null, false),
+                         false, 1, mc:source_code(s));
+ftest = fn (s) mc:compile(mudlle_parse_file(s, s, s, false),
+                          false, 1, mc:source_file(s));
 
-protect_compiler_libs = fn()
+protect_compiler_libs = fn ()
 [
-  | cmods |
-  cmods = '[
-    "dihash"
-    "compiler"
-    "link"
-    "misc"
-    "sequences"
-    "dlist"
-    "graph"
-    "ax86"
-    "vars"
-    "flow"
-    "optimise"
-    "ins3"
-    "mx86"
-    "phase1"
-    "phase2"
-    "phase3"
-    "phase4"
-    "genx86"
-    "x86"
-    "compile"
-    "noinf"
-    "inference"
-  ];
+  vforeach(fn (name) [
+    match! (module_status(name))
+      [
+        ,module_loaded    => module_set!(name, module_protected, 1);
+        ,module_protected => null;
+      ]
+  ], all_modules());
 
-  for (|i, l| [ l = vlength(cmods); i = 0 ]; i < l; ++i)
-    module_set!(cmods[i], module_protected, 1);
   detect_immutability();
 ];

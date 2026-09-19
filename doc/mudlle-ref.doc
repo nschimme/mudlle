@@ -381,12 +381,12 @@ if it belongs to a particular type:
 
 typeof returns an integer representing the values type, one of the following
 constants:
-  type_code, type_closure, type_variable, type_internal, type_primitive,
+  type_icode, type_closure, type_variable, type_internal, type_primitive,
   type_varargs, type_secure, type_integer, type_string, type_vector, type_pair,
-  type_symbol, type_table, type_private, type_object, type_character, type_gone,
-  type_oport, type_mcode, type_null
+  type_symbol, type_table, type_private, type_object, type_character,
+  type_gone, type_oport, type_mcode, type_null
 
-Most of these values should not be seen... (specifically: type_code,
+Most of these values should not be seen... (specifically: type_icode,
 type_variable, type_internal, type_oport, type_mcode). type_closure,
 type_primitive, type_varargs and type_secure all count as functions.
 
@@ -467,9 +467,9 @@ numbers:
   ~: bitwise negation.
   <<: n1 << n2 shifts n1 left by n2 bits (and adds 0 bits).
   >>: n1 >> n2 shifts n1 right by n2 bits (and adds 0 bits).
-  &: bitwise and
-  |: bitwise or
-  ^: bitwise exclusive or
+  &: bitwise AND
+  |: bitwise OR
+  ^: bitwise exclusive OR
 
 To compare two integers (and return a boolean), use <, <=, >, or >=.
 
@@ -754,7 +754,7 @@ correctly:
 
 	v = make_vector(n);
 	i = 0;
-	while (i < vector_length(v))
+	while (i < vlength(v))
 	  [
 	    | sum |
 
@@ -1033,12 +1033,11 @@ The possible errors are:
     RESULT: error: value is read-only
 
 
-  function probably has an infinite loop -- your code took to
-    long to execute. Either it has an infinite loop or you should
-    make it simpler.
+  loop limit reached -- your code took to long to execute. Either it
+    has an infinite loop or you should make it simpler.
 
-  function probably has an infinite recursion -- the depth of
-    recursive calls exceeded a predefined limit, currently 400.
+  recursion limit reached -- the depth of recursive calls exceeded a
+    predefined limit, currently 400.
 
   wrong number of parameters -- example:
 
@@ -1072,7 +1071,8 @@ contains 'string', for example
   apropos("sub")
   RESULT:
     substring
-    Primitive: s1 n1 n2 -> s2. Extract substring of s starting at n1 of length n2.
+    Primitive: s1 n1 n2 -> s2. Extract substring of s starting at n1 of
+    length n2.
     The first character is numbered 0
 
 
@@ -1105,9 +1105,9 @@ they primarily operate.
   make_string: n -> s. Creates a new string of length n. The contents
   are undefined.
 
-  string_length: s -> n. Returns the length of string s.
+  slength: s -> n. Returns the length of string s.
 
-  string_fill!: s n -> . Sets all the characters in s to ascii code n. s
+  sfill!: s n -> . Sets all the characters in s to ascii code n. s
   must not be a constant. The result is undefined.
 
   string_ref: s n1 -> n2. Return the ascii code (n2) of the n1'th
@@ -1132,9 +1132,6 @@ they primarily operate.
 
   substring: s1 n1 n2 -> s2. Extract substring of s starting
   at n1 of length n2. The returned string is modifiable.
-
-  string_append: s1 s2 -> s. Concatenate s1 and s2. The returned string
-  is modifiable. You can also use s1+s2.
 
 
 4.3 Pairs
@@ -1165,9 +1162,9 @@ they primarily operate.
   make_vector: n -> v. Create an empty vector of length n (all elements
   are set to null).
 
-  vector_length: v -> n. Returns the length of the vector.
+  vlength: v -> n. Returns the length of the vector.
 
-  vector_fill!: v x -> . Sets all elements of vector v to x. This is
+  vfill!: v x -> . Sets all elements of vector v to x. This is
   illegal if v is a constant array.
 
   vector_ref: v n -> x. Return the n'th element of v. You can use v[n]
@@ -1281,12 +1278,6 @@ manipulation functions.
 
   error: n -> . Causes error n", 1, (value errno)
 
-  catch_error: fn b -> x. Executes fn() and returns its result. If an error
-  occurs, returns the error number. If b is true, error messages are suppressed
-
-  handle_error: fn1 fn2 -> x. Executes fn1(). If an error occurs, calls
-  fn2(errno). Returns result of fn1 or fn2
-
   readonly?: x -> b. Returns true if x is a read-only value (attempts to modify
   it will cause a 'readonly value' error).
 
@@ -1305,9 +1296,6 @@ manipulation functions.
 
   apropos: s -> . Finds all global variables whose name contains
   substring s and prints them (with help)
-
-  profile: fn -> x. Returns profiling information for function fn:
-  (#calls #instructions) for mudlle functions, #calls for primitives
 
   debug: n -> . Set debug level (0 = no debug). This is most useful if
   you know how the mudlle internals work ...

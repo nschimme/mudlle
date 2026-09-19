@@ -19,25 +19,19 @@
  * ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-| arch |
-arch = if (INTBITS == 31) "x86" else "x64";
+| srcdir |
+if (INTBITS != 63) error(error_bad_value);
+srcdir = dirname(loading_file()) + "/";
 
 trap_error(fn() [
   | slice, slices |
   slice = 0;
   slices = 1;
 
-  // optional two arguments N and M lets the user pick the N'th out of
+  // optional (N . M) in 'build_slice' picks the N'th out of
   // M subsets of files to compile
-  match! (argv)
-    [
-      [_ s ss] => [
-        slice = atoi(s);
-        slices = atoi(ss);
-        assert(slice >= 0 && slice < slices);
-      ];
-      [_] => null;
-    ];
+  if (build_slice != null)
+    @(slice . slices) = build_slice;
 
   mc:verbose = 0;
   mp:reset_counters();
@@ -52,20 +46,20 @@ trap_error(fn() [
 
   | mfiles |
   // sort by size
-  mfiles = vmap(fn (f) [ f += ".mud"; f . file_stat(f)[fs_size] ], '[
-    ,("a" + arch)
+  mfiles = vmap(fn (f) [ f += ".mud"; f . file_stat(srcdir + f)[fs_size] ], '[
+    ,("a" + mc:archname)
     "compile"
     "compiler"
     "dihash"
     "dlist"
     "flow"
-    ,("gen" + arch)
+    ,("gen" + mc:archname)
     "graph"
     "inference"
     "ins3"
     "link"
     "misc"
-    ,("m" + arch)
+    ,("m" + mc:archname)
     "noinf"
     "optimise"
     "phase1"
@@ -74,12 +68,12 @@ trap_error(fn() [
     "phase4"
     "sequences"
     "vars"
-    ,arch
+    ,mc:archname
   ]);
   vqsort!(fn (a, b) cdr(a) > cdr(b), mfiles);
 
   for (| n | n = slice; n < vlength(mfiles); n += slices)
-    safecomp(car(mfiles[n]));
+    safecomp(srcdir + car(mfiles[n]));
 
   if (silent != true)
     [
@@ -89,4 +83,4 @@ trap_error(fn() [
     ]
 ], fn (n) [
   quit(1);
-], call_trace_on);
+], call_trace_on, null);

@@ -23,7 +23,6 @@
 #define RUNTIME_SUPPORT_H
 
 #include "../error.h"
-#include "../types.h"
 
 extern const struct prim_op *const global_read_ext;
 extern const struct prim_op *const global_write_ext;
@@ -32,5 +31,21 @@ void support_init(void);
 
 noreturn void global_runtime_error(enum runtime_error error, bool is_write,
                                    ulong goffset, value val);
+
+enum {
+  mp_mode_file         = 0,
+  mp_mode_any_expr     = 1,
+  mp_mode_paren_expr   = 2,
+  mp_mode_primary_expr = 3,
+  /* end mudlle const */
+  mp_mode_mask         = P(2) - 1,
+  /* start mudlle const */
+  mp_pure_ast          = P(2),
+  mp_user_symbols      = P(3),
+  mp_allow_tail        = P(4),
+  /* end mudlle const */
+  mp_all_flags         = P(5) - 1
+  /* start mudlle const */
+};
 
 #endif /* RUNTIME_SUPPORT_H */

@@ -19,22 +19,11 @@
  * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-#include "alloc.h"
+#ifndef INLINE_H
+#define INLINE_H
 
-struct local_value *addtail(block_t heap, valuelist *list, value lvalue)
-{
-  struct local_value *newp = allocate(heap, sizeof *newp);
+struct component;
 
-  GCCHECK(lvalue);
-  newp->lvalue = lvalue;
-  newp->prev = list->last;
-  newp->next = NULL;
-  if (!list->first) list->first = list->last = newp;
-  else
-    {
-      list->last->next = newp;
-      list->last = newp;
-    }
+void parser_expand_component(struct component **cp);
 
-  return newp;
-}
+#endif  /* INLINE_H */

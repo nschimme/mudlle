@@ -36,11 +36,12 @@ regress1branch("function?3", "fun", "function?(arg1)", false);
 regress1branch("function?4", (fn () 1) . "fn () 1", "function?(arg1)", true);
 regress1branch("function?5", remove . "remove", "function?(arg1)", true);
 regress1branch("function?6", sequence . "sequence", "function?(arg1)", true);
-regress1branch("function?7", string_length . "string_length", "function?(arg1)", true);
+regress1branch("function?7", slength. "slength",
+               "function?(arg1)", true);
 
 regresstypetrap = fn (name, a1, type, passes)
   [
-    eval(format("trapfn = fn (%s arg) 0", type));
+    reval(format("trapfn = fn (%s arg) 0", type));
     if (passes)
       regresspass(name, fn () trapfn(a1))
     else
@@ -70,4 +71,4 @@ regresstypetrap("function3", "fun", "function", false);
 regresstypetrap("function4", (fn () 1), "function", true);
 regresstypetrap("function5", remove, "function", true);
 regresstypetrap("function6", sequence, "function", true);
-regresstypetrap("function7", string_length, "function", true);
+regresstypetrap("function7", slength, "function", true);

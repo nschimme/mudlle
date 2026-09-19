@@ -1,9 +1,7 @@
-#include <stddef.h>
 #include <stdio.h>
 
 #include "alloc.h"
 #include "context.h"
-#include "error.h"
 
 #  include "genconstdefs.h"
 
@@ -51,12 +49,12 @@ int main(int argc, char **argv)
   PR(cc_callee_ ## reg, offsetof(struct ccontext, callee.reg))
   FOR_CALLEE_SAVE(__PR_CALLEE, SEP_SEMI);
 #undef __PR_CALLEE
-  PR(cc_SIZE,              sizeof (struct ccontext));
+  PR(cc_size,              sizeof (struct ccontext));
 #endif
 
   PR(cs_next,              offsetof(struct call_stack, next));
   PR(cs_type,              offsetof(struct call_stack, type));
-  PR(cs_SIZE,              sizeof (struct call_stack));
+  PR(cs_size,              sizeof (struct call_stack));
 
 #ifdef GCSTATS
   PR(gcstats_alloc,        offsetof(struct gcstats, a));
@@ -65,9 +63,14 @@ int main(int argc, char **argv)
   PR(gcstats_alloc_sz,     offsetof(struct gcstats_alloc, types[0].size));
 #endif
 
-#define DEF(op) ((void)printf("#define %-24s %11d\n", #op, (int)op));
-  FOR_DEFS(DEF)
-  FOR_MUDLLE_TYPES(DEF)
+#define DEF(name, sname) \
+  ((void)printf("#define %-24s %11d\n", sname, (int)name))
+  FOR_DEFS(DEF, SEP_SEMI);
+#define TDEF(t) DEF(t, #t)
+  FOR_MUDLLE_TYPES(TDEF, SEP_SEMI);
+
+  TDEF(garbage_mtemp);
+  TDEF(garbage_record);
 
   return 0;
 }

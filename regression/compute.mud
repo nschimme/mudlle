@@ -1,8 +1,8 @@
 // for all ops, all combinations of kinds of args
 // kinds: constant / arg / global / temp-result
-// (arg is like local var, but is always spilled on x86...)
+// (arg is like local var, but is always spilled on x86-64...)
 [
-  eval("dummy = fn () 1");
+  reval("dummy = fn () 1");
 
   regressunary =
     fn (lv, gv)
@@ -22,24 +22,31 @@
 
   regress1arg("car", '(20 34), "car(arg1)", 20);
   regress1arg("cdr", '(20 34), "cdr(arg1)", '(34));
-  regressunary("feroh", "fhritgfriugf")("string_length", fn (x) string_length(x));
-  regressunary('[], '[ 1 3 77])("vector_length", fn (x) vector_length(x));
-  regressunary('[99], '[])("vector_length", fn (x) vector_length(x));
+  regressunary("feroh", "fhritgfriugf")("slength",
+                                        fn (x) slength(x));
+  regressunary('[], '[ 1 3 77])("vlength", fn (x) vlength(x));
+  regressunary('[99], '[])("vlength", fn (x) vlength(x));
 
-  gi = 41;
-  loop
-    [
-      regresseval("*", "gi * 3", gi * 3);
-      regresseval("/", "gi / 3", gi / 3);
-      regresseval("%", "gi % 3", gi % 3);
-      regresseval("*", "gi * -3", gi * -3);
-      regresseval("/", "gi / -3", gi / -3);
-      regresseval("%", "gi % -3", gi % -3);
-      if (gi < 0) exit null;
-      gi = -41;
-    ];
-  eval("gf = fn (x) gi/x"); regressfail("/0", fn () gf(0));
-  eval("gf = fn (x) gi%x"); regressfail("%0", fn () gf(0));
+  vforeach(fn (rhs) [
+    vforeach(fn (lhs) [
+      gi = lhs;
+      vforeach(fn (astr) [
+        | s |
+        s = itoa(rhs);
+        regresseval(astr+"*", astr + " * " + s, gi * rhs);
+        if (rhs != 0)
+          [
+            regresseval(astr+"/", astr + " / " + s, gi / rhs);
+            regresseval(astr+"%", astr + " % " + s, gi % rhs);
+          ]
+      ], '[ "gi" "(fn () gi)()" ]);
+    ], '[ -1 0 1 41 -41 ])
+  ], sequence(
+    MININT, -(1 << 40), -(1 << 20), -8, -3, -1, 0,
+    1, 3, 8, 1 << 20, 1 << 40, MAXINT));
+
+  reval("gf = fn (x) gi/x"); regressfail("/0", fn () gf(0));
+  reval("gf = fn (x) gi%x"); regressfail("%0", fn () gf(0));
   gi = 2;
   regresseval("<<b", "12 << gi", 12 << gi);
   regresseval(">>b", "12 >> gi", 12 >> gi);
@@ -146,4 +153,11 @@
   regress2args("-0", 7, 12, "arg1 - arg2", -5);
   regresseval("-1", "gi - 12", gi - 12);
   regresseval("-2", "112 - gi", 112 - gi);
+
+  regress2args("bit_set?", "\x55", 1, "bit_set?(arg1, arg2)", 0);
+  regress2args("bit_set?", "\x55", 2, "bit_set?(arg1, arg2)", 1);
+  regressqfail("bit_set?", "bit_set?(\"\", -1)");
+  regressqfail("bit_set?", "bit_set?(\"\", 0)");
+  regressqfail("bit_set?", "bit_set?(\"\xff\", -1)");
+  regressqfail("bit_set?", "bit_set?(\"\xff\", 8)");
 ];

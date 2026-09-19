@@ -22,6 +22,14 @@
 #ifndef RUNTIME_DEBUG_H
 #define RUNTIME_DEBUG_H
 
+enum {
+  di_line,
+  di_column,
+  di_nicename,
+  di_filename,
+  di_fields
+};
+
 void debug_init(void);
 
 #endif /* RUNTIME_DEBUG_H */

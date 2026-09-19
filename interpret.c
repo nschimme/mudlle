@@ -21,25 +21,18 @@
 
 #include "mudlle-config.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include "alloc.h"
-#include "call.h"
-#include "code.h"
-#include "context.h"
-#include "error.h"
 #include "global.h"
 #include "ins.h"
 #include "interpret.h"
+#include "profile.h"
 #include "stack.h"
-#include "utils.h"
 
 #include "runtime/arith.h"
 #include "runtime/basic.h"
+#include "runtime/list.h"
 #include "runtime/mudlle-string.h"
 #include "runtime/runtime.h"
+#include "runtime/vector.h"
 
 /* As good a place as any other */
 extern const char COPYRIGHT[];
@@ -64,7 +57,15 @@ FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS ON AN\n\
 PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.\n\
 ";
 
-static inline value invoke_stack(struct closure *c, int nargs);
+static value invoke_stack(struct closure *c, int nargs);
+
+struct primop_header {
+  struct call_stack_c_header c;
+  value args[MAX_C_ARGS];
+};
+
+static noreturn void cearly_error(struct primop_header *primop,
+                                  enum runtime_error error, const char *msg);
 
 /* Macros for fast access to the GC'ed stack & code structures.
    RESTORE_INS & RESTORE_STACK must be called after anything that may
@@ -93,8 +94,10 @@ struct stack_cache {
   *stack_cache.used = mudlle_iadd(*stack_cache.used, 1);        \
   *stack_cache.pos++ = (v);                                     \
 } while (0)
-#define FAST_GET(n)    (stack_cache.pos[-((n) + 1)])
-#define FAST_SET(n, v) (stack_cache.pos[-((n) + 1)] = (v))
+#define FAST_GET(n)    (CASSERT_TYPE((n) | 0L, long),           \
+                        stack_cache.pos[-((n) + 1)])
+#define FAST_SET(n, v) (CASSERT_TYPE((n) | 0L, long),           \
+                        stack_cache.pos[-((n) + 1)] = (v))
 
 #define RESTORE_INS() ((void)(ins = (uint8_t *)me.code + ins_index))
 #define INSUINT8()  (ins_index++, *ins++)
@@ -112,35 +115,46 @@ struct stack_cache {
   runtime_error(n);				\
 } while (0)
 
-#define IERROR_TYPE(arg, type) do {		\
+#define IERROR_TYPE(arg, type, argnum) do {     \
   SAVE_OFFSET();				\
-  bad_type_error(arg, type);			\
+  bad_type_error(arg, type, argnum);            \
 } while (0)
 
-#define IEARLY_ERROR(n) do {			\
+/* Early error with the arguments still on the interpreter stack. */
+#define IEARLY_ERROR(n, msg) do {               \
   SAVE_OFFSET();				\
-  interpreted_early_runtime_error(n);		\
+  interpreted_early_runtime_error((n), (msg));  \
 } while (0)
 
+/* Use after C_START_CALL() has been called. */
+#define CEARLY_ERROR(n, msg) do {               \
+  SAVE_OFFSET();                                \
+  cearly_error(&primop, (n), (msg));            \
+} while (0)
 
-void do_interpret(struct closure *fn, int nargs)
+static inline bool check_loop(void)
+{
+  maybe_profile_tick();
+  return false;
+}
+
+void do_interpret(struct closure *fn, int my_nargs)
 {
   uint8_t *ins;
 
   struct stack_cache stack_cache;
 
+  if (check_loop()) runtime_error(error_loop);
 
   if (get_stack_pointer() < mudlle_stack_limit)
     runtime_error(error_recurse);
 
-  if (nargs > MAX_FUNCTION_ARGS)
+  if (my_nargs > MAX_FUNCTION_ARGS)
     runtime_error(error_wrong_parameters);
 
-#ifdef MUDLLE_INTERRUPT
   check_interrupt();
-#endif
 
-  assert(TYPE(fn->code, code));
+  assert(TYPE(fn->code, icode));
 
   struct call_stack_mudlle me = {
     .s = {
@@ -150,7 +164,7 @@ void do_interpret(struct closure *fn, int nargs)
     .fn     = fn,
     .code   = (struct icode *)fn->code,
     .locals = NULL,
-    .nargs  = nargs,
+    .nargs  = my_nargs,
     .offset = -1,
   };
   call_stack = &me.s;
@@ -160,16 +174,15 @@ void do_interpret(struct closure *fn, int nargs)
 #endif
 
   /* make local variables */
-  me.locals = allocate_locals(me.code->nb_locals);
+  if (me.code->nb_locals > 0)
+    me.locals = allocate_locals(me.code->nb_locals);
 
-#define LOCAL   me.locals->data[INSUINT8()]
-#define CLOSURE me.fn->variables[INSUINT8()]
+#define LOCAL_VAR(n) ((struct variable *)me.locals->data[n])
+#define LOCAL        LOCAL_VAR(INSUINT8())
+#define CLOSURE      ((struct variable *)me.fn->variables[INSUINT8()])
 
   /* Pre-initialise call stack entry for calls to C primitives */
-  struct {
-    struct call_stack_c_header c;
-    value args[MAX_PRIMITIVE_ARGS];
-  } primop;
+  struct primop_header primop;
   primop.c.s = (struct call_stack){
     .next = &me.s,
     .type = call_c
@@ -180,12 +193,15 @@ void do_interpret(struct closure *fn, int nargs)
 
   seclev_t seclev = me.code->code.seclevel;
   if (seclev < minlevel)
-    interpreted_early_runtime_error(error_security_violation);
+    interpreted_early_runtime_error(error_security_violation, NULL);
 
-  value mseclev = seclevel_to_maxseclevel(seclev);
-  value old_maxseclevel = maxseclevel;
-  if ((long)mseclev < (long)old_maxseclevel)
-    maxseclevel = mseclev;
+  seclev_t this_seclev = intval(seclevel_to_maxseclevel(seclev));
+  seclev_t old_maxseclevel = c_maxseclevel();
+  seclev_t old_trace_seclevel = trace_seclevel();
+  if (this_seclev < old_maxseclevel)
+    set_c_maxseclevel(this_seclev);
+  if (this_seclev < old_trace_seclevel)
+    set_trace_seclevel(this_seclev);
 
   stack_reserve(me.code->stkdepth); /* Ensure enough space on stack */
   RESTORE_STACK();
@@ -198,16 +214,22 @@ void do_interpret(struct closure *fn, int nargs)
                      - (uint8_t *)me.code);
   RESTORE_INS();
 
+  int call_nargs;
+
   for (;;) {
     struct obj *called;
     const struct prim_op *op;
+    value c_result;
 
-    instruction_number++;
+    ++instruction_number;
     enum operator byteop = INSOPER();
     switch (byteop)
       {
       case op_return: goto done;
 
+      case op_null:
+	FAST_PUSH(NULL);
+	break;
       case op_constant1:
 	FAST_PUSH(CONST(INSUINT8()));
 	GCCHECK(FAST_GET(0));
@@ -237,7 +259,7 @@ void do_interpret(struct closure *fn, int nargs)
 	   implementation is chosen. */
       case op_closure:
         {
-	  struct closure *new_closure = unsafe_alloc_closure(INSUINT8());
+	  struct closure *new_closure = alloc_closure_noinit(INSUINT8());
           /* No GC allowed after this point till op_closure_code is executed */
           RESTORE_STACK();
           RESTORE_INS();
@@ -270,7 +292,10 @@ void do_interpret(struct closure *fn, int nargs)
         }
 
 #define C_ARG(n) primop.args[n]
-#define C_SETARG(n, arg) C_ARG(n) = arg; GCCHECK(C_ARG(n))
+#define C_SETARG(n, arg) do {                   \
+        C_ARG(n) = arg;                         \
+        GCCHECK(C_ARG(n));                      \
+      } while (0)
 
 #define C_START_CALL(n, pop) do {               \
           SAVE_OFFSET();                        \
@@ -282,42 +307,44 @@ void do_interpret(struct closure *fn, int nargs)
         } while (0)
 
 #define C_END_CALL(result) do {                 \
-          value __result = (result);            \
+          c_result = (result);                  \
           call_stack = &me.s;			\
-          GCCHECK(__result);			\
-          RESTORE_STACK();			\
-          RESTORE_INS();                        \
-          FAST_PUSH(__result);                  \
+          goto c_end_call;                      \
         } while (0)
 
       case op_execute_primitive_1arg:
 	C_START_CALL(1, GVAR(INSUINT16()));
 	C_SETARG(0, FAST_POP());
 	set_seclevel(seclev);
-	C_END_CALL(op->op(C_ARG(0)));
+	C_END_CALL(((op1_fn)op->op)(C_ARG(0)));
+
+      c_end_call:
+        RESTORE_STACK();
+        RESTORE_INS();
+        FAST_PUSH(c_result);
 	break;
+
       case op_execute_primitive_2arg:
 	C_START_CALL(2, GVAR(INSUINT16()));
-	C_SETARG(1, FAST_POP());
 	C_SETARG(0, FAST_POP());
+	C_SETARG(1, FAST_POP());
 	set_seclevel(seclev);
-	C_END_CALL(op->op(C_ARG(0), C_ARG(1)));
-	break;
+	C_END_CALL(((op2_fn)op->op)(C_ARG(0), C_ARG(1)));
 
       case op_execute_global_1arg:
 	called = GVAR(INSUINT16());
-	nargs = 1;
+	call_nargs = 1;
 	goto execute_fn;
       case op_execute_global_2arg:
 	called = GVAR(INSUINT16());
-	nargs = 2;
+	call_nargs = 2;
 	goto execute_fn;
 
       case op_execute2:
-        nargs = INSUINT16();
+        call_nargs = INSUINT16();
         goto do_op_execute;
       case op_execute:
-	nargs = INSUINT8();
+	call_nargs = INSUINT8();
       do_op_execute:
 	called = FAST_POP();
 
@@ -326,55 +353,40 @@ void do_interpret(struct closure *fn, int nargs)
 	switch (TYPEOF(called))
 	  {
 	  case type_varargs:
-	    {
-	      struct primitive *pop = (struct primitive *)called;
-
-              /* set zero args in case there is a GC */
-              C_START_CALL(0, pop);
-	      struct vector *args = UNSAFE_ALLOCATE_RECORD(vector, nargs);
-	      RESTORE_STACK();
-	      for (ulong i = nargs; i > 0;)
-                args->data[--i] = FAST_POP();
-
-              primop.c.nargs = 1;
-	      C_SETARG(0, args);
-              vararg_op_fn vop = op->op;
-	      C_END_CALL(vop(args, nargs));
-	      break;
-	    }
+            goto execute_vararg;
 
 	  case type_secure:
-	    C_START_CALL(nargs, (struct primitive *)called);
+	    C_START_CALL(call_nargs, (struct primitive *)called);
 	    if (DEFAULT_SECLEVEL < op->seclevel
-                || intval(maxseclevel) < op->seclevel)
-	      IEARLY_ERROR(error_security_violation);
+                || c_maxseclevel() < op->seclevel)
+              CEARLY_ERROR(error_security_violation, NULL);
 	    goto execute_primitive;
 
 	  case type_primitive:
-	    C_START_CALL(nargs, (struct primitive *)called);
+	    C_START_CALL(call_nargs, (struct primitive *)called);
 
 	  execute_primitive:
-	    if (nargs != op->nargs)
-	      IEARLY_ERROR(error_wrong_parameters);
+	    if (call_nargs != op->nargs)
+              CEARLY_ERROR(
+                error_wrong_parameters,
+                bad_nargs_message(call_nargs, op->nargs, op->nargs));
 
-            for (int arg = nargs; arg > 0; )
-              {
-                --arg;
-                C_SETARG(arg, FAST_POP());
-              }
+            for (int arg = 0; arg < call_nargs; ++arg)
+              C_SETARG(arg, FAST_POP());
 
             {
               value result;
-              switch (nargs)
+              switch (primop.c.nargs)
                 {
                 case 0:
-                  result = op->op();
+                  result = ((op0_fn)op->op)();
                   break;
 
-#define __CPRIMARG(N) C_ARG(N - 1)
+#define __CPRIMARG(N) C_ARG(DEC(N))
 #define __CALL_PRIM(N)                                                  \
                   case N:                                               \
-                    result = op->op(CONCATCOMMA(N, __CPRIMARG));        \
+                    result = ((PRIMOPTYPE(N))op->op)(                   \
+                      CONCATCOMMA(N, __CPRIMARG));                      \
                     break
                   DOPRIMARGS(__CALL_PRIM, SEP_SEMI);
 #undef __CALL_PRIM
@@ -384,7 +396,6 @@ void do_interpret(struct closure *fn, int nargs)
                 }
               C_END_CALL(result);
             }
-	    break;
 
 	  case type_closure:
 	    {
@@ -393,13 +404,13 @@ void do_interpret(struct closure *fn, int nargs)
 	      SAVE_OFFSET();
 	      if (c->code->o.type == type_mcode)
 		{
-		  value result = invoke_stack(c, nargs);
+		  value result = invoke_stack(c, call_nargs);
 		  RESTORE_STACK();
 		  FAST_PUSH(result);
 		}
 	      else
 		{
-		  do_interpret(c, nargs);
+		  do_interpret(c, call_nargs);
 		  RESTORE_STACK();
 		}
 	      RESTORE_INS();
@@ -410,18 +421,18 @@ void do_interpret(struct closure *fn, int nargs)
               SAVE_OFFSET();
               primop.c.s.type = call_invalid;
               primop.c.u.value = called;
-              primop.c.nargs = nargs;
+              primop.c.nargs = call_nargs;
               call_stack = &primop.c.s;
-              IEARLY_ERROR(error_bad_function);
+              CEARLY_ERROR(error_bad_function, NULL);
             }
 	  }
 	break;
 
       case op_execute_secure2:
-        nargs = INSUINT16();
+        call_nargs = INSUINT16();
         goto do_op_execute_secure;
       case op_execute_secure:
-	nargs = INSUINT8();
+	call_nargs = INSUINT8();
       do_op_execute_secure:
 	called = FAST_POP();
 
@@ -429,17 +440,17 @@ void do_interpret(struct closure *fn, int nargs)
 	   protected modules (normally system) */
 	assert(pointerp(called) && called->type == type_secure);
 
-	C_START_CALL(nargs, (struct primitive *)called);
+	C_START_CALL(call_nargs, (struct primitive *)called);
 	set_seclevel(seclev);
-	if (seclev < op->seclevel || intval(maxseclevel) < op->seclevel)
-	  IEARLY_ERROR(error_security_violation);
+	if (seclev < op->seclevel || c_maxseclevel() < op->seclevel)
+	  CEARLY_ERROR(error_security_violation, NULL);
 	goto execute_primitive;
 
       case op_execute_primitive2:
-        nargs = INSUINT16();
+        call_nargs = INSUINT16();
         goto do_op_execute_primitive;
       case op_execute_primitive:
-	nargs = INSUINT8();
+	call_nargs = INSUINT8();
       do_op_execute_primitive:
 	called = FAST_POP();
 
@@ -447,15 +458,15 @@ void do_interpret(struct closure *fn, int nargs)
 	   protected modules (normally system) */
 	assert(pointerp(called) && called->type == type_primitive);
 
-	C_START_CALL(nargs, (struct primitive *)called);
+	C_START_CALL(call_nargs, (struct primitive *)called);
 	goto execute_primitive;
 
       case op_execute_varargs2:
-        nargs = INSUINT16();
+        call_nargs = INSUINT16();
         goto do_op_execute_varargs;
       case op_execute_varargs:
 	{
-          nargs = INSUINT8();
+          call_nargs = INSUINT8();
         do_op_execute_varargs:
 	  called = FAST_POP();
 
@@ -465,41 +476,94 @@ void do_interpret(struct closure *fn, int nargs)
 
 	  set_seclevel(seclev);
 
-	  struct primitive *pop = (struct primitive *)called;
+        execute_vararg: ;
+          struct primitive *pop = (struct primitive *)called;
 
-          /* set zero args in case there is a GC */
-          C_START_CALL(0, pop);
-	  struct vector *args = UNSAFE_ALLOCATE_RECORD(vector, nargs);
-	  RESTORE_STACK();
-	  for (ulong i = nargs; i > 0; )
-            args->data[--i] = FAST_POP();
+          C_START_CALL(call_nargs, pop);
 
-          primop.c.nargs = 1;
-	  SAVE_OFFSET();
-	  C_SETARG(0, args);
-          vararg_op_fn vop = op->op;
-	  C_END_CALL(vop(args, nargs));
-	  break;
-	}
+          int nfixed = varop_nfixed(op);
+          if (nfixed > call_nargs)
+            CEARLY_ERROR(error_wrong_parameters,
+                         bad_nargs_message(call_nargs, nfixed, UINT_MAX));
+          int nvec   = call_nargs - nfixed;
 
-      case op_argcheck:		/* A CISCy instruction :-) */
-	if (nargs != INSUINT8()) IEARLY_ERROR(error_wrong_parameters);
-	for (ulong i = 0; i < nargs; i++)
-	  ((struct variable *)me.locals->data[i])->vvalue
-            = FAST_GET(i);
-	break;
-      case op_varargs:		/* Another CISCy instruction... */
+          primop.c.nargs = 0;   /* in case of GC */
+          struct vector *argv = (nvec == 0
+                                 ? empty_vector
+                                 : ALLOC_RECORD_NOINIT(vector, nvec));
+          RESTORE_STACK();
+
+          for (int i = 0; i < nfixed; ++i)
+            C_SETARG(i, FAST_POP());
+          for (int i = 0; i < nvec; ++i)
+            argv->data[i] = FAST_POP();
+          C_SETARG(nfixed, argv);
+          primop.c.nargs = nfixed + 1;
+
+          value result = call_vararg(op, nfixed, primop.args, argv);
+          C_END_CALL(result);
+        }
+
+      case op_c_callback:
+        {
+          struct mcallback *cb = FAST_POP();
+          SAVE_OFFSET();
+          c_result = call_mcallback(cb);
+          goto c_end_call;
+        }
+
+      case op_args_fixed:       /* A CISCy instruction :-) */
+        {
+          uint8_t nfixed = INSUINT8();
+          if (my_nargs != nfixed)
+            IEARLY_ERROR(error_wrong_parameters,
+                         bad_nargs_message(my_nargs, nfixed, nfixed));
+          for (int i = 0; i < my_nargs; ++i)
+            LOCAL_VAR(i)->vvalue = FAST_GET(i);
+          break;
+        }
+      case op_args_range:       /* Another CISCy instruction... */
+        {
+          long maxargs = intval(FAST_POP());
+          long minargs = intval(FAST_POP());
+          assert(minargs >= 0);
+          if (my_nargs < minargs || my_nargs > maxargs)
+            IEARLY_ERROR(error_wrong_parameters,
+                         bad_nargs_message(my_nargs, minargs, maxargs));
+          for (int i = 0; i < my_nargs; ++i)
+            LOCAL_VAR(i)->vvalue = FAST_GET(i);
+          LOCAL_VAR(maxargs)->vvalue = makeint(my_nargs);
+          break;
+        }
+      case op_args_vararg:      /* Another CISCy instruction... */
 	{
-	  struct vector *args = UNSAFE_ALLOCATE_RECORD(vector, nargs);
+          long optargs = intval(FAST_POP());
+          long minargs = intval(FAST_POP());
 
-	  RESTORE_STACK();
-	  RESTORE_INS();
-	  for (int j = 0; j < nargs; j++)
-	    args->data[nargs - j - 1] = FAST_GET(j);
+          if (my_nargs < minargs)
+            IEARLY_ERROR(error_wrong_parameters,
+                         bad_nargs_message(my_nargs, minargs, UINT_MAX));
 
-	  ((struct variable *)me.locals->data[0])->vvalue = args;
-	  me.nargs = 1;
-	  FAST_POPN(nargs);
+	  struct vector *args = empty_vector;
+          int nvarargs = 0;
+          int nregular = my_nargs;
+          if (my_nargs > minargs + optargs)
+            {
+              nvarargs = my_nargs - minargs - optargs;
+              nregular -= nvarargs;
+              me.nargs = nregular + 1;
+
+              args = ALLOC_RECORD_NOINIT(vector, nvarargs);
+              RESTORE_STACK();
+              RESTORE_INS();
+              for (int i = 0; i < nvarargs; ++i)
+                args->data[i] = FAST_GET(i + minargs + optargs);
+            }
+
+          LOCAL_VAR(minargs + optargs)->vvalue = args;
+          LOCAL_VAR(minargs + optargs + 1)->vvalue = makeint(my_nargs);
+          for (int i = 0; i < nregular; ++i)
+            LOCAL_VAR(i)->vvalue = FAST_GET(i);
 	  break;
 	}
       case op_discard:
@@ -512,15 +576,18 @@ void do_interpret(struct closure *fn, int nargs)
           FAST_PUSH(result);
           break;
         }
-      case op_pop_n:
-	FAST_POPN(INSUINT8());
+      case op_exit_discard_n:
+        FAST_POPN(INSUINT8());
+        break;
+      case op_pop_args:
+	FAST_POPN(my_nargs);
 	break;
       case op_branch_z1:
-	if (!istrue(FAST_POP())) goto branch1;
+	if (isfalse(FAST_POP())) goto branch1;
 	(void)INSINT8();
 	break;
       case op_branch_z2:
-	if (!istrue(FAST_POP())) goto branch2;
+	if (isfalse(FAST_POP())) goto branch2;
 	(void)INSINT16();
 	break;
       case op_branch_nz1:
@@ -532,11 +599,9 @@ void do_interpret(struct closure *fn, int nargs)
 	(void)INSINT16();
 	break;
       case op_loop1:
-	FAST_POPN(1);
-#ifdef MUDLLE_INTERRUPT
+        if (check_loop()) IERROR(error_loop);
 	check_interrupt();
-#endif
-	/* FALL THROUGH */
+        FALLTHROUGH;
       case op_branch1:
       branch1:
 	{
@@ -548,11 +613,9 @@ void do_interpret(struct closure *fn, int nargs)
 	}
 
       case op_loop2:
-	FAST_POPN(1);
-#ifdef MUDLLE_INTERRUPT
+        if (check_loop()) IERROR(error_loop);
 	check_interrupt();
-#endif
-	/* FALL THROUGH */
+        FALLTHROUGH;
       case op_branch2:
       branch2:
 	{
@@ -563,14 +626,13 @@ void do_interpret(struct closure *fn, int nargs)
 	  break;
 	}
 
-#define RECALL(access) FAST_PUSH(((struct variable *)access)->vvalue)
-#define VREF(access)   FAST_PUSH(access)
-#define ASSIGN(access) do {                                     \
-          struct variable *_var = (struct variable *)(access);  \
-          _var->vvalue = FAST_GET(0);                           \
+#define RECALL(access) FAST_PUSH((access)->vvalue)
+#define ASSIGN(access) do {                     \
+          struct variable *_var = (access);     \
+          _var->vvalue = FAST_GET(0);           \
         } while (0)
 
-      case op_clear_local: ((struct variable *)LOCAL)->vvalue = NULL; break;
+      case op_clear_local: LOCAL->vvalue = NULL; break;
 
       case op_recall_local:   RECALL(LOCAL);   break;
       case op_recall_closure: RECALL(CLOSURE); break;
@@ -584,9 +646,6 @@ void do_interpret(struct closure *fn, int nargs)
           FAST_PUSH(GVAR(goffset));
           break;
         }
-      case op_vref_local:     VREF(LOCAL);     break;
-      case op_vref_closure:   VREF(CLOSURE);   break;
-        /* op_vref_global is invalid */
       case op_assign_local:   ASSIGN(LOCAL);   break;
       case op_assign_closure: ASSIGN(CLOSURE); break;
       case op_assign_global:
@@ -595,7 +654,7 @@ void do_interpret(struct closure *fn, int nargs)
 
 	  SAVE_OFFSET();
           value val = FAST_GET(0);
-	  check_global_write(val, goffset);
+	  check_global_write(goffset, val);
 	  GVAR(goffset) = val;
 	  break;
 	}
@@ -619,12 +678,13 @@ void do_interpret(struct closure *fn, int nargs)
         }
 
 #define INTEGER_OP(op, opname) do {		\
-	  value arg2 = FAST_POP();              \
-	  value arg1 = FAST_GET(0);             \
+	  value arg1 = FAST_POP();              \
+	  value arg2 = FAST_GET(0);             \
 	  if ((long)arg1 & (long)arg2 & 1)	\
 	    FAST_SET(0, op);			\
 	  else					\
             {                                   \
+              SAVE_OFFSET();                    \
               code_ ## opname(arg1, arg2);      \
               abort();                          \
             }                                   \
@@ -643,18 +703,15 @@ void do_interpret(struct closure *fn, int nargs)
 	INTEGER_OP(makebool((long)arg1 >= (long)arg2), greater_equal);
 	break;
 
-      case op_builtin_addint:
-        INTEGER_OP((value)((long)arg1 + (long)arg2 - 1), iadd);
-        break;
-
       case op_builtin_add:
         {
-          value arg2 = FAST_POP();
-          value arg1 = FAST_GET(0);
+          value arg1 = FAST_POP();
+          value arg2 = FAST_GET(0);
           if ((long)arg1 & (long)arg2 & 1)
             FAST_SET(0, (value)((long)arg1 + (long)arg2 - 1));
           else if (TYPE(arg1, string) && TYPE(arg2, string))
             {
+              SAVE_OFFSET();    /* in case string_plus() causes error */
               arg1 = string_plus(arg1, arg2);
               RESTORE_INS();
               RESTORE_STACK();
@@ -662,7 +719,7 @@ void do_interpret(struct closure *fn, int nargs)
             }
           else
             {
-              /* call for nice call trace */
+              SAVE_OFFSET();
               code_plus(arg1, arg2);
               abort();
             }
@@ -679,34 +736,62 @@ void do_interpret(struct closure *fn, int nargs)
       case op_builtin_bitor:
 	INTEGER_OP((value)((long)arg1 | (long)arg2), bitor);
 	break;
+      case op_builtin_bitnot:
+        {
+          value arg = FAST_GET(0);
+          if (!integerp(arg))
+            {
+              SAVE_OFFSET();
+              code_bitnot(arg);
+              abort();
+            }
+          FAST_SET(0, (value)((long)arg ^ -2));
+        }
+	break;
 
       case op_builtin_not:
-	FAST_SET(0, makebool(!istrue(FAST_GET(0))));
+	FAST_SET(0, makebool(isfalse(FAST_GET(0))));
 	break;
+
+      case op_builtin_car:
+      case op_builtin_cdr:
+        {
+          struct list *arg = FAST_GET(0);
+          if (!TYPE(arg, pair))
+            {
+              SAVE_OFFSET();
+              (byteop == op_builtin_car ? code_car : code_cdr)(arg);
+              abort();
+            }
+          FAST_SET(0, byteop == op_builtin_car ? arg->car : arg->cdr);
+          break;
+        }
 
 	/* These could be optimised */
       case op_builtin_ref:
         {
           SAVE_OFFSET();
-          value arg2 = FAST_POP();
-          value arg1 = code_ref(FAST_GET(0), arg2);
-          GCCHECK(arg1);
+          value arg1 = FAST_POP();
+          value arg2 = FAST_GET(0);
+          value result = code_ref(arg1, arg2);
+          GCCHECK(result);
           RESTORE_STACK();
           RESTORE_INS();
-          FAST_SET(0, arg1);
+          FAST_SET(0, result);
           break;
         }
 
       case op_builtin_set:
         {
           SAVE_OFFSET();
-          value arg2 = FAST_POP();
+          value arg0 = FAST_POP();
           value arg1 = FAST_POP();
-          arg1 = code_setb(FAST_GET(0), arg1, arg2);
-          GCCHECK(arg1);
+          value arg2 = FAST_GET(0);
+          value result = code_setb(arg0, arg1, arg2);
+          GCCHECK(result);
           RESTORE_STACK();
           RESTORE_INS();
-          FAST_SET(0, arg1);
+          FAST_SET(0, result);
           break;
         }
 
@@ -715,27 +800,30 @@ void do_interpret(struct closure *fn, int nargs)
           value arg2 = FAST_POP();
           assert(integerp(arg2));
           long typeset = intval(arg2);
-          value arg1 = FAST_GET(INSUINT8());
+          union typecheck_arg arg = { .u = INSUINT8() };
+          value arg1 = FAST_GET(arg.s.argnum);
           if (!is_typeset(arg1, typeset))
             {
               SAVE_OFFSET();
-              bad_typeset_error(arg1, typeset);
+              bad_typeset_error(arg1, typeset,
+                                arg.s.is_arg ? arg.s.argnum : -1);
             }
           break;
         }
 
         /* type checks follow */
-#define _SIMPLE_TYPECHECK(arg, type) {                  \
-          value arg1 = FAST_GET(INSUINT8());            \
-          if (!TYPE(arg1, type))                        \
-            IERROR_TYPE(arg1, type_ ## type);           \
-          break;                                        \
-        }
+#define _SIMPLE_TYPECHECK(cbarg, type) {                        \
+          union typecheck_arg arg = { .u = INSUINT8() };        \
+          value arg1 = FAST_GET(arg.s.argnum);                  \
+          if (!TYPE(arg1, type))                                \
+            IERROR_TYPE(arg1, type_ ## type, arg.s.argnum);     \
+        }                                                       \
+        break
 #define _OP_TYPECHECK(simple, arg, type) IF(simple)(    \
           _SIMPLE_TYPECHECK(arg, type),                 \
-          goto pointer_typecheck;)
+          goto pointer_typecheck)
 #define OP_TYPECHECK(type, arg)                         \
-        case op_typecheck_ ## type:                     \
+        case op_typecheck_type_ ## type:                \
           _OP_TYPECHECK(                                \
             IF(IS_MARK(_TYPE_IS_NULL_ ## type))(        \
               1,                                        \
@@ -743,38 +831,72 @@ void do_interpret(struct closure *fn, int nargs)
                 1, 0)),                                 \
             arg, type)
 
-      FOR_PLAIN_TYPES(OP_TYPECHECK,)
+        FOR_PLAIN_TYPES(OP_TYPECHECK, , SEP_SEMI);
 
         {
         pointer_typecheck: ;
-          struct obj *arg1 = FAST_GET(INSUINT8());
+          union typecheck_arg arg = { .u = INSUINT8() };
+          struct obj *arg1 = FAST_GET(arg.s.argnum);
           enum mudlle_type type = byteop - op_typecheck;
           if (!pointerp(arg1) || arg1->type != type)
-            IERROR_TYPE(arg1, type);
+            IERROR_TYPE(arg1, type, arg.s.is_arg ? arg.s.argnum : -1);
           break;
         }
 
-      case op_typecheck_none:
+      case op_typecheck_stype_none:
 	IERROR(error_bad_type);
 
-      case op_typecheck_any:
+      case op_typecheck_stype_any:
         break;
 
-      case op_typecheck_function:
+      case op_typecheck_stype_function:
 	{
-	  value arg1 = FAST_GET(INSUINT8());
-
+          union typecheck_arg arg = { .u = INSUINT8() };
+	  value arg1 = FAST_GET(arg.s.argnum);
 	  if (!is_function(arg1))
-            IERROR_TYPE(arg1, stype_function);
+            IERROR_TYPE(arg1, stype_function,
+                        arg.s.is_arg ? arg.s.argnum : -1);
 	  break;
 	}
 
-      case op_typecheck_list:
-        CASSERT_EXPR(last_synthetic_type == 27);
+      case op_typecheck_stype_false:
         {
-          value arg1 = FAST_GET(INSUINT8());
+          union typecheck_arg arg = { .u = INSUINT8() };
+          value arg1 = FAST_GET(arg.s.argnum);
+          if (arg1 != makebool(false))
+            IERROR_TYPE(arg1, stype_false,
+                        arg.s.is_arg ? arg.s.argnum : -1);
+          break;
+        }
+
+      case op_typecheck_stype_bigint_like:
+        {
+          union typecheck_arg arg = { .u = INSUINT8() };
+          value arg1 = FAST_GET(arg.s.argnum);
+          if (!is_const_typeset(arg1, TYPESET_BIGINT_LIKE))
+            IERROR_TYPE(arg1, stype_bigint_like,
+                        arg.s.is_arg ? arg.s.argnum : -1);
+          break;
+        }
+
+      case op_typecheck_stype_float_like:
+        {
+          union typecheck_arg arg = { .u = INSUINT8() };
+          value arg1 = FAST_GET(arg.s.argnum);
+          if (!is_const_typeset(arg1, TYPESET_FLOAT_LIKE))
+            IERROR_TYPE(arg1, stype_float_like,
+                        arg.s.is_arg ? arg.s.argnum : -1);
+          break;
+        }
+
+      case op_typecheck_stype_list:
+        {
+          CASSERT(mudlle_synthetic_types - mudlle_types == 7);
+          union typecheck_arg arg = { .u = INSUINT8() };
+	  value arg1 = FAST_GET(arg.s.argnum);
           if (arg1 && !TYPE(arg1, pair))
-            IERROR_TYPE(arg1, stype_list);
+            IERROR_TYPE(arg1, stype_list,
+                        arg.s.is_arg ? arg.s.argnum : -1);
           break;
         }
 
@@ -782,17 +904,20 @@ void do_interpret(struct closure *fn, int nargs)
       }
   }
  done:
-  maxseclevel = old_maxseclevel;
+  set_c_maxseclevel(old_maxseclevel);
+  set_trace_seclevel(old_trace_seclevel);
+
+  if (me.locals != NULL)
+    gc_free(&me.locals->o);
 
   call_stack = me.s.next;
 
   me.code->instruction_count += instruction_number - start_ins;
 }
 
-
 /* Interface to machine code. */
 
-static inline value invoke_stack(struct closure *c, int nargs)
+static value invoke_stack(struct closure *c, int nargs)
 /* Requires: c be a closure whose code is in machine code, i.e.
      TYPEIS(c->code, mcode);
      The stack must contain at least nargs entries.
@@ -806,25 +931,25 @@ static inline value invoke_stack(struct closure *c, int nargs)
   if (nargs > MAX_PRIMITIVE_ARGS)
     {
       GCPRO(c);
-      struct vector *extra = UNSAFE_ALLOCATE_RECORD(vector, nargs);
+      struct vector *extra = ALLOC_RECORD_NOINIT(vector, nargs);
       UNGCPRO();
       struct stack_cache stack_cache;
       RESTORE_STACK();
-      for (int i = nargs; i > 0; )
-        extra->data[--i] = FAST_POP();
+      for (int i = 0; i < nargs; ++i)
+        extra->data[i] = FAST_POP();
       return invokev(c, extra);
     }
 
   struct stack_cache stack_cache;
   RESTORE_STACK();
 
-#define __POPARG(N) __PRIMARG(N) = FAST_GET(nargs - N)
-#define __INVOKE(N)                             \
-  case N:                                       \
-    {                                           \
-      CONCATSEMI(N, __POPARG);                  \
-      FAST_POPN(N);                             \
-      return invoke ## N(c, PRIMARGNAMES ## N); \
+#define __POPARG(N) value PRIMARG(N) = FAST_GET(DEC(N))
+#define __INVOKE(N)                                     \
+  case N:                                               \
+    {                                                   \
+      CONCATSEMI(N, __POPARG);                          \
+      FAST_POPN(N);                                     \
+      return invoke ## N(c, PRIMARGNAMES(N));           \
     }
 
   switch (nargs)
@@ -837,10 +962,20 @@ static inline value invoke_stack(struct closure *c, int nargs)
 #undef __INVOKE
 }
 
+static noreturn void cearly_error(struct primop_header *primop,
+                                  enum runtime_error error, const char *msg)
+{
+  /* Clear primop.args[] to prevent GC of possibly-invalid values.
+     The real arguments are on the interpreter stack. */
+  for (int i = 0; i < primop->c.nargs; ++i)
+    primop->args[i] = NULL;
+  interpreted_early_runtime_error(error, msg);
+}
+
 /* Interface from machine code - backend specific */
 
-#if (defined __i386__ || defined __x86_64__) && !defined NOCOMPILER
-/* called from x{64,86}builtins.S; args[nargs] must be GC-protected */
+#if defined __x86_64__ && !defined NOCOMPILER
+/* called from x64builtins.S; args[nargs] must be GC-protected */
 value builtin_call_interpreter(struct closure *closure, int nargs,
                                const value *args);
 value builtin_call_interpreter(struct closure *closure, int nargs,
@@ -850,16 +985,11 @@ value builtin_call_interpreter(struct closure *closure, int nargs,
     {
       /* Reserve stack space */
       GCPRO(closure);
-      stack_reserve(nargs);
+      stack_make_room(nargs);
       UNGCPRO();
-      struct stack_cache stack_cache;
-      RESTORE_STACK();
 
-      for (int i = 0; i < nargs; i++)
-        {
-          value v = *args++;
-          FAST_PUSH(v);
-        }
+      for (int i = 0; i < nargs; ++i)
+        stack_set(i, args[i]);
     }
 
   do_interpret(closure, nargs);

@@ -22,16 +22,14 @@
 #include "alloc.h"
 #include "compile.h"
 #include "context.h"
-#include "error.h"
 #include "global.h"
-#include "interpret.h"
 #include "mcompile.h"
-#include "mparser.h"
+#include "module.h"
+#include "mtree.h"
 #include "mudlle.h"
 #include "print.h"
 #include "random.h"
 #include "stack.h"
-#include "strbuf.h"
 #include "table.h"
 
 #include "runtime/runtime.h"
@@ -47,6 +45,7 @@ void mudlle_init(void)
   stack_init();
   module_init();
   runtime_init();
+  mtree_init();
   compile_init();
   mcompile_init();
   ports_init();

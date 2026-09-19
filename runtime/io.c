@@ -22,86 +22,119 @@
 #include "../mudlle-config.h"
 
 #include <ctype.h>
-#include <time.h>
-#include <unistd.h>
+#include <errno.h>
 
-#include <sys/resource.h>
-
+#include "files.h"
 #include "io.h"
 #include "mudlle-float.h"
 #include "mudlle-string.h"
 #include "prims.h"
 
-#include "../call.h"
 #include "../charset.h"
-#include "../context.h"
-#include "../interpret.h"
-#include "../mparser.h"
-#include "../ports.h"
 #include "../print.h"
 #include "../strbuf.h"
-#include "../utils.h"
 
 
-struct oport *get_oport(struct oport *oport)
+#define OPORT_INFO_NULL (const struct oport_info){ 0 }
+
+#define DOC_OPT_OPORT                                   \
+  "Does nothing if `oport is null or false; otherwise," \
+  " `oport must be " OPORT_TYPES "."
+
+enum runtime_error ct_oport(struct oport **oport, const char **errmsg,
+                            struct oport_info *info, bool force)
 {
-  if (TYPE(oport, oport))
-    return oport;
-  return NULL;
+  if (info != NULL)
+    *info = OPORT_INFO_NULL;
+  struct mudlle_file_data *fdata;
+  if (is_mudlle_file(*oport, &fdata))
+    {
+      if (fdata->f == NULL)
+        {
+          *errmsg = "file is closed";
+          return error_bad_value;
+        }
+      if (!fdata->writable)
+        {
+          *errmsg = "file is not open for writing";
+          return error_bad_value;
+        }
+      *oport = mudlle_file_oport(*oport);
+    }
+  else if (!TYPE(*oport, oport))
+    {
+      if (force)
+        {
+          *errmsg = "expected " OPORT_TYPES;
+          return error_bad_type;
+        }
+      if (*oport != makebool(false) && *oport != NULL)
+        {
+          *errmsg = "expected null, false, " OPORT_TYPES;
+          return error_bad_type;
+        }
+      *oport = NULL;
+    }
+  return error_none;
 }
 
-TYPEDOP(newline, , "-> . Print a newline", (void),
+TYPEDOP(newline, , "-> . Print a newline to `stdout().", (void),
         OP_LEAF | OP_NOESCAPE, ".")
 {
-  pputc('\n', mudout);
-  pflush(mudout);
+  pputc('\n', mudout());
+  pflush(mudout());
   undefined();
 }
 
-static value pprint(struct oport *p, enum prt_level level, value v)
+static value pprint(struct oport *p, enum fmt_flag level, value v)
 {
+  struct oport_info info;
+  const char *errmsg;
   GCPRO(v);
-  p = get_oport(p);
+  enum runtime_error e = ct_oport(&p, &errmsg, &info, false);
   UNGCPRO();
+  if (e != error_none)
+    runtime_error_message(e, errmsg);
   if (p)
-    output_value(p, level, v);
+    output_value(p, level, v, info.use_ascii);
   undefined();
 }
 
 TYPEDOP(pdisplay, , "`oport `x -> . Print a representation of `x to"
-        " `oport as `display() does."
-        " Does nothing if `oport is not an output port.",
-        (struct oport *p, value x), OP_LEAF | OP_NOESCAPE | OP_STR_READONLY,
-        "xx.")
+        " `oport as `display() does.\n"
+        DOC_OPT_OPORT,
+        (struct oport *oport, value x),
+        OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "[ouz]x.")
 {
-  return pprint(p, prt_display, x);
+  return pprint(oport, fmt_display, x);
 }
 
 TYPEDOP(pwrite, , "`oport `x -> . Print a representation of `x to"
-        " `oport as `write() does."
-        " Does nothing if `oport is not an output port.",
-        (struct oport *p, value x), OP_LEAF | OP_NOESCAPE | OP_STR_READONLY,
-        "xx.")
+        " `oport as `write() does.\n"
+        DOC_OPT_OPORT,
+        (struct oport *oport, value x),
+        OP_LEAF | OP_NOESCAPE | OP_STR_READONLY,
+        "[ouz]x.")
 {
-  return pprint(p, prt_write, x);
+  return pprint(oport, fmt_write, x);
 }
 
 TYPEDOP(pexamine, , "`oport `x -> . Print a representation of `x to"
-        " `oport as `examine() does."
-        " Does nothing if `oport is not an output port.",
-        (struct oport *p, value x), OP_LEAF | OP_NOESCAPE | OP_STR_READONLY,
-        "xx.")
+        " `oport as `examine() does.\n"
+        DOC_OPT_OPORT,
+        (struct oport *oport, value x),
+        OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "[ouz]x.")
 {
-  return pprint(p, prt_examine, x);
+  return pprint(oport, fmt_examine, x);
 }
 
-TYPEDOP(write, , "`x -> . Print a representation of `x to the standard"
-        " oport. Cf. `read_constant() which almost does the reverse.",
+TYPEDOP(write, , "`x -> . Print a representation of `x to `stdout()."
+        " Cf. `pformat_object().",
         (value v),
         OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "x.")
 {
-  output_value(mudout, prt_write, v);
-  pflush(mudout);
+  output_value(mudout(), fmt_write, v, mudout_wants_ascii());
+  pflush(mudout());
   undefined();
 }
 
@@ -109,50 +142,56 @@ TYPEDOP(pwrite_constant, , "`oport `x `b -> . Print a representation of `x to"
         " `oport that can be read using `read_constant().\n"
         "If `b is true, replaces any non-serializable value with null.\n"
         "Throws an error if `x cannot be represented as a constant.\n"
-        "Does nothing if `oport is not an output port.",
-        (struct oport *p, value v, value replace_gone),
-        OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "xxx.")
+        DOC_OPT_OPORT,
+        (struct oport *oport, value x, value replace_gone_p),
+        OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "[ouz]xx.")
 {
-  GCPRO(v);
-  p = get_oport(p);
+  GCPRO(x);                     /* get_port() may cause GC */
+  CHECK_TYPES(oport,          CT_OPT_OPORT(NULL),
+              x,              any,
+              replace_gone_p, any);
   UNGCPRO();
-  if (p != NULL && !print_constant(p, v, MAX_STRING_SIZE,
-                                   istrue(replace_gone)))
+  if (oport == NULL)
+    undefined();
+  unsigned flags = fmt_constant;
+  if (istrue(replace_gone_p))
+    flags |= fmt_flag_replace_gone;
+  if (!output_value_cut(oport, x, MAX_STRING_SIZE, flags))
     runtime_error(error_bad_value);
   undefined();
 }
 
-TYPEDOP(display, , "`x -> . Display a representation of `x to the standard"
-        " oport.", (value v),
+TYPEDOP(display, , "`x -> . Display a representation of `x to `stdout().",
+        (value v),
         OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "x.")
 {
-  output_value(mudout, prt_display, v);
-  pflush(mudout);
+  output_value(mudout(), fmt_display, v, mudout_wants_ascii());
+  pflush(mudout());
   undefined();
 }
 
-TYPEDOP(examine, , "`x -> . Examine a representation of `x to the standard"
-        " oport.", (value v),
+TYPEDOP(examine, , "`x -> . Examine a representation of `x to `stdout().",
+        (value v),
         OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "x.")
 {
-  output_value(mudout, prt_examine, v);
-  pflush(mudout);
+  output_value(mudout(), fmt_examine, v, mudout_wants_ascii());
+  pflush(mudout());
   undefined();
 }
 
 TYPEDOP(ctime, , "-> `n. Returns the number of milliseconds of CPU"
         " time. Only use the difference between two calls.",
 	(void),
-	OP_LEAF | OP_NOALLOC | OP_NOESCAPE, ".n")
+	OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_TRIVIAL, ".n")
 {
-  clock_t c = clock();
-  if (c == (clock_t)-1)
-    return makeint(-1);
-
-  unsigned long long t = c;
-  t *= 1000;
-  t /= CLOCKS_PER_SEC;
-  return makeint((long)t);
+  struct timespec ts;
+  if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0)
+    {
+      perror("clock_gettime()");
+      abort();
+    }
+  long ms = ts.tv_sec * 1000L + ts.tv_nsec / 1000000;
+  return makeint(ms);
 }
 
 
@@ -162,8 +201,7 @@ TYPEDOP(time, ,
         " values greater than `MAXINT (following Jan" NBSP "10 13:37:03 2004"
         NBSP "UTC).\n"
         "Cf. `time_after?() and `time_diff().",
-	(void),
-	OP_LEAF | OP_NOALLOC | OP_NOESCAPE, ".n")
+	(void), OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_TRIVIAL, ".n")
 {
   return makeint(time(NULL));
 }
@@ -224,16 +262,15 @@ TYPEDOP(time_afterp, "time_after?",
   return makebool(t0 > t1);
 }
 
-static value make_tm(time_t timeval, struct tm *(*convert)(const time_t *time),
+static value make_tm(value mt, struct tm *(*convert)(const time_t *time),
                      const struct prim_op *op)
 {
-  enum runtime_error error;
+  time_t timeval;
+  CHECK_TYPES_OP(op, mt, CT_TIME(timeval));
+
   struct tm *tm = convert(&timeval);
   if (tm == NULL)
-    {
-      error = error_bad_value;
-      goto got_error;
-    }
+    RUNTIME_ERROR(error_bad_value, strerror(errno));
 
   struct vector *vtm = alloc_vector(time_fields);
   vtm->data[tm_sec]  = makeint(tm->tm_sec);
@@ -246,9 +283,6 @@ static value make_tm(time_t timeval, struct tm *(*convert)(const time_t *time),
   vtm->data[tm_yday] = makeint(tm->tm_yday);
   CASSERT(time_fields == 8);
   return vtm;
-
- got_error:
-  primitive_runtime_error(error, op, 1, makeint(timeval));
 }
 
 TYPEDOP(gmtime, ,
@@ -259,16 +293,14 @@ TYPEDOP(gmtime, ,
         "  `tm_min   \tminutes (0-59)\n"
         "  `tm_hour  \thours (0-23)\n"
         "  `tm_mday  \tday of month (1-31)\n"
-        "  `tm_mon   \tmonth (0-11 for Jan-Dec)\n"
+        "  `tm_mon   \tmonth (0-11 for Jan-Dec; cf. `MONTH_xxx)\n"
         "  `tm_year  \tyear since 1900\n"
         "  `tm_wday  \tday of week (0-6 for Sun-Sat)\n"
         "  `tm_yday  \tday of year (0-365 where 0 is Jan 1)",
 	(value mt),
 	OP_LEAF | OP_NOESCAPE, "n.v")
 {
-  time_t t;
-  CHECK_TYPES(mt, CT_TIME(t));
-  return make_tm(t, gmtime, THIS_OP);
+  return make_tm(mt, gmtime, THIS_OP);
 }
 
 TYPEDOP(localtime, ,
@@ -277,9 +309,7 @@ TYPEDOP(localtime, ,
 	(value mt),
 	OP_LEAF | OP_NOESCAPE, "n.v")
 {
-  time_t t;
-  CHECK_TYPES(mt, CT_TIME(t));
-  return make_tm(t, localtime, THIS_OP);
+  return make_tm(mt, localtime, THIS_OP);
 }
 
 static void get_tm_struct(struct tm *tm, struct vector *v)
@@ -287,7 +317,7 @@ static void get_tm_struct(struct tm *tm, struct vector *v)
   assert(TYPE(v, vector));
 
   if (vector_len(v) != time_fields)
-    runtime_error(error_bad_value);
+    bad_vector_len_error(v, time_fields);
 
   *tm = (struct tm){
     .tm_sec    = GETRANGE(v->data[tm_sec], 0, 60),
@@ -320,42 +350,73 @@ TYPEDOP(asctime, ,
   return make_readonly(alloc_string_length(s, l));
 }
 
+#ifdef MAX_STRING_LENGTH
+#define TIME_STR_MAXLEN MAX_STRING_LENGTH
+#else
+#define TIME_STR_MAXLEN 4096
+#endif
+
 TYPEDOP(strftime, ,
-	"`s0 `v -> `s1. Convert the `gmtime() vector `v into a string, as"
-        " specified by the Unix `strftime(3) format string `s0."
-        " Returns false on error."
-        " See `/mhelp `strftime for help on the format string.",
-	(struct string *fmt, struct vector *vgmt),
+	"`s0 `v -> `s1|false. Convert the `gmtime() vector `v into a string,"
+        " as specified by the Unix `strftime(3) format string `s0.\n"
+        "The resulting string must be shorter than "
+        STRINGIFY(TIME_STR_MAXLEN) NBSP "characters.\n"
+        "Returns false on error.\n"
+        "See `/mhelp `strftime for help on the format string.",
+	(struct string *fmt, struct vector *mgmt),
 	OP_LEAF | OP_NOESCAPE | OP_STR_READONLY | OP_CONST | OP_TRACE,
         "sv.[sz]")
 {
-  CHECK_TYPES(fmt, string, vgmt, vector);
+  CHECK_TYPES(fmt, string, mgmt, vector);
 
   struct tm gmt;
-  get_tm_struct(&gmt, vgmt);
+  get_tm_struct(&gmt, mgmt);
 
-#ifdef MAX_STRING_LENGTH
-  char buffer[MAX_STRING_LENGTH];
-#else
-  char buffer[4096];
-#endif
-  if (strftime(buffer, sizeof buffer, fmt->str, &gmt))
-    return make_readonly(alloc_string(buffer));
+  char buf[TIME_STR_MAXLEN + 1]; /* +1 for extra space below */
+  size_t r = strftime(buf, sizeof buf, fmt->str, &gmt);
+  if (r >= TIME_STR_MAXLEN)
+    return makebool(false);
+  if (r > 0)
+    return make_readonly(alloc_string(buf));
 
-  return makebool(false);
+  struct strbuf sbfmt = sb_initstr(fmt->str);
+  sb_addc(&sbfmt, ' ');            /* handle empty output */
+  r = strftime(buf, sizeof buf, sb_str(&sbfmt), &gmt);
+  sb_free(&sbfmt);
+  if (r == 0 || r >= TIME_STR_MAXLEN)
+    return makebool(false);
+  --r;
+  buf[r] = 0;
+  return make_readonly(alloc_string(buf));
 }
 
 TYPEDOP(mktime, ,
-        "`v -> `n. Does the inverse of `gmtime(). Returns -1 on error.",
-        (struct vector *vgmt),
+        "`v -> `n. Does the inverse of `gmtime(). If values are out of their"
+        " normal range, they will be normalized.\n"
+        "Returns -1 on error.",
+        (struct vector *mtm),
         OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "v.n")
 {
-  CHECK_TYPES(vgmt, vector);
+  CHECK_TYPES(mtm, vector);
 
-  struct tm gmt;
-  get_tm_struct(&gmt, vgmt);
+  if (vector_len(mtm) != time_fields)
+    RUNTIME_ERROR(error_bad_value, NULL);
 
-  time_t t = mktime(&gmt);
+#define TMF(name) .name = GETRANGE(mtm->data[name], INT_MIN, INT_MAX)
+  struct tm tm = {
+    TMF(tm_sec),
+    TMF(tm_min),
+    TMF(tm_hour),
+    TMF(tm_mday),
+    TMF(tm_mon),
+    TMF(tm_year),
+    TMF(tm_wday),
+    TMF(tm_yday),
+    .tm_isdst = false
+  };
+#undef TMF
+
+  time_t t = mktime(&tm);
   if (t != -1)
     t -= timezone;
   return makeint(t);
@@ -363,81 +424,42 @@ TYPEDOP(mktime, ,
 
 TYPEDOP(with_output, , "`oport `f -> `x. Evaluates `f() with output"
         " sent to `oport.\n"
-        "If `oport is not a port, just evaluates `f().\n"
+        "If `oport is a character without a link, null or false, just"
+        " evaluates `f().\n"
         "Output is restored when done. Returns the result of `f().\n"
         "Cf. `stdout().",
-        (value out, value code),
-        OP_APPLY, "xf.x")
+        (struct oport *oport, value mf),
+        OP_APPLY, "[ouz]f.x")
 {
-  CHECK_TYPES(out,  any,
-              code, CT_CALLABLE(0));
+  struct oport *oout = mudout(), *oerr = muderr();
+  GCPRO(mf, oout, oerr);        /* CT_OPT_OPORT may cause GC */
 
-  struct oport *newout = mudout, *newerr = muderr;
 
-  if (TYPE(out, oport)) newout = newerr = out;
+  /* silence warning on 'gone' argument */
+  if (TYPE(oport, gone))
+    oport = NULL;
 
-  if (newout == mudout && newerr == muderr)
-    return call0(code);
+  CHECK_TYPES(oport, CT_OPT_OPORT(NULL),
+              mf,    CT_CALLABLE(0));
 
-  struct oport *oout = mudout, *oerr = muderr;
-  GCPRO(oout, oerr);
-  mudout = newout;
-  muderr = newerr;
-  value result = mcatch_call(NULL, code);
+  struct oport *newout = mudout(), *newerr = muderr();
+  if (oport != NULL)
+    newout = newerr = oport;
+
+  bool same = newout == mudout() && newerr == muderr();
+
+  if (newout == mudout_port || same)
+    {
+      UNGCPRO();
+      return call0(mf);
+    }
+
+  session_context->ports.out = newout;
+  session_context->ports.err = newerr;
+  value result = mcatch_call(NULL, mf);
   UNGCPRO();
-  mudout = oout;
-  muderr = oerr;
-
-  maybe_mrethrow();
-
-  return result;
-}
-
-UNSAFEOP(with_output_file, ,
-         "`s `n `f -> `x. Evaluates `f() with output appended to file `s."
-         " `n decides how call traces are handled:\n"
-         "  0  \tall call traces are sent to the file\n"
-         "  1  \tonly unhandled call traces are sent to the file\n"
-         "  2  \tno call traces are sent to the file\n"
-         "Returns the result of `f().\n"
-         "Cf. `stdout().",
-         (struct string *file, value mode, value code),
-         0, "sxf.x")
-{
-  int ctmode;
-  CHECK_TYPES(file, string,
-              mode, CT_RANGE(ctmode, 0, 2),
-              code, CT_CALLABLE(0));
-
-  FILE *f = fopen(file->str, "a+");
-  if (f == NULL)
-    RUNTIME_ERROR(error_bad_value, "failed to open file");
-
-  struct oport *oport = NULL;
-  {
-    GCPRO(code, oport);
-    oport = make_file_oport(f);
-
-    if (ctmode == 0)
-      add_call_trace(oport, 0);
-    UNGCPRO();
-  }
-
-  struct oport *oout = mudout, *oerr = muderr;
-  GCPRO(oout, oerr, oport);
-  mudout = oport;
-  if (ctmode != 2)
-    muderr = oport;
-  value result = mcatch_call(NULL, code);
-  UNGCPRO();
-  mudout = oout;
-  muderr = oerr;
-
-  fclose(f);
-  set_oport_methods(oport, NULL);
-
-  if (ctmode == 0)
-    remove_call_trace(oport);
+  session_context->ports.out = oout;
+  session_context->ports.err = oerr;
 
   maybe_mrethrow();
 
@@ -463,7 +485,7 @@ static bool is_single(value v)
       return mpz_cmp_si(bi->mpz, 1) == 0;
     }
 #endif
-  bad_typeset_error(v, expected);
+  bad_typeset_error(v, expected, -1);
 }
 
 #define MAX_FORMAT_LEN     65536
@@ -498,11 +520,14 @@ static const char *get_int(const char *s, long *dst, const char *err)
 }
 
 static void pformat(struct oport *p, struct string *str,
-		    struct vector *args, int i, int nargs)
+		    struct vector *args, const struct oport_info *info)
 {
   ulong slen, spos;
 
   GCPRO(args, str, p);
+
+  size_t nargs = vector_len(args);
+  size_t i = 0;
 
   slen = string_len(str);
   spos = 0;
@@ -547,9 +572,6 @@ static void pformat(struct oport *p, struct string *str,
               }
             break;
           }
-
-        if (s >= strend)
-          bad_format_value("invalid trailing format conversion");
 
         if (*s == '*')
           {
@@ -600,7 +622,7 @@ static void pformat(struct oport *p, struct string *str,
         conv = *s;
       }
 
-      enum prt_level print_level;
+      enum fmt_flag print_level;
 
       unsigned base, predigits = 0;
       const char *prefix = "";
@@ -687,6 +709,7 @@ static void pformat(struct oport *p, struct string *str,
             prefix = "0b";
           goto do_int;
         case 'd':
+        case 'u':
           base = 10;
           goto do_int;
         case 'o':
@@ -697,10 +720,11 @@ static void pformat(struct oport *p, struct string *str,
               predigits = 1;
             }
           goto do_int;
+        case 'X':
         case 'x':
           base = 16;
           if (hash)
-            prefix = "0x";
+            prefix = conv == 'X' ? "0X" : "0x";
           goto do_int;
 
           {
@@ -719,25 +743,26 @@ static void pformat(struct oport *p, struct string *str,
             if (integerp(v))
               {
                 long l = intval(v);
-                if (base != 10)
+                if (conv != 'd')
                   {
                     space = plus = false;
                     l &= MAX_TAGGED_UINT;
                   }
 
-                istr = longtostr(&ibuf, base, l);
+                istr = longtostr(&ibuf, conv == 'X' ? -base : base, l);
               }
 #ifdef USE_GMP
             else if (TYPE(v, bigint))
               {
                 struct bigint *bi = v;
                 check_bigint(bi);
-                size_t size = mpz_sizeinbase(bi->mpz, base) + 2;
-                if (size > MAX_FORMAT_LEN)
+                size_t len = mpz_sizeinbase(bi->mpz, base) + 1;
+                if (len > MAX_FORMAT_LEN)
                   bad_format_value("bigint out of range to format");
-                sb_setminsize(sb, size);
-                sb_setlen(sb, size - 1);
-                mpz_get_str(sb_mutable_str(sb), base, bi->mpz);
+                size_t strofs = sb_add_noinit(sb, len);
+                mpz_get_str(sb_mutable_str(sb) + strofs,
+                            conv == 'X' ? -base : base,
+                            bi->mpz);
                 istr = sb_str(sb);
               }
 #endif
@@ -773,7 +798,7 @@ static void pformat(struct oport *p, struct string *str,
             if (zero)
               zeros = tlen < width ? width - tlen : 0;
             else
-              zeros = ilen < prec ? prec - ilen : 0;
+              zeros = (prec > 0 && ilen < (size_t)prec) ? prec - ilen : 0;
 
             if (zeros > MAX_FORMAT_LEN || width > MAX_FORMAT_LEN)
               bad_format_value("integer too large to print");
@@ -798,16 +823,28 @@ static void pformat(struct oport *p, struct string *str,
           }
         case 's':
         case 'S':
-          print_level = prt_display;
+          print_level = fmt_display;
           goto do_string;
         case 'w':
         case 'W':
           {
-            print_level = hash ? prt_examine : prt_write;
+            print_level = hash ? fmt_examine : fmt_write;
           do_string:
             if (i >= nargs)
               missing_format_param();
-            bool simple = width == 0 && !isupper(conv);
+
+            if (plus && prec < 0)
+              bad_format_value("precision needed with '+'");
+
+            unsigned flags = print_level;
+            if (!plus)
+              flags |= fmt_flag_truncate;
+            if (!zero)
+              flags |= fmt_flag_quote;
+            if (info->use_ascii)
+              flags |= fmt_flag_ascii;
+
+            bool simple = width == 0 && !isupper((unsigned char)conv);
             struct oport *dest = p;
             if (!simple)
               {
@@ -817,10 +854,9 @@ static void pformat(struct oport *p, struct string *str,
             if (prec > MAX_FORMAT_LEN)
               bad_format_value("precision out of range");
             output_value_cut(dest,
-                             print_level,
-                             zero,
                              args->data[i++],
-                             prec >= 0 ? prec : SIZE_MAX);
+                             prec >= 0 ? (size_t)prec : MAX_STRING_SIZE,
+                             flags);
             if (simple)
               break;
           do_output:
@@ -829,19 +865,19 @@ static void pformat(struct oport *p, struct string *str,
             if (width > MAX_FORMAT_LEN)
               bad_format_value("field width out of range");
             if (prec >= 0)
-              assert(sb_len(sb) <= prec);
+              assert(sb_len(sb) <= (size_t)prec);
             size_t spaces = sb_len(sb) < width ? width - sb_len(sb) : 0;
             if (spaces && !minus)
               pputnc(' ', spaces, p);
             if (sb_len(sb) == 0)
               ;
-            else if (isupper(conv))
+            else if (isupper((unsigned char)conv))
               {
                 pputc(TO_8UPPER(sb_str(sb)[0]), p);
-                opwrite(p, sb_str(sb) + 1, sb_len(sb) - 1);
+                port_write(p, sb_str(sb) + 1, sb_len(sb) - 1);
               }
             else
-              opwrite(p, sb_str(sb), sb_len(sb));
+              port_write(p, sb_str(sb), sb_len(sb));
             sb_free(sb);
             if (spaces && minus)
               pputnc(' ', spaces, p);
@@ -867,12 +903,12 @@ static void pformat(struct oport *p, struct string *str,
           if (plus)
             sb_addc(sb, '+');
           if (width > 0)
-            sb_printf(sb, "%lu", width);
+            sb_addint(sb, width);
           if (prec >= 0)
             {
               sb_addc(sb, '.');
               if (prec > 0)
-                sb_printf(sb, "%ld", prec);
+                sb_addint(sb, prec);
             }
           sb_addc(sb, conv);
 
@@ -884,7 +920,7 @@ static void pformat(struct oport *p, struct string *str,
           char *fmt = sb_detach(sb);
           sb_printf(sb, fmt, d);
           free(fmt);
-          opwrite(p, sb_str(sb), sb_len(sb));
+          port_write(p, sb_str(sb), sb_len(sb));
           break;
         }
     }
@@ -895,95 +931,172 @@ static void pformat(struct oport *p, struct string *str,
 
   UNGCPRO();
   sb_free(&format_data.sb);
-  return;
 }
 
 
-static struct string *sformat(struct string *fmt, struct vector *argv, int idx)
+static struct string *sformat(struct string *fmt, struct vector *argv)
 {
-  TYPEIS(fmt, string);
-  TYPEIS(argv, vector);
-
-  int nargs = vector_len(argv);
-  if (nargs < idx)
-    runtime_error(error_wrong_parameters);
-
   struct oport *p;
   {
     GCPRO(fmt, argv);
-    p = make_string_oport();
+    p = make_string_port();
     UNGCPRO();
   }
 
   struct string *str;
   {
     GCPRO(p);
-    pformat(p, fmt, argv, idx, nargs);
+    pformat(p, fmt, argv, &OPORT_INFO_NULL);
     str = port_string(p, SIZE_MAX);
     UNGCPRO();
   }
-  opclose(p);
+  port_close(p);
   return make_readonly(str);
 }
 
 VAROP(dformat, ,
-      "`s `x1 `x2 ... -> . Displays formatted string `s to the standard"
-      " oport with parameters `x1, ... See `format() for syntax. Equivalent"
+      "`s `x1 `x2 ... -> . Displays formatted string `s to `stdout()"
+      " with parameters `x1, ... See `format() for syntax. Equivalent"
       " to `display(`format(`s, `x1, ...)).",
+      (struct string *fmt, struct vector *args),
       OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "sx*.")
 {
-  if (nargs < 1) runtime_error(error_wrong_parameters);
-  TYPEIS(args->data[0], string);
-  pformat(mudout, args->data[0], args, 1, nargs);
-  pflush(mudout);
+  CHECK_TYPES(fmt,  string,
+              args, CT_ARGV(0, -1));
+  struct oport_info info = {
+    .use_ascii = mudout_wants_ascii()
+  };
+  pformat(mudout(), fmt, args, &info);
+  pflush(mudout());
   undefined();
 }
 
-TYPEDOP(dvformat, , "`s `v -> . Displays formatted string `s to the standard"
-        " oport with parameters in `v."
+TYPEDOP(dvformat, , "`s `v -> . Displays formatted string `s to `stdout()"
+        " with parameters in `v."
         " See `format() for syntax. Equivalent to `display(`vformat(`s, `v)).",
         (struct string *fmt, struct vector *argv),
         OP_LEAF | OP_NOESCAPE | OP_STR_READONLY | OP_TRACE, "sv.")
 {
-  TYPEIS(fmt, string);
-  TYPEIS(argv, vector);
-  pformat(mudout, fmt, argv, 0, vector_len(argv));
-  pflush(mudout);
+  CHECK_TYPES(fmt,  string,
+              argv, vector);
+  struct oport_info info = {
+    .use_ascii = mudout_wants_ascii()
+  };
+  pformat(mudout(), fmt, argv, &info);
+  pflush(mudout());
   undefined();
+}
+
+#define FMT_FLAG_EXTRA ""
+
+TYPEDOP(pformat_object, ,
+        "`oport `x `n0 `n1 -> . Print a string representation of `x to `oport,"
+        " " OPORT_TYPES ", using at most `n0 characters, with settings in"
+        " `n1.\n\n"
+        "`n1 must be one of `fmt_xxx:\n"
+        "  `fmt_constant  \tprint a constant that can be read using"
+        " `read_constant(); throws an error if unable to\n"
+        "  `fmt_display   \tuse `display() style output\n"
+        "  `fmt_write     \tuse `write() style output\n"
+        "  `fmt_examine   \tuse `examine() style output\n\n"
+        "optionally bitwise OR with a max pretty-print nesting level"
+        " in [0..`fmt_nest_max] shifted left `fmt_nest_shift.\n\n"
+        "optionally bitwise OR with one of `fmt_base_xxx:\n"
+        "  `fmt_base_bin  \tuse binary output for integers\n"
+        "  `fmt_base_oct  \tuse octal output for integers\n"
+        "  `fmt_base_dec  \tuse decimal output for integers (default)\n"
+        "  `fmt_base_hex  \tuse hexadecimal output for integers\n\n"
+        "optionally bitwise OR with `fmt_flag_xxx:\n"
+        "  `fmt_flag_ascii         \tonly use ASCII characters in output\n"
+        "  `fmt_flag_quote         \tprefix compound objects with a single"
+        " quote (')\n"
+        "  `fmt_flag_nref          \tindicate recursions using \"#N\"\n"
+        "  `fmt_flag_truncate      \ttruncate output to `n0 characters;"
+        " default is to fit output to `n0 characters; not used with"
+        " `fmt_constant\n"
+        "  `fmt_flag_replace_gone  \treplace values of types that cannot be"
+        " printed with null; only used with `fmt_constant\n"
+        "  `fmt_flag_storable      \tadd markup to make the object roundtrip"
+        " storable as text like `save_data(); only used with `fmt_constant"
+        FMT_FLAG_EXTRA,
+        (struct oport *oport, value x, value mmaxlen, value mflags),
+        OP_LEAF | OP_NOESCAPE, "oxnn.")
+{
+  long flags, maxlen;
+  struct oport_info info;
+  GCPRO(x);                     /* CT_OPORT() may cause GC */
+  CHECK_TYPES(oport,   CT_OPORT(&info),
+              x,       any,
+              mmaxlen, CT_RANGE(maxlen, 0, MAX_STRING_SIZE),
+              mflags,  CT_INT(flags));
+  UNGCPRO();
+
+  enum fmt_flag level = flags & fmt_level_mask;
+  unsigned base = flags & fmt_base_mask;
+  switch (base)
+    {
+    case fmt_base_bin:
+    case fmt_base_oct:
+    case fmt_base_dec:
+    case fmt_base_hex:
+      break;
+    default:
+      goto bad_flags;
+    }
+
+  if ((flags & ~(fmt_mudlle_flags | fmt_level_mask | fmt_base_mask
+                 | fmt_nest_mask)) != 0
+      || (level != fmt_display && level != fmt_write && level != fmt_examine
+          && level != fmt_constant)
+      || (level != fmt_constant && (flags & fmt_flag_storable)))
+    goto bad_flags;
+
+  if (info.use_ascii)
+    flags |= fmt_flag_ascii;
+
+  if (!output_value_cut(oport, x, maxlen, flags) && level == fmt_constant)
+    runtime_error(error_bad_value);
+
+  undefined();
+
+ bad_flags:
+  RUNTIME_ERROR(error_bad_value, "invalid flags");
 }
 
 VAROP(pformat, ,
       "`oport `s `x1 `x2 ... -> . Outputs formatted string `s to `oport,"
-      " with parameters `x1, ... See `format() for syntax. Does nothing if"
-      " `oport is not an output port.",
-      OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "xsx*.")
+      " with parameters `x1, ... See `format() for syntax.\n"
+      DOC_OPT_OPORT,
+      (struct oport *p, struct string *fmt, struct vector *args),
+      OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "[ouz]sx*.")
 {
-  if (nargs < 2) runtime_error(error_wrong_parameters);
-
-  TYPEIS(args->data[1], string);
-
-  GCPRO(args);
-  struct oport *p = get_oport(args->data[0]);
+  struct oport_info info;
+  GCPRO(fmt, args);                     /* CT_OPT_OPORT may cause GC */
+  CHECK_TYPES(p,    CT_OPT_OPORT(&info),
+              fmt,  string,
+              args, CT_ARGV(0, -1));
   UNGCPRO();
+
   if (p != NULL)
-    pformat(p, args->data[1], args, 2, nargs);
+    pformat(p, fmt, args, &info);
 
   undefined();
 }
 
 TYPEDOP(pvformat, , "`oport `s `v -> . Output formatted string `s0 with"
-        " parameters in `v to `oport. See `format() for syntax. Does nothing"
-        " if `oport is not an output port.",
-        (struct oport *p, struct string *fmt, struct vector *argv),
-        OP_LEAF | OP_NOESCAPE | OP_STR_READONLY | OP_TRACE, "xsv.")
+        " parameters in `v to `oport. See `format() for syntax.\n"
+        DOC_OPT_OPORT,
+        (struct oport *oport, struct string *fmt, struct vector *argv),
+        OP_LEAF | OP_NOESCAPE | OP_STR_READONLY | OP_TRACE, "[ouz]sv.")
 {
   GCPRO(fmt, argv);                     /* CT_OPT_OPORT may cause GC */
-  CHECK_TYPES(p,    CT_OPT_OPORT,
-              fmt,  string,
-              argv, vector);
+  struct oport_info info;
+  CHECK_TYPES(oport, CT_OPT_OPORT(&info),
+              fmt,   string,
+              argv,  vector);
   UNGCPRO();
-  if (p != NULL)
-    pformat(p, fmt, argv, 0, vector_len(argv));
+  if (oport != NULL)
+    pformat(oport, fmt, argv, &info);
   undefined();
 }
 
@@ -992,11 +1105,13 @@ TYPEDOP(vformat, , "`s0 `v -> `s1. Formats string `s0 with"
         (struct string *fmt, struct vector *argv),
         OP_LEAF | OP_NOESCAPE | OP_STR_READONLY | OP_TRACE, "sv.s")
 {
-  return sformat(fmt, argv, 0);
+  CHECK_TYPES(fmt,  string,
+              argv, vector);
+  return sformat(fmt, argv);
 }
 
 VAROP(sformat, ,
-      "`s0|`null `s1 `x1 `x2 ... -> `n. Formats into writable string `s0"
+      "`s0|null `s1 `x1 `x2 ... -> `n. Formats into writable string `s0"
       " using format `s1 and arguments `x1 `x2 ... ; throws an error if `s0"
       " and `s1 are the same string, if `s0 is not writable, or if `s0 is"
       " too short for the formatted result.\n"
@@ -1007,57 +1122,50 @@ VAROP(sformat, ,
       "If `s0 is a string, `sformat() will place a null character at"
       " `s0[`n] if and only if `n is less than `slength(`s0).\n"
       "See `format() for syntax.",
+      (struct string *dst, struct string *fmt, struct vector *args),
       OP_LEAF | OP_NOESCAPE, "[su]sx*.n")
 {
-  if (nargs < 2)
-    runtime_error(error_wrong_parameters);
+  CHECK_TYPES(dst,  OR(string, null),
+              fmt,  string,
+              args, CT_ARGV(0, -1));
+  if (dst != NULL && readonlyp(dst))
+    RUNTIME_ERROR(error_value_read_only, NULL);
 
-  TYPEIS(args, vector);
+  if (dst == fmt)
+    RUNTIME_ERROR(error_bad_value,
+                  "the destination cannot be the format string");
 
-  struct string *s = args->data[0];
-  if (s)
-    {
-      TYPEIS(s, string);
-      if (readonlyp(s))
-	runtime_error(error_value_read_only);
-    }
-
-  struct string *fmt = args->data[1];
-  TYPEIS(fmt, string);
-
-  if (s == fmt)
-    runtime_error(error_bad_value);
-
-  // REVISIT: it would be convenient to have a "struct string" oport so
-  // we could format directly into args->data[0] instead of having to
-  // use a strbuf oport.
+  /* REVISIT: it would be convenient to have a "struct string" oport so
+   * we could format directly into args->data[0] instead of having to
+   * use a strbuf oport. */
 
   struct strbuf sb = SBNULL;
-  GCPRO(args, s);
-  struct oport *p = s == NULL ? make_sink_oport() : make_strbuf_oport(&sb);
-  pformat(p, args->data[1], args, 2, nargs);
+  GCPRO(dst, fmt, args);
+  struct oport *p = dst == NULL ? make_sink_oport() : make_strbuf_oport(&sb);
+  pformat(p, fmt, args, &OPORT_INFO_NULL);
   UNGCPRO();
 
-  if (s == NULL)
+  if (dst == NULL)
     {
       struct oport_stat stat;
-      opstat(p, &stat);
+      port_stat(p, &stat);
       return makeint(stat.size);
     }
 
   size_t plen = sb_len(&sb);
-  if (string_len(s) < plen)
+  if (string_len(dst) < plen)
     {
       sb_free(&sb);
       runtime_error(error_bad_value);
     }
 
-  memcpy(s->str, sb_str(&sb), plen + 1);
+  memcpy(dst->str, sb_str(&sb), plen + 1);
   sb_free(&sb);
   return makeint(plen);
 }
 
 #define EXTRA_CONVERSIONS ""
+#define EXTRA_FLAGS ""
 
 VAROP(format, ,
       "`s0 `x1 `x2 ... -> `s1. Formats string `s0 with parameters `x1, ...\n"
@@ -1065,30 +1173,34 @@ VAROP(format, ,
       " followed by zero or more flag characters, an optional field width,"
       " an optional precision, and the conversion specifier.\n"
       "\n"
-      "Flag for for `b, `o, `x, `e, `f, `g, and `a conversions:\n"
+      "Flag for for `b, `o, `x, `X, `e, `f, `g, and `a conversions:\n"
       "  `#   \tPrefix non-zero numbers with \"0b\" (`b conversion),"
-      " \"0\" (`o conversion), or \"0x\" (`x conversion).\n"
+      " \"0\" (`o conversion), \"0x\" (`x conversion),"
+      " or \"0X\" (`X conversion).\n"
       "      \tFor `a, `e, `f, and `g conversions, the result will always"
       " contains a decimal point.\n"
       "      \tFor `g conversions, trailing zeros are not removed from"
       " the result.\n"
-      "Flags for `b, `o, `d, `x, `a, `e, `f, and `g conversions:\n"
+      "Flags for `b, `o, `d, `x, `X, `a, `e, `f, and `g conversions:\n"
       "  `0   \tZero-pad to fill up the field width.\n"
       "  ' ' \t(space) Add a space before non-negative signed numbers.\n"
       "  `+   \tForce a sign ('+' or '-') before signed numbers.\n"
-      "Flags for `c, `C, `s, `S, `w, `W, `b, `o, `d, `x, `a, `e, `f, and `g"
-      " conversions:\n"
+      "Flags for `c, `C, `s, `S, `w, `W, `b, `o, `d, `x, `X, `a, `e, `f,"
+      " and `g conversions:\n"
       "  `-   \tLeft justify the result (default is right justified).\n"
       "Flag for `c and `C conversions:\n"
       "  `#   \tWrite the character as a character constant (\"?x\").\n"
-      "Flag for `s, `S, `w and `W conversions:\n"
+      "Flags for `s, `S, `w, and `W conversions:\n"
       "  `0   \tInhibit any leading apostrophe from compound values and"
       " write null as \"()\".\n"
+      "  `+   \tFormat the output to fit the output to the specified"
+      " precision, rather than truncating it.\n"
       "Flag for `w and `W conversions:\n"
       "  `#   \tUse `examine() style output instead of `write().\n"
+      EXTRA_FLAGS
       "\n"
       "Field width and precision are only used for the `c, `C, `s, `S,"
-      " `w, `W, `b, `o, `d, `x, `a, `e, `f, and `g conversions.\n"
+      " `w, `W, `b, `o, `d, `x, `X, `a, `e, `f, and `g conversions.\n"
       "\n"
       "The field width can be either a non-negative integer or an asterisk"
       " ('*'), meaning to use the next parameter (an integer) as field"
@@ -1101,12 +1213,12 @@ VAROP(format, ,
       " non-negative integer or an asterisk ('*'),"
       " meaning to use the next parameter (an integer) as precision. If"
       " the parameter is negative, this is taken as a precision of zero.\n"
-      "For conversions `b, `o, `d, and `x, the precision is the minimum"
-      " number of digits to print, zero-padding as necessary. A precision"
-      " of zero when printing zero means no output.\n"
+      "For conversions `b, `o, `d, `u, `x, and `X, the precision is the"
+      " minimum number of digits to print, zero-padding as necessary."
+      " A precision of zero when printing zero means no output.\n"
       "For conversions `s, `S, `w, and `W, the precision is the maximum"
       " number of characters to include.\n"
-      "For conversions `a, `e and `f, the precision is the number of digits"
+      "For conversions `a, `e, and `f, the precision is the number of digits"
       " to print after the decimal point.\n"
       "For the `g conversion, the precision is the maximum number of"
       " significant digits.\n"
@@ -1132,14 +1244,13 @@ VAROP(format, ,
       " will be truncated, unless a precision is specified.\n"
       "  `W   \tLike `w but capitalize the first character.\n"
       "\n"
-      "  `b   \tThe next parameter (integer or bigint) converted to binary;"
-      " an integer will be considered unsigned.\n"
-      "  `o   \tThe next parameter (integer or bigint) converted to octal;"
-      " an integer will be considered unsigned.\n"
       "  `d   \tThe next parameter (integer or bigint) converted to"
       " decimal.\n"
-      "  `x   \tThe next parameter (integer or bigint) converted to"
-      " hexadecimal; an integer will be considered unsigned.\n"
+      "  `b, `o, `u, `x\n"
+      "      \tThe next parameter (integer or bigint) converted to"
+      " binary, octal, decimal, or hexadecimal; an integer will be"
+      " considered unsigned.\n"
+      "  `X   \tSame as `x but use uppercase characters.\n"
       "\n"
       "  `e   \tThe next parameter (a float, integer, or bigint) in"
       " \"[-]d.ddde<+->dd\" style.\n"
@@ -1150,206 +1261,213 @@ VAROP(format, ,
       " as `f conversion.\n"
       "  `a   \tThe next parameter (a float, integer, or bigint) in"
       " \"[-]0xh.hhhhp<+->d\" style." EXTRA_CONVERSIONS,
+      (struct string *fmt, struct vector *args),
       OP_LEAF | OP_NOESCAPE | OP_STR_READONLY | OP_CONST,
       "sx*.s")
 {
-  if (nargs < 1) runtime_error(error_wrong_parameters);
-  return sformat(args->data[0], args, 1);
+  CHECK_TYPES(fmt,  string,
+              args, CT_ARGV(0, -1));
+  return sformat(fmt, args);
 }
 
 TYPEDOP(pputnc, , "`oport `n0 `n1 -> . Print `n1 characters `n0 to"
-        " output port `oport."
-        " Does nothing if `oport is not an output port.",
-        (struct oport *p, value mchar, value mcount),
-        OP_LEAF | OP_NOESCAPE, "xnn.")
+        " output port `oport.\n"
+        DOC_OPT_OPORT,
+        (struct oport *oport, value mchar, value mcount),
+        OP_LEAF | OP_NOESCAPE, "[ouz]nn.")
 {
   long count;
   unsigned char c;
-  CHECK_TYPES(p,      CT_OPT_OPORT,
+  CHECK_TYPES(oport,  CT_OPT_OPORT(NULL),
               mchar,  CT_RANGE(c, SCHAR_MIN, UCHAR_MAX),
               mcount, CT_RANGE(count, 0, MAX_STRING_SIZE));
-  pputnc(c, count, p);
+  pputnc(c, count, oport);
   undefined();
 }
 
-TYPEDOP(pputc, , "`oport `n -> . Print character `n to output port `oport."
-        " Does nothing if `oport is not an output port.",
-        (struct oport *p, value mchar), OP_LEAF | OP_NOESCAPE, "xn.")
+TYPEDOP(pputc, , "`oport `n -> . Print character `n to output port `oport.\n"
+        DOC_OPT_OPORT,
+        (struct oport *oport, value mchar), OP_LEAF | OP_NOESCAPE, "[ouz]n.")
 {
   unsigned char c;
-  CHECK_TYPES(p,     CT_OPT_OPORT,
+  CHECK_TYPES(oport, CT_OPT_OPORT(NULL),
               mchar, CT_RANGE(c, SCHAR_MIN, UCHAR_MAX));
-  pputc(c, p);
+  pputc(c, oport);
   undefined();
 }
 
-TYPEDOP(pprint, , "`oport `s -> . Print `s to output port `oport."
-        " Does nothing if `oport is not an output port.",
-        (struct oport *p, struct string *s),
-        OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "xs.")
+TYPEDOP(pprint, , "`oport `s -> . Print `s to output port `oport.\n"
+        DOC_OPT_OPORT,
+        (struct oport *oport, struct string *mstr),
+        OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "[ouz]s.")
 {
-  GCPRO(s);                     /* CT_OPT_OPORT may cause GC */
-  CHECK_TYPES(p, CT_OPT_OPORT,
-              s, string);
+  GCPRO(mstr);                  /* CT_OPT_OPORT may cause GC */
+  CHECK_TYPES(oport, CT_OPT_OPORT(NULL),
+              mstr,  string);
   UNGCPRO();
 
-  if (p == NULL)
+  if (oport == NULL)
     undefined();
-  pswrite(p, s);
+  pswrite(oport, mstr);
   undefined();
 }
+
 
 TYPEDOP(pprint_substring, ,
         "`oport `s `n0 `n1 -> . Print `n1 characters of `s to `oport,"
-        " starting with character `n0."
-        " Does nothing if `oport is not an output port.",
-        (struct oport *p, struct string *s, value mstart, value mlength),
-        OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "xsnn.")
+        " starting with character `n0.\n"
+        DOC_OPT_OPORT,
+        (struct oport *oport, struct string *mstr,
+         value mstart, value mlength),
+        OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "[ouz]snn.")
 {
-  long start = GETINT(mstart), length = GETINT(mlength);
-  GCPRO(s);                     /* CT_OPT_OPORT may cause GC */
-  CHECK_TYPES(p,       CT_OPT_OPORT,
-              s,       string,
-              mstart,  CT_STR_IDX(start, s, true),
+  long start, length;
+  GCPRO(mstr);                     /* CT_OPT_OPORT may cause GC */
+  CHECK_TYPES(oport,   CT_OPT_OPORT(NULL),
+              mstr,    string,
+              mstart,  CT_STR_IDX(start, mstr, true),
               mlength, CT_RANGE(length, 0, LONG_MAX));
-  if (start + length > string_len(s))
+  if ((ulong)(start + length) > string_len(mstr))
     RUNTIME_ERROR(error_bad_index, NULL);
   UNGCPRO();
-  pswrite_substring(p, s, start, length);
+  pswrite_substring(oport, mstr, start, length);
   undefined();
 }
 
-TYPEDOP(make_string_oport, ,
-       "-> `oport. Returns a new string output port.",
+TYPEDOP(make_string_port, ,
+        "-> `oport. Returns a new string output port.",
 	(void),
 	OP_LEAF | OP_NOESCAPE, ".o")
 {
-  return make_string_oport();
+  return make_string_port();
+}
+
+TYPEDOP(portp, "port?", "`x -> `b. True if `x is an output port.", (value v),
+	OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_STR_READONLY, "x.n")
+{
+  return makebool(TYPE(v, oport));
+}
+
+TYPEDOP(string_portp, "string_port?",
+        "`x -> `b. True if `x is a string output port.",
+        (struct oport *x),
+	OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_STR_READONLY, "x.n")
+{
+  return makebool(TYPE(x, oport) && is_string_port(x));
 }
 
 TYPEDOP(port_string, ,
-       "`oport -> `s. Returns the contents of string port `oport.\n"
+        "`oport -> `s. Returns the contents of string port `oport.\n"
         "Throws an error if `oport contains more than `MAX_STRING_SIZE"
         " characters.",
-	(struct oport *p),
+	(struct oport *oport),
 	OP_LEAF | OP_NOESCAPE, "o.s")
 {
-  CHECK_TYPES(p, CT_STR_OPORT);
-  return port_string(p, SIZE_MAX);
+  CHECK_TYPES(oport, CT_STR_OPORT);
+  return port_string(oport, SIZE_MAX);
 }
 
-TYPEDOP(port_string_head, ,
-       "`oport `n -> `s. Returns at most `n leading characters from the"
-        " contents of string port `oport.\n"
+TYPEDOP(port_substring, ,
+        "`oport `n0 `n1 -> `s. Returns a substring of starting at `n0 of"
+        " length `n1 from the string port `oport.\n"
         "Throws an error if attempting to extract more than"
         " `MAX_STRING_SIZE characters",
-        (struct oport *p, value n),
-	OP_LEAF | OP_NOESCAPE, "on.s")
+        (struct oport *oport, value mfrom, value mnchars),
+	OP_LEAF | OP_NOESCAPE, "onn.s")
 {
-  long maxlen;
-  CHECK_TYPES(p, CT_STR_OPORT,
-              n, CT_RANGE(maxlen, 0, LONG_MAX));
-  return port_string(p, maxlen);
+  long start, nchars;
+  CHECK_TYPES(oport,   CT_STR_OPORT,
+              mfrom,   CT_RANGE(start,  0, LONG_MAX),
+              mnchars, CT_RANGE(nchars, 0, LONG_MAX));
+  return port_substring(oport, start, nchars);
 }
 
 TYPEDOP(port_copy, ,
-       "`oport `s `n0 `n1 -> `n2. Copies the first `n1 characters of string"
+        "`oport `s `n0 `n1 -> `n2. Copies the first `n1 characters of string"
         " port `oport into the supplied string `s starting at position `n0.\n"
 	"String `s must be writable and at least `n0 + `n1 bytes long;"
 	" neither `n0 nor `n1 can be negative.\n"
         "Returns `n2 in range [0, `n1] as the number of bytes written.\n"
         "Note: `port_copy() will place a null character at `s[`n0 + `n2]"
-	" if and only if `n0 + `n2 is less than slength(`s).\n",
-	(struct oport *p, struct string *s, value mstart, value mlength),
+	" if and only if `n0 + `n2 is less than slength(`s).",
+	(struct oport *oport, struct string *mstr,
+         value mstart, value mlength),
 	OP_LEAF | OP_NOESCAPE, "osnn.n")
 {
-  long start, length;
-  CHECK_TYPES(p,       CT_STR_OPORT,
-              s,       string,
+  ulong start, length;
+  CHECK_TYPES(oport,   CT_STR_OPORT,
+              mstr,    string,
               mstart,  CT_RANGE(start, 0, LONG_MAX),
               mlength, CT_RANGE(length, 0, LONG_MAX));
 
-  if (readonlyp(s))
+  if (readonlyp(mstr))
     runtime_error(error_value_read_only);
 
-  size_t plen = string_port_length(p);
-  size_t slen = string_len(s);
+  size_t plen = string_port_length(oport);
+  size_t slen = string_len(mstr);
 
   if (slen < start + length)
     runtime_error(error_bad_value);
 
   size_t copied = (plen < length) ? plen : length;
-  GCPRO(s);
-  string_port_copy(s->str + start, p, copied);
+  GCPRO(mstr);
+  string_port_copy(mstr->str + start, oport, copied);
   UNGCPRO();
 
-  assert(s->str[start + copied] == '\0');
+  assert(mstr->str[start + copied] == '\0');
   return makeint(copied);
 }
 
 TYPEDOP(port_append, ,
-       "`oport0 `oport1 -> . Prints the contents of string port `oport1"
+        "`oport0 `oport1 -> . Prints the contents of string port `oport1"
         " to port `oport0.",
 	(struct oport *dst, struct oport *src),
 	OP_LEAF | OP_NOESCAPE, "oo.")
 {
   CHECK_TYPES(dst, oport,
               src, CT_STR_OPORT);
+  if (dst == src)
+    RUNTIME_ERROR(error_bad_value, "cannot copy port to itself");
   port_append(dst, src);
   undefined();
 }
 
-TYPEDOP(string_oport_length, ,
-       "`oport -> `n. Returns the number of characters in the string"
+TYPEDOP(string_port_length, ,
+        "`oport -> `n. Returns the number of characters in the string"
         " port `oport.",
-	(struct oport *p),
+	(struct oport *oport),
 	OP_LEAF | OP_NOESCAPE, "o.n")
 {
-  CHECK_TYPES(p, CT_STR_OPORT);
-  return makeint(string_port_length(p));
+  CHECK_TYPES(oport, CT_STR_OPORT);
+  return makeint(string_port_length(oport));
 }
 
 TYPEDOP(port_empty, "port_empty!",
         "`oport -> . Empties the contents of string port `oport.",
-        (struct oport *p),
+        (struct oport *oport),
         OP_LEAF | OP_NOESCAPE, "o.")
 {
-  CHECK_TYPES(p, CT_STR_OPORT);
-  empty_string_oport(p);
+  CHECK_TYPES(oport, CT_STR_OPORT);
+  empty_string_oport(oport);
   undefined();
 }
 
-TYPEDOP(add_call_trace_oport, "add_call_trace_oport!",
-        "`x `b -> . Also send call traces to `x (an oport"
-        " or a character). If `b is TRUE, only send those not handled"
-        " otherwise.",
-        (value oport, value only_unhandled), OP_LEAF | OP_NOESCAPE, "ox.")
+#define EXTRA_INTERACTIVE ""
+
+TYPEDOP(port_interactivep, "port_interactive?",
+        "`oport -> `b. True if output port `oport is interactive: a file"
+        " open on a terminal" EXTRA_INTERACTIVE ".",
+        (struct oport *oport),
+        OP_LEAF | OP_NOESCAPE | OP_NOALLOC, "o.n")
 {
-  CHECK_TYPES(oport,          CT_TYPES(oport, character),
-              only_unhandled, any);
-
-  GCPRO(oport);
-  remove_call_trace(oport);
-  UNGCPRO();
-
-  add_call_trace(oport, istrue(only_unhandled));
-  undefined();
+  CHECK_TYPES(oport, oport);
+  return makebool(port_is_interactive(oport));
 }
 
-TYPEDOP(remove_call_trace_oport, "remove_call_trace_oport!",
-        "`x -> . Stop sending call traces to `x (an oport or a character)."
-        " Cf. `add_call_trace_oport!().",
-        (value oport), OP_LEAF | OP_NOESCAPE, "o.")
-{
-  CHECK_TYPES(oport, CT_TYPES(oport, character));
-  remove_call_trace(oport);
-  undefined();
-}
-
-#undef stdout                   /* needed on OS X */
+#undef stdout                   /* needed on macOS */
 TYPEDOP(stdout, ,
         "-> `port. Returns the standard `display() output port.",
-        (void), OP_LEAF | OP_NOALLOC | OP_NOESCAPE, ".o")
+        (void), OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_TRIVIAL, ".o")
 {
   return mudout_port;
 }
@@ -1375,18 +1493,20 @@ void io_init(void)
   DEFINE(localtime);
   DEFINE(mktime);
   DEFINE(with_output);
-  DEFINE(with_output_file);
   DEFINE(pputc);
   DEFINE(pputnc);
   DEFINE(pprint);
   DEFINE(pprint_substring);
-  DEFINE(make_string_oport);
+  DEFINE(portp);
+  DEFINE(string_portp);
+  DEFINE(make_string_port);
   DEFINE(port_empty);
   DEFINE(port_string);
-  DEFINE(port_string_head);
+  DEFINE(port_substring);
   DEFINE(port_copy);
   DEFINE(port_append);
-  DEFINE(string_oport_length);
+  DEFINE(port_interactivep);
+  DEFINE(string_port_length);
   DEFINE(pformat);
   DEFINE(pvformat);
   DEFINE(dformat);
@@ -1394,9 +1514,7 @@ void io_init(void)
   DEFINE(format);
   DEFINE(sformat);
   DEFINE(vformat);
-
-  DEFINE(add_call_trace_oport);
-  DEFINE(remove_call_trace_oport);
+  DEFINE(pformat_object);
 
 
   format_data.oport = make_strbuf_oport(&format_data.sb);

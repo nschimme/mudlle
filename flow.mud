@@ -31,7 +31,7 @@ defines
   mc:f_dvars, mc:f_types, mc:f_sizes, mc:all_functions, mc:flow_sizes,
   mc:add_fallthrough_block
 
-reads mc:show_type_info, mc:verbose
+reads mc:verbose
 
 [
   | intersection_predecessors, union_predecessors, union_successors,
@@ -65,7 +65,7 @@ reads mc:show_type_info, mc:verbose
 
   | kset, kstring_set, kvector_set, kref, kvector_ref, kstring_ref,
     referencers,
-    kmake_vector, kmake_string, kvappend, ksappend, kvcopy, kscopy |
+    kmake_vector, kmake_string, kvappend, kvconcat, ksconcat, kvcopy, kscopy |
   kset         = mc:make_kglobal("set!");
   kstring_set  = mc:make_kglobal("string_set!");
   kvector_set  = mc:make_kglobal("vector_set!");
@@ -77,7 +77,8 @@ reads mc:show_type_info, mc:verbose
   kmake_vector = mc:make_kglobal("make_vector");
   kmake_string = mc:make_kglobal("make_string");
   kvappend     = mc:make_kglobal("vappend");
-  ksappend     = mc:make_kglobal("sappend");
+  kvconcat     = mc:make_kglobal("vconcat");
+  ksconcat     = mc:make_kglobal("sconcat");
   kscopy       = mc:make_kglobal("scopy");
   kvcopy       = mc:make_kglobal("vcopy");
 
@@ -96,7 +97,8 @@ reads mc:show_type_info, mc:verbose
 			block = graph_node_get(n);
 			block[mc:f_ambiguous_w] = block[mc:f_ambiguous_rw]
                           = block[mc:f_uses] = block[mc:f_copies]
-                          = block[mc:f_live] = block[mc:f_types] = false;
+                          = block[mc:f_live] = block[mc:f_types]
+                          = block[mc:f_sizes] = false;
 		      ], cdr(ifn[mc:c_fvalue]));
 
   // basic block handling
@@ -133,10 +135,10 @@ reads mc:show_type_info, mc:verbose
 	      if (scan == ilist) exit 0;
 	      ilnext = dget(scan);
 
-	      if (ins[mc:i_class] == mc:i_branch ||
-                  ilnext[mc:il_label] ||
-                  (ins[mc:i_class] == mc:i_trap &&
-                   ins[mc:i_top] == mc:trap_always))
+	      if (ins[mc:i_class] == mc:i_branch
+                  || ilnext[mc:il_label]
+                  || (ins[mc:i_class] == mc:i_trap
+                      && ins[mc:i_top] == mc:trap_always))
                 exit 0
 	    ];
 
@@ -151,10 +153,10 @@ reads mc:show_type_info, mc:verbose
 	  //  - it did not end in an unconditional branch or trap
 	  if (previous_bnode) graph_add_edge(previous_bnode, bnode, true);
 
-	  if ((ins[mc:i_class] == mc:i_branch &&
-               ins[mc:i_bop] == mc:branch_always)
-              || (ins[mc:i_class] == mc:i_trap &&
-                  ins[mc:i_top] == mc:trap_always))
+	  if ((ins[mc:i_class] == mc:i_branch
+               && ins[mc:i_bop] == mc:branch_always)
+              || (ins[mc:i_class] == mc:i_trap
+                  && ins[mc:i_top] == mc:trap_always))
             // no edge to next node
 	    previous_bnode = false
 	  else
@@ -261,10 +263,11 @@ reads mc:show_type_info, mc:verbose
             exit<cont> entry = graph_edge_to(edge);
 
           // find nodes that have no direct predecessors
-          | nodes |
-          nodes = lfilter(fn (node) lforall?(fn (edge) !graph_edge_get(edge),
-                                             graph_edges_in(node)),
-                          allnodes);
+          | dangling_nodes |
+          dangling_nodes = lfilter(
+            fn (node) lforall?(fn (edge) !graph_edge_get(edge),
+                               graph_edges_in(node)),
+            allnodes);
 
           // prefer the destination of previous block
           | lastins, lastil |
@@ -274,10 +277,10 @@ reads mc:show_type_info, mc:verbose
           | n |
           entry = if (lastins[mc:i_class] == mc:i_branch
                       && memq(n = lastins[mc:i_bdest][mc:l_ilist][mc:il_node],
-                              nodes))
+                              dangling_nodes))
             n
           else
-            car(nodes);
+            car(dangling_nodes);
 	]
     ];
 
@@ -297,13 +300,11 @@ intersection_predecessors = fn (n, problem)
     info = graph_node_get(n)[problem];
 
     // in = union{p:predecessors of n} out(p)
-    new_in = info[mc:flow_in];
-    graph_edges_in_apply(fn (predecessor) [
+    new_in = graph_edges_in_reduce(fn (predecessor, new_in) [
       bintersection!(
         new_in,
         graph_node_get(graph_edge_from(predecessor))[problem][mc:flow_out])
-    ], n);
-    info[mc:flow_in] = new_in;
+    ], info[mc:flow_in], n);
 
     // out(i) = gen(i) U (in(i) - kill(i))
     new_out = bunion!(bdifference(new_in, info[mc:flow_kill]),
@@ -330,13 +331,11 @@ union_predecessors = fn (n, problem)
     info = graph_node_get(n)[problem];
 
     // in = union{p:predecessors of n} out(p)
-    new_in = info[mc:flow_in];
-    graph_edges_in_apply(fn (predecessor) [
+    new_in = graph_edges_in_reduce(fn (predecessor, new_in) [
       bunion!(
         new_in,
-        graph_node_get(graph_edge_from(predecessor))[problem][mc:flow_out])
-    ], n);
-    info[mc:flow_in] = new_in;
+        graph_node_get(graph_edge_from(predecessor))[problem][mc:flow_out]);
+    ], info[mc:flow_in], n);
 
     // out(i) = gen(i) U (in(i) - kill(i))
     new_out = bunion!(bdifference(new_in, info[mc:flow_kill]),
@@ -363,13 +362,11 @@ union_successors = fn (n, problem)
     info = graph_node_get(n)[problem];
 
     // out = union{s:successors of n} in(s)
-    new_out = info[mc:flow_out];
-    graph_edges_out_apply(fn (successor) [
+    new_out = graph_edges_out_reduce(fn (successor, new_out) [
       bunion!(
         new_out,
         graph_node_get(graph_edge_to(successor))[problem][mc:flow_in])
-    ], n);
-    info[mc:flow_out] = new_out;
+    ], info[mc:flow_out], n);
 
     // in(i) = gen(i) U (out(i) - kill(i))
     new_in = bunion!(bdifference(new_out, info[mc:flow_kill]),
@@ -385,7 +382,7 @@ union_successors = fn (n, problem)
 // flow minimum known sizes of vectors and strings
 mc:flow_sizes = fn (ifn)
   [
-    | fg, change, new_sizeset |
+    | fg, new_sizeset |
     fg = ifn[mc:c_fvalue];
 
     new_sizeset = fn (ifn) make_string(ifn[mc:c_fnvars]);
@@ -395,11 +392,12 @@ mc:flow_sizes = fn (ifn)
 		      [
 			| block |
 			block = graph_node_get(n);
-                        block[mc:f_sizes] = vector
-                          (null, null,
-                           new_sizeset(ifn),    // in
-                           new_sizeset(ifn),    // out
-                           ifn[mc:c_fallvars]); // map
+                        block[mc:f_sizes] = indexed_vector(
+                          mc:flow_gen  . null,
+                          mc:flow_kill . null,
+                          mc:flow_in   . new_sizeset(ifn),
+                          mc:flow_out  . null,
+                          mc:flow_map  . ifn[mc:c_fallvars]);
 		      ], cdr(fg));
 
     | size_block, merge_in_sizes |
@@ -410,7 +408,8 @@ mc:flow_sizes = fn (ifn)
         pnode = graph_node_get(graph_edge_from(predecessor));
         assert(vector?(pnode));
         pout = pnode[mc:f_sizes][mc:flow_out];
-        assert(string?(pout));
+        if (pout == null)
+          exit<function> new_in;
 
         override_var = 0;
 
@@ -436,7 +435,7 @@ mc:flow_sizes = fn (ifn)
           assert(integer?(val));
 
           // avoid overflow problems
-          if (val < 0 || val >= (1 << 20))
+          if (val < 0 || val >= MAX_STRING_SIZE)
             exit<done> null;
 
           if (bop >= mc:branch_vlength)
@@ -448,13 +447,13 @@ mc:flow_sizes = fn (ifn)
           blabel = mc:skip_label_alias(pins[mc:i_bdest]);
           if (blabel[mc:l_ilist] != first_il)
             [
-              // the fall-through is to our block; invese operator logic
+              // the fall-through is to our block; inverse operator logic
               bop ^= 1;
             ];
 
           if (bop == mc:branch_eq)
             null
-          else if (bop == mc:branch_gt)
+          else if (bop == mc:branch_gt || bop == mc:branch_ne)
             ++val
           else if (bop == mc:branch_ge)
             null
@@ -464,9 +463,14 @@ mc:flow_sizes = fn (ifn)
           if (val > 255)
             val = 255;
 
-          | pnvar |
+          | pnvar, oldval |
           pnvar = car(pins[mc:i_aargs])[mc:v_number];
-          if (val <= pout[pnvar])
+          oldval = pout[pnvar];
+          if (val <= oldval)
+            exit<done> null;
+
+          // '!=' can only increase the assumed size by 1
+          if (bop == mc:branch_ne && val != oldval + 1)
             exit<done> null;
 
           // 'override_var' is known to at least be of size 'override_value'
@@ -502,10 +506,9 @@ mc:flow_sizes = fn (ifn)
         info = block[mc:f_sizes];
         ilist = block[mc:f_ilist];
         first_il = dget(ilist);
-        new_in = null;
-        graph_edges_in_apply(fn (predecessor) [
-          new_in = merge_in_sizes(predecessor, first_il, new_in)
-        ], n);
+        new_in = graph_edges_in_reduce(fn (predecessor, new_in) [
+          merge_in_sizes(predecessor, first_il, new_in)
+        ], null, n);
 
         if (new_in == null)
           new_in = new_sizeset(ifn);
@@ -523,8 +526,10 @@ mc:flow_sizes = fn (ifn)
 
             <noref> [
               | rvar, ivar, sizefield |
-              if (class == mc:i_compute && ins[mc:i_aop] == mc:b_ref)
+              if (class == mc:i_compute)
                 [
+                  if (ins[mc:i_aop] != mc:b_ref)
+                    exit<noref> null;
                   @(rvar ivar) = ins[mc:i_aargs];
                   sizefield = mc:i_asizeinfo;
                 ]
@@ -556,12 +561,12 @@ mc:flow_sizes = fn (ifn)
                 exit<noref> null;
 
               // convoluted to avoid the -minint problem
-              if (ival <= -255 || ival >= 254)
-                ival = 255
+              ival = if (ival <= -255 || ival >= 254)
+                255
               else if (ival < 0)
-                ival = -ival
+                -ival
               else
-                ++ival;
+                ival + 1;
 
               if (ival > new_out[nrvar])
                 new_out[nrvar] = ival;
@@ -569,8 +574,6 @@ mc:flow_sizes = fn (ifn)
 
 	    if (class == mc:i_closure)
 	      mc:set_closure_vars!(ins, mc:closure_write, amb)
-            else if (class == mc:i_vref)
-              set_bit!(amb, ins[mc:i_varg][mc:v_number])
             else if (class == mc:i_call && mc:call_escapes?(ins)
                      || class == mc:i_return)
               [
@@ -628,19 +631,16 @@ mc:flow_sizes = fn (ifn)
                     if (f == kmake_vector || f == kmake_string)
                       match (args) [
                         (arg) => [
-                          | n |
-                          n = mc:var_value(arg);
-                          if (integer?(n))
-                            new = n
+                          | len |
+                          len = mc:var_value(arg);
+                          if (integer?(len))
+                            new = len
                         ]
                       ]
-                    else if (f == kvappend || f == ksappend)
-                      match (args) [
-                        (arg1 arg2) => [
-                          new = (get_size(new_out, arg1)
-                                 + get_size(new_out, arg2));
-                        ]
-                      ]
+                    else if ((f == kvappend && llength(args) == 2)
+                             || f == kvconcat || f == ksconcat)
+                      new = lreduce(fn (arg, s) s + get_size(new_out, arg),
+                                    0, args)
                     else if (f == kvcopy || f == kscopy)
                       match (args) [
                         (arg) => [
@@ -656,19 +656,24 @@ mc:flow_sizes = fn (ifn)
               exit<break> null;
           ];
 
-        if (string_cmp(new_out, info[mc:flow_out]) != 0)
+        | old_out |
+        old_out = info[mc:flow_out];
+        if (old_out != null && string_equal?(new_out, old_out))
+          false
+        else
           [
             info[mc:flow_out] = new_out;
-            change = true;
-          ];
+            true
+          ]
       ];
 
-    change = true;
-    while (change)
-      [
-	change = false;
-	graph_nodes_apply(size_block, cdr(fg));
-      ];
+    // do a first pass in call order
+    lforeach(size_block, order_nodes(car(fg), cdr(fg)));
+
+    // iterate until fixed point reached
+    while (graph_nodes_reduce(fn (n, change) size_block(n) || change,
+                              false, cdr(fg)))
+      null;
   ];
 
 | type_rwmask |
@@ -691,7 +696,7 @@ mc:flow_ambiguous = fn (ifn, type)
   //     mc:closure_write: variables written in some closure
   //     mc:closure_read|mc:closure_write: all variables that escape
   [
-    | fg, merge_block, change, block_ambiguous, rwmask |
+    | fg, block_ambiguous, rwmask |
 
     rwmask = type_rwmask(type);
     fg = ifn[mc:c_fvalue];
@@ -712,7 +717,6 @@ mc:flow_ambiguous = fn (ifn, type)
             match (ins[mc:i_class])
               [
                 ,mc:i_closure => mc:set_closure_vars!(ins, rwmask, amb);
-                ,mc:i_vref => set_bit!(amb, ins[mc:i_varg][mc:v_number]);
               ];
 
 	    scan = dnext(scan);
@@ -725,27 +729,22 @@ mc:flow_ambiguous = fn (ifn, type)
 		      [
 			| block |
 			block = graph_node_get(n);
-			block[type] = vector
-			  (block_ambiguous(block[mc:f_ilist]),
-			   mc:new_varset(ifn), // nothing is ever killed
-			   mc:new_varset(ifn),
-			   mc:new_varset(ifn),
-			   ifn[mc:c_fallvars]);
+			block[type] = indexed_vector(
+                          mc:flow_gen  . block_ambiguous(block[mc:f_ilist]),
+                          mc:flow_kill . mc:new_varset(ifn),
+                          mc:flow_in   . mc:new_varset(ifn),
+                          mc:flow_out  . mc:new_varset(ifn),
+                          mc:flow_map  . ifn[mc:c_fallvars]);
 		      ], cdr(fg));
 
     // equations:
     //   in(i) = union{p:predecessors of i} out(p)
     //   out(i) = in(i) U gen(i)
 
-    merge_block = fn (n)
-      if (union_predecessors(n, type)) change = true;
-
-    loop
-      [
-	change = false;
-	graph_nodes_apply(merge_block, cdr(fg));
-	if (!change) exit 0
-      ];
+    while (graph_nodes_reduce(fn (node, change) [
+      union_predecessors(node, type) || change
+    ], false, cdr(fg)))
+      null;
   ];
 
 mc:scan_ambiguous = fn (f, x, block, globals, type)
@@ -781,7 +780,6 @@ mc:scan_ambiguous = fn (f, x, block, globals, type)
         match (ins[mc:i_class])
           [
             ,mc:i_closure => mc:set_closure_vars!(ins, rwmask, ambiguous);
-            ,mc:i_vref => set_bit!(ambiguous, ins[mc:i_varg][mc:v_number]);
           ];
 
 	scan = dnext(scan);
@@ -835,9 +833,6 @@ mc:build_ambiguous_list = fn (block, globals, type)
                     ];
                 ];
             ];
-            ,mc:i_vref => [
-              set_bit!(ambiguous, ins[mc:i_varg][mc:v_number])
-            ]
           ]
       ]
   ];
@@ -849,20 +844,20 @@ mc:flow_uses = fn (ifn)
   //   within ifn are ignored (otherwise the use set explodes).
   //   As the uses are for du-chains, this is no loss.
   [
-    | fg, merge_block, change, block_uses, all_uses, vmap, uindex,
+    | fg, block_uses, all_uses, vmap, uindex,
       new_use, new_use_set, use_set, uses, uset, rcount, globals, i, vars |
 
     fg = ifn[mc:c_fvalue];
     vmap = ifn[mc:c_fallvars];
     uindex = -1;
-    vars = lappend(ifn[mc:c_fclosure],
-                   lappend(ifn[mc:c_fglobals], ifn[mc:c_flocals]));
+    vars = lappend(ifn[mc:c_fclosure], ifn[mc:c_fglobals]);
+    vars = lappend(vars, ifn[mc:c_flocals]);
     // not interested in uses of variables which are not written in ifn
     globals = mc:set_vars!(mc:new_varset(ifn), ifn[mc:c_fglobals_write]);
     mc:set_vars!(globals, ifn[mc:c_fclosure_write]);
 
     new_use = fn (nv, il)
-      (uindex = uindex + 1) . vmap[nv] . il;
+      ++uindex . vmap[nv] . il;
 
     new_use_set = fn () new_bitset(uindex);
     use_set = fn (uses)
@@ -946,28 +941,23 @@ mc:flow_uses = fn (ifn)
 	 bforeach(fn (ndvar) bunion!(killed, vmap[ndvar][mc:v_uses]),
 		  block[mc:f_dvars]);
 
-	 block[mc:f_uses] = vector(use_set(block[mc:f_uses]),
-				   killed,
-				   bcopy(uset),
-				   bcopy(uset),
-				   all_uses);
+	 block[mc:f_uses] = indexed_vector(
+           mc:flow_gen  . use_set(block[mc:f_uses]),
+           mc:flow_kill . killed,
+           mc:flow_in   . bcopy(uset),
+           mc:flow_out  . bcopy(uset),
+           mc:flow_map  . all_uses);
        ], cdr(fg));
 
     // equations:
     //   out(i) = union{s:successors of i} in(s)
     //   in(i) = gen(i) U (out(i) - kill(i))
 
-    merge_block = fn (n)
-      if (union_successors(n, mc:f_uses)) change = true;
-
-    rcount = 0;
-    change = true;
-    while (change)
-      [
-	change = false;
-	graph_nodes_apply(merge_block, cdr(fg));
-	rcount = rcount + 1;
-      ];
+    rcount = 1;
+    while (graph_nodes_reduce(fn (node, change) [
+      union_successors(node, mc:f_uses) || change
+    ], false, cdr(fg)))
+      ++rcount;
     if (mc:verbose >= 3)
       [
 	dformat("use resolution iterations: %s\n", rcount);
@@ -980,7 +970,7 @@ mc:flow_copies = fn (ifn)
   // Requires: ambiguous data-flow information
   // Effects: Computes reaching copy information (for copy propagation)
   [
-    | fg, merge_block, change, block_copies, all_copies, entry, eblock, copy1,
+    | fg, block_copies, all_copies, entry, eblock, copy1,
       globals, cindex, vmap, new_copy_set, copy_set, i, copies, copyset |
 
     fg = ifn[mc:c_fvalue];
@@ -1040,8 +1030,8 @@ mc:flow_copies = fn (ifn)
                [
                  | ins |
                  ins = il[mc:il_ins];
-                 bit_clear?(ambiguous, ins[mc:i_adest][mc:v_number]) &&
-                   bit_clear?(ambiguous, car(ins[mc:i_aargs])[mc:v_number])
+                 bit_clear?(ambiguous, ins[mc:i_adest][mc:v_number])
+                   && bit_clear?(ambiguous, car(ins[mc:i_aargs])[mc:v_number])
                ], copies);
           ];
 
@@ -1111,6 +1101,9 @@ mc:flow_copies = fn (ifn)
          if (ambiguous)
            kvars = bunion(kvars, ambiguous);
 
+         // start value for flow_in: all_copies
+	 firstin = bcopy(copyset);
+
 	 // killed = all copies whose vars are assigned or ambiguous
 	 // in the block
 	 i = 0;
@@ -1121,25 +1114,26 @@ mc:flow_copies = fn (ifn)
 
 	     il = all_copies[i];
 	     copy = il[mc:il_ins];
-	     if (bit_set?(kvars, copy[mc:i_adest][mc:v_number]) ||
-		 bit_set?(kvars, car(copy[mc:i_aargs])[mc:v_number]))
+	     if (bit_set?(kvars, copy[mc:i_adest][mc:v_number])
+		 || bit_set?(kvars, car(copy[mc:i_aargs])[mc:v_number]))
 	       set_bit!(killed, i);
+
+             set_bit!(firstin, i);
 
 	     ++i;
 	   ];
 	 // except those generated here
 	 bdifference!(killed, copies);
 
-         // start value for flow_in: all_copies
-	 firstin = string_fill!(bcopy(copyset), 255);
 	 // start value for flow_out: all_copies - kill
 	 firstout = bdifference(firstin, killed);
 
-	 block[mc:f_copies] = vector(copies,
-				     killed,
-				     firstin,
-				     firstout,
-				     all_copies);
+	 block[mc:f_copies] = indexed_vector(
+           mc:flow_gen  . copies,
+           mc:flow_kill . killed,
+           mc:flow_in   . firstin,
+           mc:flow_out  . firstout,
+           mc:flow_map  . all_copies);
        ], cdr(fg));
 
     // equations:
@@ -1152,16 +1146,10 @@ mc:flow_copies = fn (ifn)
     eblock[mc:flow_in] = copyset;
     eblock[mc:flow_out] = eblock[mc:flow_gen];
 
-    merge_block = fn (n)
-      if (n != entry && intersection_predecessors(n, mc:f_copies))
-        change = true;
-
-    change = true;
-    while (change)
-      [
-	change = false;
-	graph_nodes_apply(merge_block, cdr(fg));
-      ];
+    while (graph_nodes_reduce(fn (node, change) [
+      (node != entry && intersection_predecessors(node, mc:f_copies)) || change
+    ], false, cdr(fg)))
+      null;
 
     all_copies
   ];
@@ -1170,7 +1158,7 @@ mc:flow_live = fn (ifn)
   // Types: ifn: intermediate function
   // Effects: Computes liveness information (for register allocation)
   [
-    | fg, merge_block, change, block_live, globals |
+    | fg, block_live, globals |
 
     fg = ifn[mc:c_fvalue];
     globals = mc:set_vars!(mc:new_varset(ifn), ifn[mc:c_fglobals]);
@@ -1203,27 +1191,22 @@ mc:flow_live = fn (ifn)
 	 | block |
 
 	 block = graph_node_get(n);
-	 block[mc:f_live] = vector
-	   (bdifference!(block_live(block), globals),
-	    block[mc:f_dvars],
-	    mc:new_varset(ifn),
-	    mc:new_varset(ifn),
-	    ifn[mc:c_fallvars]);
+	 block[mc:f_live] = indexed_vector(
+           mc:flow_gen  . bdifference!(block_live(block), globals),
+           mc:flow_kill . block[mc:f_dvars],
+           mc:flow_in   . mc:new_varset(ifn),
+           mc:flow_out  . mc:new_varset(ifn),
+           mc:flow_map  . ifn[mc:c_fallvars]);
        ], cdr(fg));
 
     // equations:
     //   out(i) = union{s:successors of i} in(s)
     //   in(i) = gen(i) U (out(i) - kill(i))
 
-    merge_block = fn (n)
-      if (union_successors(n, mc:f_live)) change = true;
-
-    change = true;
-    while (change)
-      [
-	change = false;
-	graph_nodes_apply(merge_block, cdr(fg));
-      ];
+    while (graph_nodes_reduce(fn (node, change) [
+      union_successors(node, mc:f_live) || change
+    ], false, cdr(fg)))
+      null;
   ];
 
 mc:rscan_live = fn (f, x, block)
@@ -1395,7 +1378,7 @@ mc:rscan_live = fn (f, x, block)
 
   mc:all_functions = fn (ifn)
     // Types: ifn : intermediate function
-    // Effects: Returns all the functions in ifn
+    // Effects: Returns all the functions in ifn in deepest-first order
     [
       | todo, fns, check_ins |
 
@@ -1411,7 +1394,12 @@ mc:rscan_live = fn (f, x, block)
               | called |
               called = car(i[mc:i_cargs]);
               if (called[mc:v_class] == mc:v_function)
-                todo = called[mc:v_fvalue] . todo
+                [
+                  | ifn |
+                  ifn = called[mc:v_fvalue];
+                  if (!lfind?(ifn, todo) && !lfind?(ifn, fns))
+                    todo = ifn . todo
+                ]
             ]
         ];
 
@@ -1420,8 +1408,7 @@ mc:rscan_live = fn (f, x, block)
       while (todo != null)
 	[
 	  | first |
-	  first = car(todo);
-	  todo = cdr(todo);
+	  @(first . todo) = todo;
 
 	  fns = first . fns;
 

@@ -1,7 +1,7 @@
-eval("f1 = fn v v");
-eval("f2 = fn (x1, x2) x1");
-eval("f3 = fn (x1, x2) fn (y) x1 = y");
-eval("f4 = fn () [ | x1 | fn (y) x1 = y ]");
+reval("f1 = fn (v...) v");
+reval("f2 = fn (x1, x2) x1");
+reval("f3 = fn (x1, x2) fn (y) x1 = y");
+reval("f4 = fn () [ | x1 | fn (y) x1 = y ]");
 regress("prolog1", f1(1, 2, 3), '[ 1 2 3]);
 regress("prolog2", f2(1, 2), 1);
 regressfail("prolog2a", fn () f2(1));

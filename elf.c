@@ -40,13 +40,7 @@ void elf_init(struct elf_file *elf)
       },
       .e_type    = ET_REL,
       .e_version = EV_CURRENT,
-#ifdef __x86_64__
-      .e_machine = EM_X86_64,
-#elif defined __i386__
-      .e_machine = EM_386,
-#else
-#error Unsupported architecture
-#endif
+      .e_machine = EM_MACHINE,
     }
   };
   elf_alloc_sect(elf, 0, 0, 0, 0);
@@ -90,7 +84,9 @@ void *elf_alloc(struct elf_file *elf, size_t *size)
         memcpy(result + data->hdr.sh_offset,
                data->data,
                data->hdr.sh_size);
-      ((struct elf_sect_hdr *)(result + elf->file_hdr.e_shoff))[n] = data->hdr;
+      memcpy(result + elf->file_hdr.e_shoff + sizeof (struct elf_sect_hdr) * n,
+             &data->hdr,
+             sizeof (struct elf_sect_hdr));
     }
   return result;
 }

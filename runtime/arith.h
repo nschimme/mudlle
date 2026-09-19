@@ -26,18 +26,19 @@
 
 extern const struct prim_op *const negate_prim_ext;
 
-value code_iadd(value a1, value a2);
-value code_plus(value a1, value a2);
+value code_iadd(value v1, value v2);
+value code_plus(value v1, value v2);
 value string_plus(struct string *s1, struct string *s2);
 
-value code_subtract(value a, value b);
-value code_bitand(value a, value b);
-value code_bitor(value a, value b);
+value code_subtract(value v1, value v2);
+value code_bitand(value v1, value v2);
+value code_bitor(value v1, value v2);
+value code_bitnot(value n);
 
-value code_smaller(value a, value b);
-value code_smaller_equal(value a, value b);
-value code_greater(value a, value b);
-value code_greater_equal(value a, value b);
+value code_smaller(value v1, value v2);
+value code_smaller_equal(value v1, value v2);
+value code_greater(value v1, value v2);
+value code_greater_equal(value v1, value v2);
 
 void arith_init(void);
 

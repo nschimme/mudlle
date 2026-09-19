@@ -22,6 +22,8 @@
 #ifndef BUILTINS_H
 #define BUILTINS_H
 
+#include <stdint.h>
+
 #include "mudlle-macro.h"
 
 /* machine code primitives */
@@ -30,77 +32,73 @@ void interpreter_invoke(void);
 /* Enter the interpreter from a machine code function */
 
 /* Compiler support builtins (machine specific) */
-#if defined __i386__ || defined __x86_64__
-
-#ifdef __x86_64__
- #define __IS_X86_64 1
-#else
- #define __IS_X86_64 0
-#endif
-
-#define X86_BUILTINS_FOREACH(v)                 \
-  v(badd)                                       \
-  v(balloc_closure)                             \
-  v(balloc_variable)                            \
-  v(balloc_vector)                              \
-  v(bapply_varargs)                             \
-  v(bbitref)                                    \
-  v(bcall)                                      \
-  IF(__IS_X86_64)(v(bcall_prim),)               \
-  IF(__IS_X86_64)(v(bcall_prim_noalloc),)       \
-  v(bcall_secure)                               \
-  v(bcall_varargs)                              \
-  v(bcleargc)                                   \
-  v(bcleargc0)                                  \
-  v(bcleargc1)                                  \
-  v(bcleargc2)                                  \
-  v(bcleargc3)                                  \
-  v(bcleargc4)                                  \
-  v(bconcat)                                    \
-  v(bcons)                                      \
-  v(bdivide)                                    \
-  v(bearly_error_wrong_parameters)              \
-  v(berror_abort)                               \
-  v(berror_bad_function)                        \
-  v(berror_bad_index)                           \
-  v(berror_bad_type)                            \
-  v(berror_bad_value)                           \
-  v(berror_compile)                             \
-  v(berror_divide_by_zero)                      \
-  v(berror_loop)                                \
-  v(berror_no_match)                            \
-  v(berror_recurse)                             \
-  v(berror_security_violation)                  \
-  v(berror_stack_underflow)                     \
-  v(berror_user_interrupt)                      \
-  v(berror_value_read_only)                     \
-  v(berror_variable_read_only)                  \
-  v(berror_wrong_parameters)                    \
-  v(bmultiply)                                  \
-  v(bpcons)                                     \
-  v(bref)                                       \
-  v(bremainder)                                 \
-  IF(__IS_X86_64)(,v(brestore_caller))          \
-  v(brglobal)                                   \
-  IF(__IS_X86_64)(,v(bsave_caller))             \
-  IF(__IS_X86_64)(,v(bsave_caller_noalloc))     \
-  v(bset)                                       \
-  v(bshift_left)                                \
-  v(bshift_right)                               \
-  v(bsymbol_ref)                                \
-  v(btype_error)                                \
-  v(btypeof)                                    \
-  v(bvarargs)                                   \
+#define BUILTINS_FOREACH(v, sep)                \
+  v(badd)                          sep()        \
+  v(balloc_closure)                sep()        \
+  v(balloc_variable)               sep()        \
+  v(balloc_vector)                 sep()        \
+  v(bapply_varargs)                sep()        \
+  v(bbitref)                       sep()        \
+  v(bcall)                         sep()        \
+  v(bcall_prim)                    sep()        \
+  v(bcall_prim_noalloc)            sep()        \
+  v(bcall_secure)                  sep()        \
+  v(bcall_varargs)                 sep()        \
+  v(bcheck_xcount)                 sep()        \
+  v(bcleargc)                      sep()        \
+  v(bcleargc0)                     sep()        \
+  v(bcleargc1)                     sep()        \
+  v(bcleargc2)                     sep()        \
+  v(bcleargc3)                     sep()        \
+  v(bcleargc4)                     sep()        \
+  v(bconcat)                       sep()        \
+  v(bcons)                         sep()        \
+  v(bdivide)                       sep()        \
+  v(bearly_error_wrong_parameters) sep()        \
+  v(berror_abort)                  sep()        \
+  v(berror_bad_function)           sep()        \
+  v(berror_bad_index)              sep()        \
+  v(berror_bad_type)               sep()        \
+  v(berror_bad_value)              sep()        \
+  v(berror_compile)                sep()        \
+  v(berror_divide_by_zero)         sep()        \
+  v(berror_loop)                   sep()        \
+  v(berror_no_match)               sep()        \
+  v(berror_recurse)                sep()        \
+  v(berror_security_violation)     sep()        \
+  v(berror_stack_underflow)        sep()        \
+  v(berror_user_interrupt)         sep()        \
+  v(berror_value_read_only)        sep()        \
+  v(berror_variable_read_only)     sep()        \
+  v(berror_wrong_parameters)       sep()        \
+  v(bmultiply)                     sep()        \
+  v(bno_match_error)               sep()        \
+  v(bpcons)                        sep()        \
+  v(bref)                          sep()        \
+  v(bref_end)                      sep()        \
+  v(bremainder)                    sep()        \
+  v(brglobal)                      sep()        \
+  v(bset)                          sep()        \
+  v(bshift_left)                   sep()        \
+  v(bshift_right)                  sep()        \
+  v(bsref)                         sep()        \
+  v(btype_error)                   sep()        \
+  v(bvarargs)                      sep()        \
+  v(bvcopy)                        sep()        \
+  v(bvector_bitor)                 sep()        \
+  v(bvequalp)                      sep()        \
+  v(bvfindp)                       sep()        \
+  v(bvref)                         sep()        \
   v(bwglobal)
 
-#define DECL_PROTO(name) extern void name();
-X86_BUILTINS_FOREACH(DECL_PROTO)
+#define DECL_PROTO(name) extern void name()
+BUILTINS_FOREACH(DECL_PROTO, SEP_SEMI);
 #undef DECL_PROTO
 
 /* these aren't accessible via builtin_find() */
 extern void bcall_primitive_tail();
-extern void builtin_start(), builtin_end();
+extern void builtin_start(), builtin_end(), bref_end(), bset_end();
 
-#endif  /* __i386__ || __x86_64__ */
+extern const uint8_t valid_segvs[];
 
 #endif  /* BUILTINS_H */

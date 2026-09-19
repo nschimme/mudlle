@@ -19,13 +19,10 @@
  * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-#include <string.h>
-
 #include "alloc.h"
 #include "error.h"
-#include "objenv.h"
-#include "print.h"
 #include "stack.h"
+
 
 #define STACK_SIZE 256
 #define LARGE_STACK 1024
@@ -43,17 +40,16 @@ void stack_init(void)
 
 void stack_clear(void)
 {
-  if (!stack || intval(stack->used) > LARGE_STACK) /* Excessively large */
+  assert(stack == NULL || intval(stack->used) == 0);
+  if (stack == NULL || vector_len(stack->values) > LARGE_STACK)
     stack = alloc_env(STACK_SIZE);
-  else
-    stack->used = makeint(0);
 }
 
 value stack_pop(void)
 {
   ulong used = intval(stack->used);
-
-  if (used == 0) runtime_error(error_stack_underflow);
+  if (used == 0)
+    runtime_error(error_stack_underflow);
   stack->used = mudlle_iadd(stack->used, -1);
   return stack->values->data[used - 1];
 }
@@ -64,15 +60,24 @@ void stack_push(value v)
   env_add_entry(stack, v);
 }
 
-value stack_get(ulong aindex)
+value stack_get(ulong idx)
 {
   ulong used = intval(stack->used);
+  if (used <= idx)
+    runtime_error(error_stack_underflow);
+  return stack->values->data[used - idx - 1];
+}
 
-  if (used <= aindex) runtime_error(error_stack_underflow);
-  return stack->values->data[used - aindex - 1];
+void stack_set(ulong idx, value v)
+{
+  GCCHECK(v);
+  ulong used = intval(stack->used);
+  if (used <= idx)
+    runtime_error(error_stack_underflow);
+  stack->values->data[used - idx - 1] = v;
 }
 
 ulong stack_depth(void)
 {
-  return (ulong)intval(stack->used);
+  return uintval(stack->used);
 }

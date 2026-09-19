@@ -23,20 +23,54 @@
 #include "list.h"
 #include "prims.h"
 
-#include "../interpret.h"
+enum runtime_error check_proper_list(struct list *l, typeset_t typeset,
+                                     size_t *elems, const char **errmsg)
+{
+  size_t n = 0;
+  /* slowl catches loops in objlist; Floyd's algorithm */
+  for (struct list *slowl = l; l != NULL; ++n)
+    {
+      if (n == MAX_VECTOR_SIZE)
+        {
+          *errmsg = "list has too many entries";
+          return error_loop;
+        }
+      if (!TYPE(l, pair))
+        {
+          *errmsg = bad_typeset_message(l, TYPESET_LIST);
+          return error_bad_type;
+        }
+      if (!is_typeset(l->car, typeset))
+        {
+          *errmsg = bad_typeset_message(l->car, typeset);
+          return error_bad_type;
+        }
+      l = l->cdr;
+      if (n & 1)
+        slowl = slowl->cdr;
+      if (slowl == l)
+        {
+          *errmsg = "list has a loop";
+          return error_loop;
+        }
+    }
+  if (elems != NULL)
+    *elems = n;
+  return error_none;
+}
 
 TYPEDOP(cons, , "`x1 `x2 -> `l. Make a new pair from elements `x1 and `x2."
         " See also `pcons().",
-	(value car, value cdr),
-	OP_LEAF | OP_NOESCAPE, "xx.k")
+        (value car, value cdr),
+        OP_LEAF | OP_NOESCAPE, "xx.k")
 {
   return alloc_list(car, cdr);
 }
 
 TYPEDOP(pcons, , "`x1 `x2 -> `l. Make a new read-only, possibly immutable,"
         " pair from elements `x1 and `x2.",
-	(value car, value cdr),
-	OP_LEAF | OP_NOESCAPE | OP_CONST, "xx.k")
+        (value car, value cdr),
+        OP_LEAF | OP_NOESCAPE | OP_CONST, "xx.k")
 {
   unsigned imm = immutablep(car) && immutablep(cdr) ? OBJ_IMMUTABLE : 0;
   struct list *p = alloc_list(car, cdr);
@@ -44,38 +78,38 @@ TYPEDOP(pcons, , "`x1 `x2 -> `l. Make a new read-only, possibly immutable,"
   return p;
 }
 
-TYPEDOP(car, , "`l -> `x. Returns the first element of pair `l.",
-        (struct list *l),
-	OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "k.x")
+EXT_TYPEDOP(car, , "`l -> `x. Returns the first element of pair `l.",
+            (struct list *l), (l),
+            OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "k.x")
 {
   CHECK_TYPES(l, pair);
   return l->car;
 }
 
-TYPEDOP(cdr, , "`l -> `x. Returns second element of pair `l.",
-        (struct list *l),
-	OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "k.x")
+EXT_TYPEDOP(cdr, , "`l -> `x. Returns second element of pair `l.",
+            (struct list *l), (l),
+            OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "k.x")
 {
   CHECK_TYPES(l, pair);
   return l->cdr;
 }
 
-TYPEDOP(pairp, "pair?", "`x -> `b. Returns TRUE if `x is a pair", (value v),
-	OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "x.n")
+TYPEDOP(pairp, "pair?", "`x -> `b. Returns true if `x is a pair", (value v),
+        OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "x.n")
 {
   return makebool(TYPE(v, pair));
 }
 
-TYPEDOP(listp, "list?", "`x -> `b. Returns TRUE if `x is a pair or null",
+TYPEDOP(listp, "list?", "`x -> `b. Returns true if `x is a pair or null",
         (value v),
-	OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "x.n")
+        OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "x.n")
 {
   return makebool(!v || TYPE(v, pair));
 }
 
-TYPEDOP(nullp, "null?", "`x -> `b. Returns TRUE if `x is the null object",
+TYPEDOP(nullp, "null?", "`x -> `b. Returns true if `x is the null object",
         (value v),
-	OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "x.n")
+        OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "x.n")
 {
   return makebool(v == NULL);
 }
@@ -105,12 +139,12 @@ EXT_TYPEDOP(set_cdrb, "set_cdr!", "`l `x -> `x. Sets the second element of"
 }
 
 VAROP(list, , "`x1 ... -> `l. Returns a list of the arguments",
-       OP_LEAF | OP_NOESCAPE, (".u", "xx*.k"))
+      (struct vector *args), OP_LEAF | OP_NOESCAPE, (".u", "xx*.k"))
 {
   struct list *l = NULL;
   GCPRO(l, args);
 
-  while (nargs > 0)
+  for (size_t nargs = vector_len(args); nargs > 0; )
     l = alloc_list(args->data[--nargs], l);
 
   UNGCPRO();
@@ -119,13 +153,14 @@ VAROP(list, , "`x1 ... -> `l. Returns a list of the arguments",
 
 VAROP(plist, , "`x1 ... -> `l. Returns a read-only and (if all elements"
       " are immutable) immutable list of the arguments.",
+      (struct vector *args),
       OP_LEAF | OP_NOESCAPE | OP_CONST, (".u", "xx*.k"))
 {
   struct list *l = NULL;
   GCPRO(l, args);
 
   bool immutable = true;
-  while (nargs > 0)
+  for (size_t nargs = vector_len(args); nargs > 0; )
     {
       value v = args->data[--nargs];
       immutable = immutable && immutablep(v);

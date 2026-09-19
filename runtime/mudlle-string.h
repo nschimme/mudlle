@@ -24,21 +24,29 @@
 
 #include "check-types.h"
 
-#include "../types.h"
-
 bool string_equalp(struct string *a, struct string *b);
 value string_append(struct string *s1, struct string *s2,
                     const struct prim_op *op);
-value code_string_ref(struct string *str, value i);
-value code_string_set(struct string *str, value i, value c);
+value string_ref(struct string *str, value midx, const struct prim_op *op);
+value mudlle_string_set(struct string *str, value midx, value mc,
+                        const struct prim_op *op);
 
 int mudlle_string_isearch(struct string *haystack, struct string *needle);
 
-value concat_strings(struct string **strings, int count);
+int mudlle_strcmp(struct string *a, struct string *b);
+int mudlle_istrcmp(struct string *a, struct string *b);
+
+value concat_strings(long count, struct string **strings);
 
 void string_init(void);
 
-const unsigned char *get_iso88591_pcre_table(void);
+#ifdef USE_PCRE
+/* set these when compiling user-supplied patterns to pcre2_compile() */
+#define REQUIRED_PCRE_FLAGS (PCRE2_NEVER_BACKSLASH_C | PCRE2_NEVER_UTF)
+
+struct pcre2_real_compile_context_8 *get_iso88591_pcre2_compile_context(void);
+struct pcre2_real_match_context_8 *get_pcre2_match_context(void);
+#endif
 
 extern struct string *const static_empty_string;
 
@@ -46,10 +54,9 @@ enum runtime_error ct_string_index(long idx, const char **errmsg,
                                    struct string *str, bool beyond,
                                    long *dst);
 
-#define __CT_STR_IDX_E(v, msg, dst_str_beyond)                          \
-  ct_string_index(v, msg, ARGN2 dst_str_beyond, ARGN3 dst_str_beyond,   \
-                  &(ARGN1 dst_str_beyond))
-#define CT_STR_IDX(dst, str, beyond) \
-  CT_INT_P((dst, str, beyond), __CT_STR_IDX_E)
+#define __CT_STR_IDX_E(v, msg, str_beyond_dst)          \
+  ct_string_index(v, msg, EXPAND_ARGS str_beyond_dst)
+#define CT_STR_IDX(dst, str, beyond)                    \
+  CT_INT_P((str, beyond, &dst), __CT_STR_IDX_E)
 
 #endif /* RUNTIME_MUDLLE_STRING_H */

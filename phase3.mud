@@ -22,9 +22,9 @@
 library phase3 // optimisation
 requires compiler, dlist, flow, graph, ins3, misc, optimise, sequences, vars
 
-defines mc:phase3, mc:myself
+defines mc:phase3
 
-reads mc:verbose, mc:infer_types
+reads mc:verbose
 writes mc:tnargs, mc:tncstargs, mc:tnpartial, mc:tnfull
 
 // VARIABLE CLASSES: Some notes on their effects on optimisation
@@ -111,9 +111,9 @@ writes mc:tnargs, mc:tncstargs, mc:tnpartial, mc:tnfull
       | closure_uses |
 
       lforeach(fn (ifn) // clear info
-	        lforeach(fn (local) local[mc:v_lclosure_uses] = 0,
+               lforeach(fn (local) local[mc:v_lclosure_uses] = 0,
 			ifn[mc:c_flocals]),
-	      fns);
+               fns);
 
       // compute uses
       closure_uses = fn (il)
@@ -124,23 +124,14 @@ writes mc:tnargs, mc:tncstargs, mc:tnpartial, mc:tnfull
 	  dvar = mc:defined_var(ins);
 	  args = mc:arguments(ins, null);
 
-          if (ins[mc:i_class] == mc:i_vref)
-            lforeach(fn (v) [
-              | base |
-              base = mc:var_base(v);
-              base[mc:v_lclosure_uses] |=
-                (mc:vref_indirect | mc:closure_read | mc:closure_write
-                 | mc:local_write_once | mc:local_write_many);
-            ], args)
-          else
-            lforeach(fn (v)
-                     if (v[mc:v_class] == mc:v_closure)
-                     [
-                       | base |
-                       base = mc:var_base(v);
-                       base[mc:v_lclosure_uses] |= mc:closure_read;
-                     ],
-                     args);
+          lforeach(fn (v)
+                   if (v[mc:v_class] == mc:v_closure)
+                   [
+                     | base |
+                     base = mc:var_base(v);
+                     base[mc:v_lclosure_uses] |= mc:closure_read;
+                   ],
+                   args);
 
 	  if (dvar && dvar[mc:v_class] == mc:v_closure)
 	    [
@@ -151,12 +142,11 @@ writes mc:tnargs, mc:tncstargs, mc:tnpartial, mc:tnfull
 	    ];
 	];
 
-      lforeach
-	(fn (ifn)
-	   graph_nodes_apply
-	     (fn (n) dforeach(closure_uses, graph_node_get(n)[mc:f_ilist]),
-	      cdr(ifn[mc:c_fvalue])),
-	 fns);
+      lforeach(
+        fn (ifn) graph_nodes_apply(
+          fn (n) dforeach(closure_uses, graph_node_get(n)[mc:f_ilist]),
+          cdr(ifn[mc:c_fvalue])),
+        fns);
     ];
 
   represent_variables = fn (fns)
@@ -174,20 +164,18 @@ writes mc:tnargs, mc:tncstargs, mc:tnpartial, mc:tnfull
 	  locals = ifn[mc:c_flocals]; // candidates
 	  // all locals assigned in closures must be indirect
 	  /*lforeach(fn (v) v[mc:v_indirect] = true, locals);
-	  locals = null;*/
-	  locals = lfilter(fn (v)
-			     [
-			       | uses |
-			       uses = v[mc:v_lclosure_uses];
-			       if (uses & mc:closure_write)
-				 [
-				   v[mc:v_indirect] = true;
-				   false
-				 ]
-			       else // consider further if read in closures
-				 uses & mc:closure_read
-			     ],
-			   locals);
+          locals = null;*/
+	  locals = lfilter(fn (v) [
+            | uses |
+            uses = v[mc:v_lclosure_uses];
+            if (uses & mc:closure_write)
+              [
+                v[mc:v_indirect] = true;
+                false
+              ]
+            else // consider further if read in closures
+              uses & mc:closure_read
+          ], locals);
 
 	  // For remaining locals, check if the local is part of the
 	  // ambiguous set at its point of definition. If so it must
@@ -199,16 +187,18 @@ writes mc:tnargs, mc:tncstargs, mc:tnpartial, mc:tnfull
 
 	      nlocal = local[mc:v_number];
 
-	      graph_nodes_exists?(fn (n) [
-                mc:scan_ambiguous(fn (il, ambiguous, indirect) [
-                  if (!indirect &&
-                      nlocal == il[mc:il_defined_var] &&
-                      bit_set?(ambiguous, nlocal))
-                    indirect = local[mc:v_indirect] = true;
-                  indirect
-                ], false, graph_node_get(n), mc:new_varset(ifn),
-                                  mc:f_ambiguous_rw);
-              ], cdr(ifn[mc:c_fvalue]));
+	      graph_nodes_exists?(
+                fn (n) [
+                  mc:scan_ambiguous(
+                    fn (il, ambiguous, indirect) [
+                      if (!indirect
+                          && nlocal == il[mc:il_defined_var]
+                          && bit_set?(ambiguous, nlocal))
+                        indirect = local[mc:v_indirect] = true;
+                      indirect
+                    ], false, graph_node_get(n), mc:new_varset(ifn),
+                    mc:f_ambiguous_rw);
+                ], cdr(ifn[mc:c_fvalue]));
 	    ];
 
 	  lforeach(ambiguous_def, locals);
@@ -242,12 +232,11 @@ writes mc:tnargs, mc:tncstargs, mc:tnpartial, mc:tnfull
 	      // Add a fetch of each indirect arg (not for closures or
 	      // non-safe-write memory ops; the latter are only used for
 	      // non-indirect reasons)
-	      if (class != mc:i_closure &&
-                  class != mc:i_vref &&
-                  (class != mc:i_memory
-                   || ins[mc:i_mop] == mc:memory_write_safe) &&
-		  (args = lfilter(fn (v) v[mc:v_indirect],
-                                  mc:arguments(ins, null))) != null)
+	      if (class != mc:i_closure
+                  && (class != mc:i_memory
+                      || ins[mc:i_mop] == mc:memory_write_safe)
+                  && (args = lfilter(fn (v) v[mc:v_indirect],
+                                     mc:arguments(ins, null))) != null)
 		// Special case: replacing 'x := <indirect var>'
 		if (class == mc:i_compute && ins[mc:i_aop] == mc:b_assign)
 		  // replaced by x := <indirect var>[0]
@@ -324,27 +313,22 @@ writes mc:tnargs, mc:tncstargs, mc:tnpartial, mc:tnfull
 	];
 
       lforeach(indirection, fns);
-      lforeach(fn (ifn)	// forward indirection to closure vars
-	      lforeach(fn (cvar)
-		      cvar[mc:v_indirect] = mc:var_base(cvar)[mc:v_indirect],
-		      ifn[mc:c_fclosure]),
-	      fns);
+      lforeach(fn (ifn)	[
+        // forward indirection to closure vars
+        lforeach(fn (cvar) [
+          cvar[mc:v_indirect] = mc:var_base(cvar)[mc:v_indirect]
+        ], ifn[mc:c_fclosure])
+      ], fns);
 
       // add instructions to fetch and set indirect variables
-      lforeach(fn (ifn)
-	      graph_nodes_apply(fn (n)
-				[
-				  | block |
-				  block = graph_node_get(n);
-				  block[mc:f_ilist] =
-				    add_indirection(ifn, block[mc:f_ilist])
-				],
-				cdr(ifn[mc:c_fvalue])),
-	      fns);
+      lforeach(fn (ifn) [
+        graph_nodes_apply(fn (n) [
+          | block |
+          block = graph_node_get(n);
+          block[mc:f_ilist] = add_indirection(ifn, block[mc:f_ilist])
+        ], cdr(ifn[mc:c_fvalue]))
+      ], fns);
     ];
-
-  // Placeholder for "myself" in functions
-  mc:myself = mc:var_make_constant("<myself>");
 
   direct_recursion = fn (ifn)
     // Types: ifn: intermediate function
@@ -382,6 +366,25 @@ writes mc:tnargs, mc:tncstargs, mc:tnpartial, mc:tnfull
 	 cdr(ifn[mc:c_fvalue]));
     ];
 
+  | remove_maybe_sconcat |
+  remove_maybe_sconcat = fn (ifn)
+    graph_nodes_apply(fn (n) [
+      | block, ilist |
+      block = graph_node_get(n);
+      ilist = block[mc:f_ilist];
+      for (|scan| scan = ilist; ; )
+        [
+          | il, ins |
+          il = dget(scan);
+          ins = il[mc:il_ins];
+          if (ins[mc:i_class] == mc:i_maybe_sconcat)
+            mc:make_il_nop(il);
+          scan = dnext(scan);
+          if (scan == ilist)
+            exit<break> null;
+        ]
+    ], cdr(ifn[mc:c_fvalue]));
+
   mc:phase3 = fn "intermediate -> intermediate. Phase 3 of the compiler" (fns)
     [
       // makes basic blocks explicit
@@ -395,13 +398,15 @@ writes mc:tnargs, mc:tncstargs, mc:tnpartial, mc:tnfull
 	  display("Inferring types\n");
 	];
       mc:tnargs = mc:tncstargs = mc:tnpartial = mc:tnfull = 0;
-      lforeach(mc:infer_types, fns);
+      mc:infer_types(fns);
       if (mc:verbose >= 3)
 	[
-	  display("Complete type inference results:\n");
-	  dformat("%s args, of which %s constant, %s fully inferred, %s partially.\n",
-                  mc:tnargs, mc:tncstargs, mc:tnfull, mc:tnpartial);
+	  dformat("""Complete type inference results:
+%d args, of which %d constant, %d fully inferred, %d partially.
+""", mc:tnargs, mc:tncstargs, mc:tnfull, mc:tnpartial);
 	];
+
+      lforeach(remove_maybe_sconcat, fns);
 
       if (mc:verbose >= 2)
 	[

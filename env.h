@@ -65,6 +65,8 @@ void env_block_pop(void);
 /* Effects: Pop a local scope
 */
 
+struct vlist *env_block_vlist(void);
+
 struct variable_list *env_pop(uint16_t *nb_locals);
 /* Effects: Pop an environement, returning the variables that it needs
      in its closure as well as the number of local variables it uses.

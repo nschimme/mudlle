@@ -22,28 +22,53 @@
 #include "mudlle-config.h"
 
 #include <ctype.h>
-#include <errno.h>
-#include <math.h>
-#include <stdlib.h>
-#include <string.h>
 
 #include "alloc.h"
 #ifdef ALLOC_STATS
 #  include "context.h"
 #endif
-#include "error.h"
 #include "mvalues.h"
+#include "strbuf.h"
 #include "types.h"
-
+#include "utils.h"
 
 const char *const mudlle_type_names[] = {
-  "code",   "closure", "variable", "internal",  "primitive", "varargs",
-  "secure", "integer", "string",   "vector",    "pair",      "symbol",
-  "table",  "private", "object",   "character", "gone",      "oport",
-  "mcode",  "float",   "bigint",   "reference", "null",
-  "none",   "any",     "function", "list"
+  [type_icode]        = "icode",
+  [type_closure]      = "closure",
+  [type_variable]     = "variable",
+  [type_internal]     = "internal",
+  [type_primitive]    = "primitive",
+  [type_varargs]      = "varargs",
+  [type_secure]       = "secure",
+  [type_integer]      = "integer",
+  [type_string]       = "string",
+  [type_vector]       = "vector",
+  [type_pair]         = "pair",
+  [type_symbol]       = "symbol",
+  [type_table]        = "table",
+  [type_private]      = "private",
+  [type_object]       = "object",
+  [type_character]    = "character",
+  [type_gone]         = "gone",
+  [type_oport]        = "oport",
+  [type_mcode]        = "mcode",
+  [type_float]        = "float",
+  [type_bigint]       = "bigint",
+  [type_null]         = "null",
+  [type_connection]   = "connection",
+  [type_cookie]       = "cookie",
+  [type_file]         = "file",
+  [type_weak_ref]     = "weak_ref",
+  [type_regexp]       = "regexp",
+  [stype_none]        = "none",
+  [stype_any]         = "any",
+  [stype_function]    = "function",
+  [stype_list]        = "list",
+  [stype_float_like]  = "float_like",
+  [stype_bigint_like] = "bigint_like",
+  [stype_false]       = "false"
 };
-CASSERT_VLEN(mudlle_type_names, last_synthetic_type);
+CASSERT_VLEN(mudlle_type_names, 34);
 
 #ifdef ALLOC_STATS
 
@@ -63,7 +88,7 @@ struct file_line_stats
   struct file_line **slots;
 };
 
-static struct file_line_stats type_alloc_stats[last_type];
+static struct file_line_stats type_alloc_stats[mudlle_types];
 
 static unsigned str_int_hash(const char *str, int line)
 {
@@ -79,7 +104,7 @@ static unsigned str_int_hash(const char *str, int line)
 struct vector *get_alloc_stats(void)
 {
   int entries = 0;
-  for (enum mudlle_type t = 0; t < last_type; ++t)
+  for (enum mudlle_type t = 0; t < mudlle_types; ++t)
     entries += type_alloc_stats[t].used;
 
   struct vector *res = alloc_vector(entries);
@@ -88,7 +113,7 @@ struct vector *get_alloc_stats(void)
   int used = 0;
 
   GCPRO(res, vec);
-  for (enum mudlle_type t = 0; t < last_type; ++t)
+  for (enum mudlle_type t = 0; t < mudlle_types; ++t)
     for (int i = 0; i < type_alloc_stats[t].size; ++i)
       for (struct file_line *fl = type_alloc_stats[t].slots[i];
            fl; fl = fl->next)
@@ -112,15 +137,14 @@ static struct file_line *file_line_stat_lookup(struct file_line_stats *stats,
 					       const char *file,
 					       int line)
 {
-  unsigned key = str_int_hash(file, line);
-  struct file_line *fl;
-
   if (stats->size == 0)
     return NULL;
 
-  for (fl = stats->slots[key % stats->size]; fl; fl = fl->next)
-    if (fl->key == key && fl->line == line
-	&& !strcmp(fl->file, file))
+  unsigned key = str_int_hash(file, line);
+  for (struct file_line *fl = stats->slots[key % stats->size];
+       fl != NULL;
+       fl = fl->next)
+    if (fl->key == key && fl->line == line && strcmp(fl->file, file) == 0)
       return fl;
 
   return NULL;
@@ -163,13 +187,14 @@ static void inc_file_line(struct file_line_stats *stats, const char *file,
     }
 
   data = malloc(sizeof *data);
-  data->key = key;
-  data->file = strdup(file);
-  data->line = line;
-  data->count = 1;
-  data->size = size;
-
-  data->next = stats->slots[key % stats->size];
+  *data = (struct file_line){
+    .key   = key,
+    .file  = strdup(file),
+    .line  = line,
+    .count = 1,
+    .size  = size,
+    .next  = stats->slots[key % stats->size],
+  };
   stats->slots[key % stats->size] = data;
 
   ++stats->used;
@@ -192,9 +217,12 @@ void record_allocation(enum mudlle_type type, long size)
       case call_primop:
       case call_invalid:
       case call_invalid_argp:
+      case call_invalid_argv:
       case call_session:
         break;
-      case call_string:
+      case call_mstring:
+      case call_string_args:
+      case call_string_argv:
         goto done;
       case call_bytecode:
         {
@@ -211,10 +239,11 @@ void record_allocation(enum mudlle_type type, long size)
 
 #endif /* ALLOC_STATS */
 
-struct closure *unsafe_alloc_closure(ulong nb_variables)
+struct closure *alloc_closure_noinit(ulong nb_variables)
 {
   ulong fields = nb_variables + grecord_fields(struct closure);
-  return make_readonly(UNSAFE_ALLOCATE_RECORD(closure, fields));
+  return make_readonly(
+    alloc_record_noinit(garbage_mtemp, type_closure, fields));
 }
 
 struct closure *alloc_closure0(struct code *code)
@@ -222,10 +251,10 @@ struct closure *alloc_closure0(struct code *code)
   GCPRO(code);
 
 #ifdef ALLOC_STATS
-  record_allocation(type_closure, sizeof(struct obj) + sizeof(value));
+  record_allocation(type_closure, sizeof (struct obj) + sizeof (value));
 #endif
 
-  struct closure *newp = (struct closure *)allocate_record(
+  struct closure *newp = (struct closure *)allocate_mtemp(
     type_closure, grecord_fields(*newp));
   newp->code = code;
   assert(immutablep(code));
@@ -236,21 +265,18 @@ struct closure *alloc_closure0(struct code *code)
 }
 
 /* allocate uninitialized string for 'len' characters */
-struct string *alloc_empty_string(size_t len)
+struct string *alloc_string_noinit(size_t len)
 {
-  struct string *result = (struct string *)allocate_string(type_string,
-                                                           len + 1);
+  struct string *result = (struct string *)allocate_string(
+    type_string, len + 1);
   result->str[len] = 0;
   return result;
 }
 
 struct string *alloc_string(const char *s)
 {
-  if (!s) s = "(null)";
-  size_t l = strlen(s);
-  struct string *newp = (struct string *)allocate_string(type_string, l + 1);
-  memcpy(newp->str, s, l + 1);
-  return newp;
+  if (s == NULL) s = "(null)";
+  return alloc_string_length(s, strlen(s));
 }
 
 struct string *alloc_string_length(const char *str, size_t len)
@@ -260,7 +286,7 @@ struct string *alloc_string_length(const char *str, size_t len)
       abort();
     }
 
-  struct string *newp = alloc_empty_string(len);
+  struct string *newp = alloc_string_noinit(len);
   if (len > 0)
     memcpy(newp->str, str, len);
   return newp;
@@ -270,7 +296,7 @@ struct string *mudlle_string_copy(struct string *s)
 {
   GCPRO(s);
   size_t len = string_len(s);
-  struct string *result = alloc_empty_string(len);
+  struct string *result = alloc_string_noinit(len);
   memcpy(result->str, s->str, len);
   UNGCPRO();
   return result;
@@ -289,11 +315,16 @@ struct string *safe_alloc_string(const char *s)
   return alloc_string(s ? s : "");
 }
 
+struct string *strbuf_to_mudlle(const struct strbuf *sb)
+{
+  return alloc_string_length(sb_str(sb), sb_len(sb));
+}
+
 struct variable *alloc_variable(value val)
 {
   GCCHECK(val);
   GCPRO(val);
-  struct variable *newp = UNSAFE_ALLOCATE_RECORD(variable, 1);
+  struct variable *newp = ALLOC_RECORD_NOINIT(variable, 1);
   newp->vvalue = val;
   UNGCPRO();
 
@@ -311,40 +342,32 @@ struct mudlle_float *alloc_float(double d)
 
 /* always run this before doing any operations on bi, in case a GC has
    moved the data around */
+#ifdef USE_GMP
 void check_bigint(struct bigint *bi)
 {
-#ifdef USE_GMP
   bi->mpz[0]._mp_d = &bi->limbs[0];
-#endif
 }
 
 struct bigint *alloc_bigint(mpz_t mpz)
 {
-  struct bigint *newp;
-
-#ifdef USE_GMP
-  newp = (struct bigint *)allocate_string(
+  struct bigint *newp = (struct bigint *)allocate_string(
     type_bigint,
-    sizeof(mpz_t) +
-    sizeof(mp_limb_t) * mpz[0]._mp_alloc);
+    sizeof (mpz_t) + sizeof (mp_limb_t) * mpz[0]._mp_alloc);
   newp->mpz[0]._mp_alloc = mpz[0]._mp_alloc;
   newp->mpz[0]._mp_size = mpz[0]._mp_size;
   newp->mpz[0]._mp_d = (mp_limb_t *)0xdeadbeef;
   memcpy(&newp->limbs[0], mpz->_mp_d,
-	 sizeof(mp_limb_t) * abs(mpz[0]._mp_size));
-#else
-  newp = (struct bigint *)allocate_string(type_bigint, sizeof *newp);
-#endif
+	 sizeof (mp_limb_t) * ABS(mpz[0]._mp_size));
   newp->o.flags |= OBJ_READONLY | OBJ_IMMUTABLE;
-
   return newp;
 }
+#endif
 
 struct symbol *alloc_symbol(struct string *name, value data)
 {
   GCPRO(name, data);
   assert(obj_readonlyp(&name->o));
-  struct symbol *newp = UNSAFE_ALLOCATE_RECORD(symbol, 2);
+  struct symbol *newp = ALLOC_RECORD_NOINIT(symbol, 2);
   UNGCPRO();
   newp->name = name;
   newp->data = data;
@@ -356,29 +379,25 @@ struct vector *alloc_vector(ulong size)
   return (struct vector *)allocate_record(type_vector, size);
 }
 
-struct vector *make_vector(unsigned argc, va_list va)
+struct vector *make_vector(unsigned argc, value args[static argc])
 {
   if (argc == 0)
-    return UNSAFE_ALLOCATE_RECORD(vector, 0);
+    return ALLOC_RECORD_NOINIT(vector, 0);
 
   struct gcpro gcpros[argc];
-  value args[argc];
-  for (int i = 0; i < argc; ++i)
-    {
-      args[i] = va_arg(va, value);
-      GCPROV(gcpros[i], args[i]);
-    }
-  struct vector *v = UNSAFE_ALLOCATE_RECORD(vector, argc);
+  for (unsigned i = 0; i < argc; ++i)
+    GCPROV(gcpros[i], args[i]);
+  struct vector *v = ALLOC_RECORD_NOINIT(vector, argc);
   UNGCPROV(gcpros[0]);
-  memcpy(v->data, args, sizeof args);
+  memcpy(v->data, args, argc * sizeof args[0]);
   return v;
 }
 
 struct list *alloc_list(value car, value cdr)
 {
   GCPRO(car, cdr);
-  struct list *newp = (struct list *)unsafe_allocate_record(
-    type_pair, grecord_fields(*newp));
+  struct list *newp = (struct list *)alloc_record_noinit(
+    garbage_record, type_pair, grecord_fields(*newp));
   UNGCPRO();
   newp->car = car;
   newp->cdr = cdr;
@@ -386,18 +405,11 @@ struct list *alloc_list(value car, value cdr)
 }
 
 
-struct mprivate *alloc_private(enum mprivate_type type, ulong size)
-{
-  struct mprivate *p = (struct mprivate *)allocate_record(
-    type_private, grecord_fields(*p) + size);
-  p->ptype = makeint(type);
-  return p;
-}
-
 /*
- * Converts the string sp or length len into an int i and returns
- * true. On over/underflow or illegal characters, it returns false. If
- * allow_one_overflow, -MIN_TAGGED_INT is accepted (for decimal only).
+ * Converts the string 'sp' of length 'len' into '*l' and returns true. On
+ * over/underflow or illegal characters, it returns false.
+ * If 'allow_one_overflow', -MIN_TAGGED_INT is accepted (for decimal only).
+ * 'base' is the base; or 0 to determined by prefix.
  */
 bool mudlle_strtolong(const char *sp, size_t len, long *l, int base,
                       bool allow_one_overflow)
@@ -432,15 +444,14 @@ bool mudlle_strtolong(const char *sp, size_t len, long *l, int base,
   if (*sp == '0')
     {
       unsigned char t = sp[1];
-      t = tolower(t);
-      if (t == 'x')
+      if (t == 'x' || t == 'X')
         {
           if (base != 0 && base != 16)
             return false;
           base = 16;
           sp += 2;
         }
-      else if (t == 'b')
+      else if (t == 'b' || t == 'B')
         {
           if (base != 0 && base != 2)
             return false;
@@ -481,13 +492,8 @@ bool mudlle_strtolong(const char *sp, size_t len, long *l, int base,
   for (;;)
     {
       unsigned char c = *sp++;
-
-      int d;
-      if (isdigit(c))
-	d = c - '0';
-      else if (isalpha(c))
-        d = toupper(c) - 'A' + 10;
-      else
+      int d = xdigit_val(c);
+      if (d < 0)
 	return false;
 
       if (d >= base)
@@ -508,7 +514,6 @@ bool mudlle_strtolong(const char *sp, size_t len, long *l, int base,
       if (n > limrad)
 	return false;
     }
-
 }
 
 /* returns true on success; sp[len] must be NUL */

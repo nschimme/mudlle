@@ -19,17 +19,13 @@
  * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-#include <ctype.h>
-#include <string.h>
-#include <strings.h>
-
 #include "alloc.h"
 #include "charset.h"
-#include "error.h"
 #include "hash.h"
-#include "mvalues.h"
 #include "table.h"
 #include "utils.h"
+
+#include "runtime/mudlle-string.h"
 
 struct table_methods {
   struct table *(*alloc)(ulong size);
@@ -51,12 +47,11 @@ static value ctable_makeint(long n)
   return makeint(~n);
 }
 
-int table_good_size(int entries)
+ulong table_good_size(ulong entries)
 {
   assert(entries < (INT_MAX - 2) / 4);
   entries = (entries * 4 + 2) / 3;
-  /* next power of two */
-  return P(CHAR_BIT * sizeof (int) - clz(entries));
+  return NEXT_POW2(entries);
 }
 
 static const struct table_methods table_methods = {
@@ -113,13 +108,13 @@ static long table_find(struct table *table, const char *name, size_t nlength)
 {
   const struct table_methods *methods = get_methods(table);
 
-  ulong size = vector_len(table->buckets);
-  int size_bits = ffs(size) - 1;
+  size_t size = vector_len(table->buckets);
+  int size_bits = ffsl(size) - 1;
   assert(size <= UINT_MAX);
   assert(P(size_bits) == size);
 
   ulong hashcode = methods->hash(name, nlength, size_bits);
-  long scan = hashcode;
+  ulong scan = hashcode;
   struct symbol **bucket = (struct symbol **)&table->buckets->data[scan];
   for (;;)
     {
@@ -138,7 +133,7 @@ static long table_find(struct table *table, const char *name, size_t nlength)
           scan = 0;
           bucket = (struct symbol **)&table->buckets->data[scan];
         }
-      assert(scan != hashcode);	/* The table is never allowed to be full */
+      assert(scan != hashcode); /* The table is never allowed to be full */
     }
 }
 
@@ -167,7 +162,7 @@ struct symbol *table_remove(struct table *table, const char *name)
 }
 
 struct symbol *table_remove_len(struct table *table, const char *name,
-				size_t nlength)
+                                size_t nlength)
 /* Effects: Removes table[name] from data. Rehashes nescessary values.
    Modifies: table
    Returns: false if the entry wasn't found
@@ -180,8 +175,8 @@ struct symbol *table_remove_len(struct table *table, const char *name,
   struct symbol *result = table->buckets->data[scan];
   struct symbol **bucket = (struct symbol **)&table->buckets->data[scan];
 
-  long size = vector_len(table->buckets);
-  int size_bits = ffs(size) - 1;
+  size_t size = vector_len(table->buckets);
+  int size_bits = ffsl(size) - 1;
   assert(P(size_bits) == size);
 
   *bucket = NULL;
@@ -192,7 +187,7 @@ struct symbol *table_remove_len(struct table *table, const char *name,
     {
       ++bucket;
       ++scan;
-      if (scan == size)
+      if ((ulong)scan == size)
         {
           scan = 0;
           bucket = (struct symbol **)&table->buckets->data[scan];
@@ -272,10 +267,10 @@ enum runtime_error safe_table_mset(struct table *table, struct string *s,
         return error_bad_value; /* table is full */
       GCPRO(table, *x);
       if (!obj_readonlyp(&s->o))
-	{
-	  /* make a copy of index string or it may get modified */
-	  s = make_readonly(mudlle_string_copy(s));
-	}
+        {
+          /* make a copy of index string or it may get modified */
+          s = make_readonly(mudlle_string_copy(s));
+        }
       table_add_fast(table, s, *x);
       UNGCPRO();
     }
@@ -300,7 +295,6 @@ struct symbol *table_add(struct table *table, struct string *name, value data)
   return table_add_fast(table, name, data);
 }
 
-
 struct symbol *table_add_fast(struct table *table, struct string *name,
                               value data)
 /* Requires: table_lookup(table, name->str, ...) to have just failed.
@@ -322,7 +316,7 @@ struct symbol *table_add_sym_fast(struct table *table, struct symbol *sym)
    Returns: The symbol
 */
 {
-  ulong size = vector_len(table->buckets);
+  size_t size = vector_len(table->buckets);
 
   assert(!obj_readonlyp(&table->o));
   assert(!obj_readonlyp(&table->buckets->o));
@@ -349,7 +343,7 @@ struct symbol *table_add_sym_fast(struct table *table, struct symbol *sym)
   table->buckets = newp;
   table->used = methods->make_used(0);
 
-  for (long i = 0; i < size; ++i)
+  for (ulong i = 0; i < size; ++i)
     {
       struct symbol *osym = old->data[i];
       if (osym == NULL)
@@ -369,7 +363,7 @@ struct list *table_list(struct table *table)
 {
   struct list *l = NULL;
   struct symbol *sym;
-  ulong size = vector_len(table->buckets);
+  size_t size = vector_len(table->buckets);
 
   GCPRO(l, table);
   while (size > 0)
@@ -388,9 +382,9 @@ struct list *table_prefix(struct table *table, struct string *prefix)
      prefix (case insensitive, like all table ops)
 */
 {
-  ulong prelen = string_len(prefix);
+  size_t prelen = string_len(prefix);
   struct vector *buckets = table->buckets;
-  ulong size = vector_len(table->buckets);
+  size_t size = vector_len(table->buckets);
   struct list *l = NULL;
 
   const struct table_methods *methods = get_methods(table);
@@ -401,7 +395,7 @@ struct list *table_prefix(struct table *table, struct string *prefix)
       struct symbol *sym = buckets->data[size];
       if (sym == NULL || sym->data == NULL)
         continue;
-      ulong symlen = string_len(sym->name);
+      size_t symlen = string_len(sym->name);
       if (prelen > symlen)
         continue;
       if (methods->compare(sym->name->str, prefix->str, prelen) == 0)
@@ -417,26 +411,82 @@ struct symbol *table_exists(struct table *table,
                             bool (*check)(struct symbol *sym, void *data),
                             void *data)
 {
-  long size = vector_len(table->buckets);
+  size_t size = vector_len(table->buckets);
   struct symbol **bucket = (struct symbol **)&table->buckets->data[0];
-  for (long i = 0; i < size; ++i, ++bucket)
+  for (size_t i = 0; i < size; ++i, ++bucket)
     if (*bucket && check(*bucket, data))
       return *bucket;
 
   return NULL;
 }
 
+size_t table_non_null_entries(struct table *table)
+{
+  size_t n = 0;
+  struct vector *buckets = table->buckets;
+  size_t size = vector_len(buckets);
+  for (size_t i = 0; i < size; ++i)
+    {
+      struct symbol *bucket = buckets->data[i];
+      if (bucket != NULL && bucket->data != NULL)
+        ++n;
+    }
+  return n;
+}
+
+struct vector *table_vector(struct table *table)
+{
+  size_t nentries = table_non_null_entries(table);
+  struct vector *buckets = table->buckets;
+  GCPRO(buckets);
+  struct vector *result = alloc_vector(nentries);
+  UNGCPRO();
+  size_t size = vector_len(buckets);
+  for (size_t i = 0, j = 0; i < size; ++i)
+    {
+      struct symbol *bucket = buckets->data[i];
+      if (bucket != NULL && bucket->data != NULL)
+        result->data[j++] = bucket;
+    }
+  return result;
+}
+
+static int cmp_symbol(const void *a, const void *b)
+{
+  struct symbol *const *asym = a, *const *bsym = b;
+  return mudlle_strcmp((*asym)->name, (*bsym)->name);
+}
+
+static int cmp_isymbol(const void *a, const void *b)
+{
+  struct symbol *const *asym = a, *const *bsym = b;
+  return mudlle_istrcmp((*asym)->name, (*bsym)->name);
+}
+
+struct vector *sorted_table_vector(struct table *table)
+{
+  struct vector *v = table_vector(table);
+  qsort(v->data, vector_len(v), sizeof v->data[0],
+        is_ctable(table) ? cmp_symbol : cmp_isymbol);
+  return v;
+}
+
 /* 'action' must not modify the table, but may cause GC */
-void table_foreach(struct table *table, void *data,
-                   void (*action)(struct symbol *, void *))
+void table_foreach(struct table *table,
+                   void (*action)(struct symbol *sym, void *data),
+                   void *data)
 {
   GCPRO(table);
-  long size = vector_len(table->buckets);
-  for (long i = 0; i < size; ++i)
+  struct vector *buckets = table->buckets;
+  size_t size = vector_len(buckets);
+  for (size_t i = 0; i < size; ++i)
     {
-      struct symbol *bucket = (struct symbol *)table->buckets->data[i];
+      struct symbol *bucket = buckets->data[i];
       if (bucket)
-	action(bucket, data);
+        {
+          action(bucket, data);
+          buckets = table->buckets;
+        }
     }
   UNGCPRO();
 }
@@ -461,7 +511,7 @@ struct table *table_shallow_copy(struct table *table)
 struct table *table_copy(struct table *table)
 {
   struct vector *buckets = table->buckets;
-  ulong blen = vector_len(buckets);
+  size_t blen = vector_len(buckets);
   ulong count = 0;
   for (ulong n = 0; n < blen; ++n)
     {
@@ -490,7 +540,7 @@ struct table *table_copy(struct table *table)
 void rehash_table(struct table *table)
 {
   struct vector *buckets = table->buckets;
-  ulong blen = vector_len(buckets);
+  size_t blen = vector_len(buckets);
 
   size_t bsize = blen * sizeof buckets->data[0];
   value *old = malloc(bsize);
@@ -508,7 +558,7 @@ void rehash_table(struct table *table)
   value oused = table->used;
   table->used = methods->make_used(0);
 
-  for (long i = 0; i < blen; ++i)
+  for (ulong i = 0; i < blen; ++i)
     {
       struct symbol *sym = old[i];
       if (sym == NULL)
@@ -538,6 +588,25 @@ void protect_table(struct table *table)
 
 void immutable_table(struct table *table)
 {
+  make_immutable(table->buckets);
   table->o.flags |= OBJ_READONLY | OBJ_IMMUTABLE;
-  table->buckets->o.flags |= OBJ_READONLY | OBJ_IMMUTABLE;
+}
+
+static void immutable_symbol(struct symbol *sym, void *data)
+{
+  make_immutable(sym);
+}
+
+struct table *make_table_immutable(struct table *table)
+{
+  table_foreach(table, immutable_symbol, NULL);
+  immutable_table(table);
+  return table;
+}
+
+struct table *try_make_table_immutable(struct table *table)
+{
+  try_make_immutable(&table->buckets->o);
+  try_make_immutable(&table->o);
+  return table;
 }

@@ -25,14 +25,16 @@
 
 /* #define XMLDEBUG 1 */
 
-#include <string.h>
-
 #include <libxml/xmlreader.h>
 
-#include "../ports.h"
 #include "../table.h"
 
+#ifdef XMLDEBUG
+#include "../utils.h"
+#endif
+
 #include "check-types.h"
+#include "files.h"
 #include "mudlle-xml.h"
 #include "prims.h"
 #include "symbol.h"
@@ -175,7 +177,7 @@ static value mudlle_xml_read(xmlTextReaderPtr reader, struct table *name_table)
               xmlFreeTextReader(reader);
 
               /* cause user-friendly call trace */
-              code_table_set(name_table, mstr, NULL);
+              do_table_set(name_table, mstr, NULL, table_set_ext);
               abort();
             }
 
@@ -212,11 +214,11 @@ static value mudlle_xml_read(xmlTextReaderPtr reader, struct table *name_table)
         }
 
 #ifdef XMLDEBUG
-      fprintf(stderr, "%*s  depth %3d  type %3d  name %s\n",
-              (int)intval(mdepth), "",
-              (int)intval(mdepth),
-              (int)xmlTextReaderNodeType(reader),
-              xmlTextReaderConstName(reader));
+      mudlle_log("%*s  depth %3d  type %3d  name %s",
+                 (int)intval(mdepth), "",
+                 (int)intval(mdepth),
+                 xmlTextReaderNodeType(reader),
+                 xmlTextReaderConstName(reader));
 #endif
 
       if (xmlstack == NULL)
@@ -251,8 +253,8 @@ static value mudlle_xml_read(xmlTextReaderPtr reader, struct table *name_table)
     }
   UNGCPRO();
 
-  /* will probably not happen without the "real" error strings being
-     set; better safe than sorry! */
+  /* will probably not happen without the "real" error strings being set;
+     better safe than sorry! */
   if (result == -1 && xml_error.msg == NULL)
     {
       xmlChar *uri = xmlTextReaderBaseUri(reader);
@@ -261,6 +263,7 @@ static value mudlle_xml_read(xmlTextReaderPtr reader, struct table *name_table)
         .line = 1,
         .msg  = strdup("does not parse")
       };
+      assert(xml_error.msg != NULL); /* silence clang-tidy warning */
       free(uri);
     }
 
@@ -285,7 +288,7 @@ static value mudlle_xml_read(xmlTextReaderPtr reader, struct table *name_table)
 
 struct xml_read_data {
   struct vector *minput;
-  int vidx, sidx;
+  size_t vidx, sidx;
 };
 
 static int xml_read_input(void *arg, char *buffer, int len)
@@ -322,25 +325,25 @@ static int xml_read_close(void *arg)
   return 0;
 }
 
-SECOP(xml_read, , "`v `s `n `t -> `x. Reads an XML document (named `s)"
-       " from vector of strings `v using `XML_PARSE_xxx flags in `n.\n"
-       "Returns an XML tree, or an error [`uri `line `msg].\n"
-       "`t is the name table, or NULL.",
-       (struct vector *minput, struct string *murl, value mflags,
-           struct table *name_table),
-       LVL_IMPLEMENTOR, 0,
-       "vsn[tu].v")
+SECOP(xml_read, , "`v `s `n `t|null -> `x. Reads an XML document (named `s)"
+      " from vector of strings `v using `XML_PARSE_xxx flags in `n.\n"
+      "Returns an XML tree, or an error [`uri `line `msg].\n"
+      "`t is the name table, or null.",
+      (struct vector *minput, struct string *murl, value mflags,
+       struct table *name_table),
+      LVL_IMPLEMENTOR, 0,
+      "vsn[tu].v")
 {
   int flags;
   CHECK_TYPES(minput,     vector,
-              murl,       string,
+              murl,       CT_PATHNAME,
               mflags,     CT_AUTO_RANGE(flags),
               name_table, CT_TYPES(null, table));
 
   char *url;
   ALLOCA_PATH(url, murl);
 
-  for (int i = 0; i < vector_len(minput); ++i)
+  for (size_t i = 0; i < vector_len(minput); ++i)
     TYPEIS(minput->data[i], string);
 
   struct xml_read_data read_data = { .minput = minput };
@@ -358,15 +361,15 @@ SECOP(xml_read, , "`v `s `n `t -> `x. Reads an XML document (named `s)"
   return result;
 }
 
-SECOP(xml_read_file, , "`s `n `t -> `x. Reads an XML document from file `s,"
-      " using `XML_PARSE_xxx flags in `n. Returns an XML tree, or"
-      " an error [`uri `line `msg]. `t is the name table, or NULL.",
+SECOP(xml_read_file, , "`s `n `t|null -> `x. Reads an XML document from"
+      " file `s, using `XML_PARSE_xxx flags in `n. Returns an XML tree, or"
+      " an error [`uri `line `msg]. `t is the name table, or null.",
       (struct string *mfilename, value mflags, struct table *name_table),
       LVL_IMPLEMENTOR, 0,
       "sn[tu].v")
 {
   int flags;
-  CHECK_TYPES(mfilename,  string,
+  CHECK_TYPES(mfilename,  CT_PATHNAME,
               mflags,     CT_AUTO_RANGE(flags),
               name_table, CT_TYPES(null, table));
 
@@ -389,11 +392,9 @@ SECOP(xml_read_file, , "`s `n `t -> `x. Reads an XML document from file `s,"
   return mudlle_xml_read(reader, name_table);
 }
 
-#define DEFINE_INT(name) system_define(#name, makeint(name))
-
 void xml_init(void)
 {
-  xml_utf16_encoder = xmlFindCharEncodingHandler("UTF-16LE");
+  xml_utf16_encoder = xmlGetCharEncodingHandler(XML_CHAR_ENCODING_UTF16LE);
   assert(xml_utf16_encoder != NULL);
 
   DEFINE(xml_read);
@@ -441,6 +442,7 @@ void xml_init(void)
 
 #else  /* ! USE_XML */
 
+void xml_init(void);
 void xml_init(void)
 {
 }

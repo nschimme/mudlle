@@ -24,6 +24,6 @@
 
 #include "types.h"
 
-void do_interpret(struct closure *c, int nargs);
+void do_interpret(struct closure *fn, int nargs);
 
 #endif

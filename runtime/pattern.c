@@ -21,27 +21,25 @@
 
 #include "../mudlle-config.h"
 
-#include <stdlib.h>
-#include <string.h>
-
 #include "pattern.h"
 #include "prims.h"
 
 #include "../charset.h"
-#include "../error.h"
 #include "../table.h"
+#include "../utils.h"
 
 struct seen_values {
-  struct {
+  struct seen_entry {
     /* 'lhs->size' stores the index into the 'seen' array; 'lhs_size' keeps the
        original size */
     struct obj *lhs, *rhs;
     long lhs_size;
   } *seen;
   size_t size, used;
+  bool hit_stack_limit;
 };
 
-static bool recurse(value pat, value val, struct seen_values *seen);
+static bool recurse(value lhs, value rhs, struct seen_values *seen);
 
 struct table_data {
   struct seen_values *seen;
@@ -64,16 +62,6 @@ static bool recurse_symbol(struct symbol *sym, void *_data)
   return !recurse(sym->data, val, data->seen);
 }
 
-/* return true if we found too many entries */
-static bool count_non_null_syms(struct symbol *sym, void *_data)
-{
-  struct table_data *data = _data;
-  if (sym->data != NULL
-      && data->nentries-- == 0)
-    return true;
-  return false;
-}
-
 /* return the vector_len(v), but handle that the size may be an index into seen
    values */
 static long safe_vlen(struct vector *v, struct seen_values *seen)
@@ -88,6 +76,7 @@ static long safe_vlen(struct vector *v, struct seen_values *seen)
 
 static bool recurse(value lhs, value rhs, struct seen_values *seen)
 {
+ again:                         /* used for manual tail recursion */
   if (!pointerp(lhs))
     return lhs == rhs;
 
@@ -107,6 +96,7 @@ static bool recurse(value lhs, value rhs, struct seen_values *seen)
   if (has_seen_lhs)
     {
       size_t idx = lhsobj->size;
+      assert(idx < seen->used);
       return seen->seen[idx].rhs == rhs;
     }
 
@@ -133,11 +123,21 @@ static bool recurse(value lhs, value rhs, struct seen_values *seen)
       return (((struct mudlle_float *)lhs)->d
               == ((struct mudlle_float *)rhs)->d);
     case type_bigint:
+#ifdef USE_GMP
       check_bigint((struct bigint *)lhs);
       check_bigint((struct bigint *)rhs);
       return mpz_cmp(((struct bigint *)lhs)->mpz,
                      ((struct bigint *)rhs)->mpz) == 0;
+#else
+      return false;
+#endif
     default:
+      return false;
+    }
+
+  if (get_stack_pointer() < hard_mudlle_stack_limit)
+    {
+      seen->hit_stack_limit = true;
       return false;
     }
 
@@ -149,10 +149,13 @@ static bool recurse(value lhs, value rhs, struct seen_values *seen)
       seen->size = seen->size ? seen->size * 2 : 16;
       seen->seen = realloc(seen->seen, sizeof *seen->seen * seen->size);
     }
-  seen->seen[seen->used].lhs = lhs;
-  seen->seen[seen->used].rhs = rhs;
-  seen->seen[seen->used].lhs_size = lhsobj->size;
-  lhsobj->size = seen->used++;
+  seen->seen[seen->used] = (struct seen_entry){
+    .lhs      = lhs,
+    .rhs      = rhs,
+    .lhs_size = lhsobj->size
+  };
+  lhsobj->size = seen->used;
+  ++seen->used;
   lhsobj->flags |= OBJ_FLAG_0;
   rhsobj->flags |= OBJ_FLAG_1;
 
@@ -160,40 +163,46 @@ static bool recurse(value lhs, value rhs, struct seen_values *seen)
     {
     case type_symbol:
       {
-        struct symbol *sympat = lhs, *symval = rhs;
-        size_t symlen = string_len(sympat->name);
-        return (symlen == string_len(symval->name)
-                && mem7icmp(sympat->name->str, symval->name->str, symlen) == 0
-                && recurse(sympat->data, symval->data, seen));
+        struct symbol *lsym = lhs, *rsym = rhs;
+        size_t symlen = string_len(lsym->name);
+        if (symlen != string_len(rsym->name)
+            || mem7icmp(lsym->name->str, rsym->name->str, symlen) != 0)
+          return false;
+        lhs = lsym->data;
+        rhs = rsym->data;
+        goto again;
       }
     case type_vector:
       {
-        long vl = safe_vlen(lhs, seen);
-        if (vl != safe_vlen(rhs, seen))
+        long vlen = safe_vlen(lhs, seen);
+        if (vlen != safe_vlen(rhs, seen))
           return false;
-        for (long i = 0; i < vl; ++i)
-          if (!recurse(((struct vector *)lhs)->data[i],
-                       ((struct vector *)rhs)->data[i],
-                       seen))
+        if (vlen == 0)
+          return true;
+        struct vector *lvec = lhs, *rvec = rhs;
+        for (long i = 0; i < vlen - 1; ++i)
+          if (!recurse(lvec->data[i], rvec->data[i], seen))
             return false;
-        return true;
+        lhs = lvec->data[vlen - 1];
+        rhs = rvec->data[vlen - 1];
+        goto again;
       }
     case type_pair:
-      return (recurse(((struct list *)lhs)->car,
-                      ((struct list *)rhs)->car,
-                      seen)
-              && recurse(((struct list *)lhs)->cdr,
-                         ((struct list *)rhs)->cdr,
-                         seen));
+      {
+        struct list *llist = lhs, *rlist = rhs;
+        if (!recurse(llist->car, rlist->car, seen))
+          return false;
+        lhs = llist->cdr;
+        rhs = rlist->cdr;
+        goto again;
+      }
     case type_table:
       {
         if (is_ctable(lhs) != is_ctable(rhs))
           return false;
         struct table_data tdata = { .seen = seen, .table = rhs };
-        if (table_exists((struct table *)lhs, recurse_symbol, &tdata)
-            || table_exists((struct table *)rhs, count_non_null_syms, &tdata))
-          return false;
-        return tdata.nentries == 0;
+        return (!table_exists((struct table *)lhs, recurse_symbol, &tdata)
+                && table_non_null_entries(rhs) == tdata.nentries);
       }
     default:
       abort();
@@ -201,19 +210,18 @@ static bool recurse(value lhs, value rhs, struct seen_values *seen)
 }
 
 TYPEDOP(equalp, "equal?",
-        "`x0 `x1 -> `b. Return true if `x0 is equal to `x1.\n"
-        "Pairs, vectors, symbols, and tables are compared"
-        " recursively.\n"
-        "All objects are considered equal to themselves.\n"
+        "`x0 `x1 -> `b. Return true if `x0 is equal to `x1.\n\n"
+        "Pairs, vectors, symbols, and tables are compared recursively.\n\n"
+        "All objects are considered equal to themselves.\n\n"
         "No objects of different types are considered equal. E.g., a float"
         " is never considered equal to a bigint or an integer."
-        " Also, a ctable is never considered equal to a table.\n"
-        "Strings, bigints and floats are considered equal if `string_cmp,"
-        " `bicmp, and `fcmp return zero, respectively.\n"
+        " A ctable is never considered equal to a table.\n\n"
+        "Strings, bigints and floats are considered equal if `string_cmp(),"
+        " `bicmp(), and `fcmp() return zero, respectively.\n\n"
         "Symbol name comparisons are case- and accent-insensitive, except"
-        " inside ctables.\n"
-        "Table entries that are `null are considered equivalent to"
-        " absent ones.\n"
+        " inside ctables.\n\n"
+        "Table entries that are null are considered equivalent to absent"
+        " ones.\n\n"
         "The graph of the container objects (pairs, vectors, symbols, and"
         " tables) in `x0 and `x1 must be homomorphic. This matters if the"
         " same container is referenced more than once.",
@@ -224,14 +232,20 @@ TYPEDOP(equalp, "equal?",
   struct seen_values seen = { .size = 0 };
   bool result = recurse(lhs, rhs, &seen);
 
+  /* can be expensive */
+  expensive_operation(seen.used / 8);
+
   /* restore modified data */
-  for (int i = 0; i < seen.used; ++i)
+  for (size_t i = 0; i < seen.used; ++i)
     {
       seen.seen[i].lhs->size = seen.seen[i].lhs_size;
       seen.seen[i].lhs->flags &= ~OBJ_FLAG_0;
       seen.seen[i].rhs->flags &= ~OBJ_FLAG_1;
     }
   free(seen.seen);
+
+  if (seen.hit_stack_limit)
+    runtime_error(error_recurse);
 
   return makebool(result);
 }

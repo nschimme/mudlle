@@ -22,29 +22,19 @@
 #ifndef LEXER_H
 #define LEXER_H
 
-#include <stdbool.h>
-#include <stdio.h>
-
 #include "mparser.h"
-
-struct filename;
 
 struct reader_state {
   struct lexer_state *data;
 };
 
-int yylex(void);
+union YYSTYPE;
+int yylex(union YYSTYPE *yylval_param, YYLTYPE *yylloc_param);
 
-void read_from_strings(const char *const *strs, const struct filename *fname,
-                       bool force_const);
-void read_from_file(FILE *f, const struct filename *fname);
-
-/* always call {save,restore}_reader_state() around use of read_from_xxx() */
-void save_reader_state(struct reader_state *state);
-void restore_reader_state(struct reader_state *state);
+void set_lex_config(const struct parser_config *pconfig);
 
 bool allow_comma_expression(void);
 
-const struct loc *lexer_location(void);
+struct comment_list *lexer_comments(void);
 
 #endif

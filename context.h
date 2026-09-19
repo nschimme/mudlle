@@ -57,16 +57,15 @@ context (in that case the current value is in global variable x).
 #define CONTEXT_H
 
 #include <setjmp.h>
+#include <stdatomic.h>
 
 #include "error.h"
 #include "mvalues.h"
-
 
 enum call_trace_mode {
   call_trace_off,               /* call trace completely suppressed */
   call_trace_barrier,           /* call trace to muderr/observers up to here */
   call_trace_on,                /* complete call traces to everyone  */
-  call_trace_no_err             /* no call trace to muderr; only to watchers */
 };
 
 /* Function context */
@@ -104,8 +103,9 @@ static inline void ccontext_frame(const struct ccontext *cc,
   ulong *bp = cc->frame_end_bp;
   if ((ulong)bp <= 1)
     {
-      /* esp points to the stack position where the previous ebp
-         was pushed by the push %ebp/mov %esp,%ebp preamble */
+      /* %rsp points to the stack position where the previous %rbp was pushed
+         by the push %rbp/mov %rsp,%rbp preamble;
+         cf. END_NTH_FRAME() in x64builtins.S */
       ulong c_args = (ulong)bp + 2;
       bp = (ulong *)*sp;
       sp += c_args;
@@ -123,10 +123,42 @@ extern struct ccontext ccontext;
 extern seclev_t internal_seclevel;
 /* Lowest seclevel seen in current call chain. A mudlle int so it
    cheaply can be pushed to the stack. */
-extern value maxseclevel;
+extern value internal_maxseclevel;
+/* Seclevel that can view call traces. Typically equal to maxseclevel. */
+extern seclev_t internal_trace_seclevel;
 /* Set to true whenever a secure or vararg was the most recently
    called primitive. */
 extern bool seclevel_valid;
+
+static ALWAYS_INLINE void set_m_maxseclevel(value lvl)
+{
+  internal_maxseclevel = lvl;
+}
+
+static ALWAYS_INLINE void set_c_maxseclevel(seclev_t lvl)
+{
+  internal_maxseclevel = makeint(lvl);
+}
+
+static ALWAYS_INLINE value m_maxseclevel(void)
+{
+  return internal_maxseclevel;
+}
+
+static ALWAYS_INLINE seclev_t c_maxseclevel(void)
+{
+  return intval(internal_maxseclevel);
+}
+
+static ALWAYS_INLINE seclev_t trace_seclevel(void)
+{
+  return internal_trace_seclevel;
+}
+
+static ALWAYS_INLINE void set_trace_seclevel(seclev_t lvl)
+{
+  internal_trace_seclevel = lvl;
+}
 
 static inline seclev_t get_seclevel(void)
 {
@@ -134,7 +166,7 @@ static inline seclev_t get_seclevel(void)
   return internal_seclevel;
 }
 
-static inline void set_seclevel(seclev_t seclevel)
+static ALWAYS_INLINE void set_seclevel(seclev_t seclevel)
 {
   internal_seclevel = seclevel;
 }
@@ -148,9 +180,8 @@ static inline bool effective_seclevel_below(seclev_t seclev)
 {
   if (seclev >= LEGACY_SECLEVEL)
     return get_effective_seclevel() < seclev;
-  return intval(maxseclevel) < seclev;
+  return c_maxseclevel() < seclev;
 }
-
 
 /* Used only by byte-coded functions and C primitives (not used for,
    nor updated by, compiled code) */
@@ -162,11 +193,12 @@ enum call_class {
   call_string_args,             /* a string description; for displaying
                                    stack traces only; */
   call_string_argv,             /* ... last arg is actually vector(arg) */
+  call_mstring,                 /* mudlle string */
   call_session,                 /* a new session */
   call_invalid,                 /* invalid interpreter call */
-  call_invalid_argp             /* invalid call with pointer to args */
+  call_invalid_argp,            /* invalid call with pointer to args */
+  call_invalid_argv             /* invalid call with last arg a vector(arg) */
 };
-
 
 struct call_stack
 {
@@ -178,7 +210,7 @@ struct call_stack_mudlle {      /* used for call_bytecode */
   struct call_stack s;
   struct closure *fn;           /* Actual function */
   struct icode *code;           /* The function's code */
-  struct vector *locals;	/* Local vars */
+  struct vector *locals;        /* Local vars */
   int nargs;                    /* -1 = don't know yet */
   int offset;                   /* Instr. offset called from */
 };
@@ -189,6 +221,7 @@ struct call_stack_c_header {
     struct primitive *prim;         /* for call_c */
     const struct prim_op *op;       /* for call_primop */
     const char *name;               /* for call_string_xxx */
+    struct string *mstring;         /* for call_mstring */
     value value;                    /* for call_invalid{,_argv} */
   } u;
   int nargs;
@@ -210,15 +243,9 @@ extern struct call_stack *call_stack;
 
 static inline struct ccontext *next_ccontext(const struct ccontext *cc)
 {
-#ifdef __i386__
-  /* ebx, esi, edi */
-  const int frame_size = (3 * sizeof (value)
-                          + sizeof (struct call_stack)
-                          + sizeof *cc);
-#elif defined __x86_64__
-  /* ebx, r12-r15 */
-  const int frame_size = MUDLLE_ALIGN(
-    5 * sizeof (value)
+#ifdef __x86_64__
+  const size_t frame_size = MUDLLE_ALIGN(
+    NCALLEE_SAVE * sizeof (value)
     + sizeof (struct call_stack)
     + sizeof *cc,
     16);
@@ -246,20 +273,21 @@ struct catch_context
 {
   struct catch_context *parent;
 
-  sigjmp_buf exception;         /* the return point */
-
-  /* How should call traces be shown if errors occur in this context ? */
-  enum call_trace_mode call_trace_mode;
+  sigjmp_buf exception_jmp_buf; /* longjmp() target on exception */
 
   /* Save values of constant/local/preserved mudlle variables, to be able to
      restore them after a throw(). In an ideal world, everything would be in
      the call_stack. */
   struct call_stack *old_call_stack;
-  int old_stack_depth;
   struct gcpro *old_gcpro;
   struct ccontext old_ccontext;
-
   struct mjmpbuf *mjmpbuf;
+
+  int old_stack_depth;
+  unsigned old_forbid;
+
+  /* How should call traces be shown if errors occur in this context? */
+  enum call_trace_mode call_trace_mode;
 };
 
 extern struct catch_context *catch_context;
@@ -270,7 +298,7 @@ struct mexception {
 };
 extern struct mexception mexception;
 
-static inline bool has_pending_exception(void)
+static ALWAYS_INLINE bool has_pending_exception(void)
 {
   return mexception.sig != SIGNAL_NONE;
 }
@@ -283,42 +311,51 @@ bool mcatch(void (*fn)(void *x), void *x,
        exception_signal/exception_error.
      The execution environment is protected by this function, i.e.:
         stack
-	GC protection lists
-	activation stack
-	seclevel
-	exception handler
+        GC protection lists
+        activation stack
+        seclevel
+        exception handler
      Calls to mcatch may be nested with no problems.
 */
 
 /* Session context */
 /* --------------- */
 
-typedef void *muser_t;
-
 struct session_context
 {
   struct call_stack s;
   struct session_context *parent;
-  struct oport *_mudout, *_muderr;
-  muser_t _muduser;
+  struct {
+    struct oport *out, *err;
+  } ports;
   seclev_t old_minlevel;
   seclev_t old_maxseclevel;
+  seclev_t old_trace_seclevel;
   ulong old_xcount;
-#if defined __i386__ || defined __x86_64__
   ulong old_stack_limit;
-#endif
   struct gcpro *old_gcpro;
+  enum runtime_error rethrow_error;
 };
 
 extern struct session_context *session_context;
 
 /* end mudlle const */
-#define mudout  (session_context->_mudout)
-#define muduser (session_context->_muduser)
-#define muderr  (session_context->_muderr)
+static ALWAYS_INLINE bool in_mudlle_session(void)
+{
+  return session_context != NULL;
+}
 
-extern ulong xcount;			/* Loop detection */
-extern seclev_t minlevel;               /* Minimum security level */
+static ALWAYS_INLINE struct oport *mudout(void)
+{
+  return session_context->ports.out;
+}
+
+static ALWAYS_INLINE struct oport *muderr(void)
+{
+  return session_context->ports.err;
+}
+
+extern seclev_t minlevel;       /* Minimum security level */
 
 extern ulong hard_mudlle_stack_limit, mudlle_stack_limit;
 
@@ -326,22 +363,42 @@ struct session_info {
   seclev_t minlevel;
   /* See session_context.seclevel */
   seclev_t maxseclevel;
-  muser_t muser;
   struct oport *mout, *merr;
 };
 
 extern const struct session_info cold_session;
 
+#define XCOUNT_PROFILE_FLAG (1UL << TAGGED_INT_BITS)
+#define XCOUNT_MASK         (XCOUNT_PROFILE_FLAG - 1)
+
+/* XCOUNT_PROFILE_FLAG can change from a inside a signal handler */
+extern volatile atomic_ulong internal_xcount;
+
+static ALWAYS_INLINE ulong get_xcount(void)
+{
+  return internal_xcount & XCOUNT_MASK;
+}
+
+static inline void set_xcount(ulong v)
+{
+  ulong old, new;
+  do
+    {
+      old = internal_xcount;
+      new = (old & XCOUNT_PROFILE_FLAG) | (v & XCOUNT_MASK);
+    }
+  while (!atomic_compare_exchange_weak(&internal_xcount, &old, new));
+}
+
 /* 'cost' are mudlle loops; helps cause error_loop */
 static inline void expensive_operation(ulong cost)
 {
-  if (cost >= xcount)
-    xcount = 1;
-  else
-    xcount -= cost;
+  ulong old = get_xcount();
+  ulong new = cost >= old ? 1 : old - cost;
+  set_xcount(new);
 }
 
-void session_start(struct session_context *newp,
+void session_start(struct session_context *context,
                    const struct session_info *info);
 void cold_session_start(struct session_context *context,
                         seclev_t maxseclevel);
@@ -354,21 +411,16 @@ void unlimited_execution(void);
 /* Global context */
 /* -------------- */
 
-void reset_context(void);
-/* Effects: Clears all contexts. Should be called with caution ...
-*/
-
 void context_init(void);
 /* Effects: Initialises module */
 
+/* call now and then to possibly reclaim some memory */
+void reset_mudlle_context(void);
+
 void set_mudlle_stack_limit(unsigned long reserved);
-
-extern struct list *mudcalltrace;
-
-void remove_call_trace(value v);
-void add_call_trace(value v, bool unhandled_only);
 
 value mjmpbuf(value *result);
 bool is_mjmpbuf(value buf);
+
 
 #endif

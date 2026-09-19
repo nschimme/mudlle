@@ -7,9 +7,7 @@ Read the COPYRIGHT file for terms of use.
 
 Installation
 ------------
-To compile this software for 32-bit x86 on Linux or OS X, just type 'make'.
-
-To compile for 64-bit x86-64 on Linux or OS X, type 'make ARCH=amd64".
+To compile for 64-bit x86-64 on Linux or macOS, just type 'make".
 
 Makefile contains a number of USE_xxx variables that can be set to
 'yes' to enable that feature. They may require additional header files.
@@ -38,7 +36,7 @@ doc/mudlle-intro.doc and doc/mudlle-ref.doc contain a somewhat out of date
 language introduction and reference. However, everything described in those
 documents should still work.
 
-A compiler is available for x86 and x86-64. To load it, type:
+A compiler is available for x86-64. To load it, type:
 
   load("xc.mud")
 

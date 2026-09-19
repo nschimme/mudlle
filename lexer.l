@@ -26,7 +26,6 @@
 %{
 #include <ctype.h>
 #include <string.h>
-#include <stdlib.h>
 #include <unistd.h>
 
 #include "calloc.h"
@@ -41,26 +40,18 @@
 
 #  include "parser.tab.h"
 
-/* We never wrap into another file */
-#define YY_SKIP_YYWRAP
-#define yywrap() (1)
-
-#define YY_USE_PROTOS
-
-#define YY_USER_ACTION do {                     \
-  yylloc.last_column += yyleng;                 \
-  yylloc.first_line = yylloc.last_line;         \
-} while (0);
+#define YY_USER_ACTION advance_location(yylloc);
 
 #define LOCATION_STEP() do {                    \
-  yylloc.first_column = yylloc.last_column;     \
+  yylloc->first.col = yylloc->last_column;      \
+  yylloc->first.pos = yylloc->last_pos;         \
+  yylloc->first.line = yylloc->last_line;       \
 } while (0)
 
 #define LOCATION_NEWLINE() do {                 \
-  yylloc.last_column = yylloc.first_column = 1; \
-  yylloc.last_line += 1;                        \
+  yylloc->last_column = 1;                      \
+  yylloc->last_line += 1;                       \
 } while (0)
-
 typedef size_t (*reader_fn)(void *ptr, size_t size, size_t nmemb,
                             FILE *stream);
 static size_t string_read(void *ptr, size_t size, size_t nmemb, FILE *stream);
@@ -70,19 +61,27 @@ static size_t string_read(void *ptr, size_t size, size_t nmemb, FILE *stream);
   (result) = lstate.reader((buf), 1, (max_size), yyin); \
 } while (0)
 
+static void loc_add(struct loc *loc, int delta)
+{
+  loc->col += delta;
+  loc->pos += delta;
+}
+
 static const char *base_name(int base);
 
 static YY_BUFFER_STATE mbuf;
 
 struct lexer_state {
   reader_fn reader;
-  bool allow_comma_expr, force_constant;
-  YYLTYPE loc;
-  struct {
-    const char *str;
-    size_t len;
-    const char *const *strs;
+  bool allow_comma_expr, track_comments;
+  int start_token;
+  struct lexer_str_state {
+    size_t cstr;                /* current index into pconfig->strs[] */
+    const char *cur;            /* current string */
+    size_t len;                 /* chars remaining in 'cur' */
   } s;
+  struct comment_list *comments;
+  const struct parser_config *pconfig;
 };
 
 static struct lexer_state lstate;
@@ -93,36 +92,60 @@ struct lkeyword {
 };
 
 static const struct lkeyword keywords[] = {
-  { "fn",       FUNCTION },
-  { "if",       KW_IF },
   { "else",     ELSE },
-  { "while",    WHILE },
   { "exit",     LOOP_EXIT },
-  { "loop",     LOOP },
+  { "fn",       FUNCTION },
   { "for",      FOR },
+  { "if",       IF_KEYWORD },
+  { "loop",     LOOP },
+  { "match!",   MATCH_FORCE },
   { "match",    MATCH },
-  { "match!",   FORCE_MATCH },
+  { "while",    WHILE },
 
+  { "defines",  DEFINES },
   { "library",  LIBRARY },
   { "module",   MODULE },
-  { "requires", REQUIRES },
   { "reads",    READS },
-  { "writes",   WRITES },
+  { "requires", REQUIRES },
   { "static",   STATIC },
-  { "defines",  DEFINES }
+  { "writes",   WRITES },
 };
 #define NKEYWORDS VLENGTH(keywords)
 
-#define UNTERMINATED_STRING() do {                                      \
-  compile_error(&cstring.loc, "unterminated %s constant",               \
-                cstring.is_char_const ? "character" : "string");        \
-  yyterminate();                                                        \
+#define STRING_START(is_char, is_triple) do {   \
+  assert(cstring.loc.fname == NULL);            \
+  cstring.loc = *LLOC_LOC(*yylloc);             \
+  cstring.is_char_const = (is_char);            \
+  cstring.is_triple_quote = (is_triple);        \
+  sb_empty(&cstring.sb);                        \
+} while (0)
+
+#define END_STRING() do {                       \
+  assert(cstring.loc.fname != NULL);            \
+  cstring.loc.fname = NULL;                     \
+} while (0)
+
+#define STRING_ERROR(...) do {                  \
+  struct loc loc = cstring.loc;                 \
+  END_STRING();                                 \
+  compile_error(&loc, __VA_ARGS__);             \
+  yyterminate();                                \
+} while (0)
+
+#define UNTERMINATED_STRING()                                   \
+  STRING_ERROR("unterminated %s constant",                      \
+                cstring.is_char_const ? "character" : "string")
+
+#define INVALID_FLOAT(msg) do {                 \
+  cstring.loc.col += sb_len(&cstring.sb);       \
+  STRING_ERROR(msg);                            \
 } while (0)
 
 static struct {
   struct strbuf sb;
   struct loc loc;
-  bool is_char_const;
+  bool is_char_const, is_triple_quote;
+  unsigned raw_delim_len;       /* length of ###" prefix */
 } cstring = { .sb = SBNULL };
 
 static struct {
@@ -130,64 +153,73 @@ static struct {
   int level;
 } ccomment;
 
-static inline int hexval(int c)
-{
-  if (isdigit(c))
-    return c - '0';
-  return toupper(c) - 'A' + 10;
-}
-
-#define lexer_error(...) compile_error(LLOC_LOC(yylloc), __VA_ARGS__)
-
-#define END_ESC_CHAR() do {                                     \
-  if (cstring.is_char_const)                                    \
-    {                                                           \
-      BEGIN(INITIAL);                                           \
-      assert(sb_len(&cstring.sb) == 1);                         \
-      yylval.integer = (unsigned char)sb_str(&cstring.sb)[0];   \
-      return INTEGER;                                           \
-    }                                                           \
-  BEGIN(STRING_CONST);                                          \
+#define lexer_error(...) do {                           \
+  compile_error(LLOC_LOC(*yylloc), __VA_ARGS__);        \
+  yyterminate();                                        \
 } while (0)
 
 #define END_FLOAT() do {                                                \
-    if (!mudlle_strtofloat(sb_str(&cstring.sb),                         \
-                           sb_len(&cstring.sb),                         \
-                           &yylval.mudlle_float))                       \
-   {                                                                    \
-     compile_error(&cstring.loc, "illegal floating-point number");      \
-     yyterminate();                                                     \
-   }                                                                    \
- BEGIN(INITIAL);                                                        \
- return FLOAT;                                                          \
+  if (!mudlle_strtofloat(sb_str(&cstring.sb),                           \
+                         sb_len(&cstring.sb),                           \
+                         &yylval->mudlle_float.d))                      \
+    STRING_ERROR("illegal floating-point number");                      \
+  END_STRING();                                                         \
+  BEGIN(INITIAL);                                                       \
+  return FLOAT;                                                         \
+} while (0)
+
+#define END_COMMENT() do {                                              \
+  if (lstate.track_comments)                                            \
+    {                                                                   \
+      struct comment_list *c = allocate(parser_heap(), sizeof *c);      \
+      *c = (struct comment_list){                                       \
+        .next  = lstate.comments,                                       \
+        .start = *LLOC_LOC(ccomment.start),                             \
+        .end   = *LLOC_LAST_LOC(*yylloc)                                \
+      };                                                                \
+      lstate.comments = c;                                              \
+    }                                                                   \
+  LOCATION_STEP();                                                      \
+  BEGIN(INITIAL);                                                       \
 } while (0)
 
 static bool check_int(const char **str, size_t len, int *base,
                       const char *type, bool *is_float,
                       const struct loc *sloc);
 
+static void advance_location(YYLTYPE *loc)
+{
+  loc->last_pos += yyleng;
+  loc->last_column += yyleng;
+}
+
 %}
 
+%option bison-locations
 %option noinput
 %option nounput
 %option noyymore
+%option noyywrap
+%option warn
 
 DIGIT           [0-9]
-NONZERO		[1-9]
-OCTDIGIT	[0-7]
-EXP		[eE][+-]?{DIGIT}+
-DECIM		\.{DIGIT}+
-HEXDIGIT	[0-9a-fA-F]
+OCTDIGIT        [0-7]
+EXP             [eE][+-]?{DIGIT}+
+HEXDIGIT        [0-9a-fA-F]
 GLOBAL_PREFIX   :
-SYMBOL_NAME     [a-zA-Z][a-zA-Z0-9$_:?!]{0,1024}
-I_BIN_TAIL	[bB][01]{0,1024}
-I_OCT_TAIL	{OCTDIGIT}{0,1024}
-I_HEX_TAIL	[xX]{HEXDIGIT}{0,1024}
-I_DEC		{NONZERO}{DIGIT}{0,1024}
-INT             ({I_DEC}|0({I_HEX_TAIL}|{I_BIN_TAIL}|{I_OCT_TAIL}))
+OPT_SYMBOL_TAIL [a-zA-Z0-9_:?!]?
+SYMBOL_NAME     [a-zA-Z][a-zA-Z0-9_:?!]{0,1024}
+USER_VAR_NAME   ([a-zA-Z0-9$][a-zA-Z0-9$_:?!]{0,1024})?
+I_BIN_TAIL      [bB][01]{0,1024}
+I_HEX_TAIL      [xX]{HEXDIGIT}{0,1024}
+I_DEC           {DIGIT}{1,1024}
+INT             ({I_DEC}|0({I_HEX_TAIL}|{I_BIN_TAIL}))
 
-/* used by read_constant() */
+%x HASH
+
 %x STRING_CONST
+%x STRING_CONST_RAW
+%x STRING_CONST_TRIPLE
 %x SC_ESC
 %x SC_NAME
 %x DEC_PERIOD
@@ -201,510 +233,617 @@ INT             ({I_DEC}|0({I_HEX_TAIL}|{I_BIN_TAIL}|{I_OCT_TAIL}))
 
 %{
   LOCATION_STEP();
-  if (lstate.force_constant)
+  if (lstate.start_token != YY_NULL)
     {
-      lstate.force_constant = false;
-      return FORCE_CONSTANT;
+      int t = lstate.start_token;
+      lstate.start_token = YY_NULL;
+      return t;
     }
 %}
 
-\n { LOCATION_NEWLINE(); }
+\n {
+  LOCATION_NEWLINE();
+  LOCATION_STEP();
+}
 [ \t\r]+  { LOCATION_STEP(); }
 "/"[/\*]? {
-          if (yyleng == 1) return '/';
-          if (yytext[1] == '*')
-            {
-              ccomment.start = yylloc;
-              ccomment.level = 1;
-              BEGIN(COMMENT);
-            }
-          else
-            BEGIN(LINE_COMMENT);
-        }
+  if (yyleng == 1) return '/';
+  ccomment.start = *yylloc;
+  ccomment.level = 1;
+  if (yytext[1] == '*')
+    BEGIN(COMMENT);
+  else
+    BEGIN(LINE_COMMENT);
+}
 
-<LINE_COMMENT><<eof>> { BEGIN(INITIAL); }
-<LINE_COMMENT>\n { LOCATION_NEWLINE(); BEGIN(INITIAL); }
 <LINE_COMMENT>.* { }
+<LINE_COMMENT><<eof>> { END_COMMENT(); }
+<LINE_COMMENT>\n {
+  LOCATION_NEWLINE();
+  END_COMMENT();
+}
 
 <COMMENT>[^/\*\n] { }
 <COMMENT>\n { LOCATION_NEWLINE(); }
 <COMMENT><<eof>> {
-          compile_error(LLOC_LOC(ccomment.start), "unterminated comment");
-          yyterminate();
-        }
+  compile_error(LLOC_LOC(ccomment.start), "unterminated comment");
+  yyterminate();
+}
 
 <COMMENT>\*\/? {
-          if (yyleng == 2 && --ccomment.level == 0)
-            BEGIN(INITIAL);
-        }
+  if (yyleng == 2 && --ccomment.level == 0)
+    END_COMMENT();
+}
 <COMMENT>\/\*? {
-          if (yyleng == 2)
-            ++ccomment.level;
-        }
+  if (yyleng == 2)
+    ++ccomment.level;
+}
 
-"&&"	{ return SC_AND; }
-"||"	{ return SC_OR; }
-"^^"    { return XOR; }
-"!"	{ return '!'; }
-"["	{ return '['; }
-"]"	{ return ']'; }
-"|"	{ return '|'; }
-";"	{ return ';'; }
-"+"	{ return '+'; }
-"-"	{ return '-'; }
-"*"	{ return '*'; }
-"%"	{ return '%'; }
-"("	{ return '('; }
-")"	{ return ')'; }
-"{"	{ return '{'; }
-"}"	{ return '}'; }
-"&"	{ return '&'; }
-"~"	{ return '~'; }
-"^"	{ return '^'; }
-"+="	{ yylval.bop = b_add;         return ASSIGN_ADD; }
-"&="	{ yylval.bop = b_bitand;      return ASSIGN_BIT_AND; }
-"|="	{ yylval.bop = b_bitor;       return ASSIGN_BIT_OR; }
-"^="	{ yylval.bop = b_bitxor;      return ASSIGN_BIT_XOR; }
-"/="	{ yylval.bop = b_divide;      return ASSIGN_DIV; }
-"*="	{ yylval.bop = b_multiply;    return ASSIGN_MUL; }
-"%="	{ yylval.bop = b_remainder;   return ASSIGN_REM; }
-"&&="	{ yylval.bop = b_sc_and;      return ASSIGN_SC_AND; }
-"||="	{ yylval.bop = b_sc_or;       return ASSIGN_SC_OR; }
-"<<="	{ yylval.bop = b_shift_left;  return ASSIGN_SHL; }
-">>="	{ yylval.bop = b_shift_right; return ASSIGN_SHR; }
-"-="	{ yylval.bop = b_subtract;    return ASSIGN_SUB; }
-"^^="	{ yylval.bop = b_xor;         return ASSIGN_XOR; }
-"="	{ return ASSIGN; }
-"=="	{ return EQ; }
-">="	{ return GE; }
-">"	{ return GT; }
-"<="	{ return LE; }
-"<"	{ return LT; }
-"!="	{ return NE; }
-"<<"	{ return SHIFT_LEFT; }
-">>"	{ return SHIFT_RIGHT; }
+[][!%&\'()*+;<=>@^_{|}~-] { return yytext[0]; }
+
+"&&"    { return LOGICAL_AND; }
+"||"    { return LOGICAL_OR; }
+"^^"    { return LOGICAL_XOR; }
+"+="    { yylval->bop = b_add;         return ASSIGN_OP; }
+"&="    { yylval->bop = b_bitand;      return ASSIGN_OP; }
+"|="    { yylval->bop = b_bitor;       return ASSIGN_OP; }
+"^="    { yylval->bop = b_bitxor;      return ASSIGN_OP; }
+"/="    { yylval->bop = b_divide;      return ASSIGN_OP; }
+"*="    { yylval->bop = b_multiply;    return ASSIGN_OP; }
+"%="    { yylval->bop = b_remainder;   return ASSIGN_OP; }
+"&&="   { yylval->bop = b_logical_and; return ASSIGN_OP; }
+"||="   { yylval->bop = b_logical_or;  return ASSIGN_OP; }
+"<<="   { yylval->bop = b_shift_left;  return ASSIGN_OP; }
+">>="   { yylval->bop = b_shift_right; return ASSIGN_OP; }
+"-="    { yylval->bop = b_subtract;    return ASSIGN_OP; }
+"^^="   { yylval->bop = b_logical_xor; return ASSIGN_OP; }
+"=="    { return EQ; }
+">="    { return GE; }
+"<="    { return LE; }
+"!="    { return NE; }
+"<<"    { return SHIFT_LEFT; }
+">>"    { return SHIFT_RIGHT; }
 "--"    { return DECREMENT; }
 "++"    { return INCREMENT; }
 
-"@"	{ return '@'; }
-"'"	{ return QUOTE; }
 "=>"    { return PATTERN_MATCH; }
-"_"     { return SINK; }
-"."{1,3} {
-          if (yyleng == 1) return '.';
-          if (yyleng == 3) return ELLIPSIS;
-          lexer_error("invalid '..' operator");
-          yyterminate();
-        }
+"."{1,4}[0-9]? {
+  int last = yytext[yyleng - 1];
+  int nperiod = yyleng;
+  if (last == '.')
+    {
+      if (nperiod == 1) return '.';
+      if (nperiod == 3) return ELLIPSIS;
+    }
+  else
+    --nperiod;
+  switch (nperiod)
+    {
+    case 1:
+      lexer_error("floating-point numbers must start with a digit");
+    case 2: lexer_error("invalid '..' operator");
+    case 4: lexer_error("invalid '....' operator");
+    default:
+      loc_add(&yylloc->first, nperiod);
+      lexer_error("'...' must be followed by whitespace before"
+                  " a digit");
+    }
+}
 
-,[ \n\t\r]? {
-          yylval.tcomma.space_suffix = (yytext[1] != 0);
-          if (yytext[1] == '\n')
-            LOCATION_NEWLINE();
-          return COMMA;
-        }
+","[ \n\t\r]? {
+  yylval->tcomma.space_suffix = (yytext[1] != 0);
+  if (yytext[1] == '\n')
+    LOCATION_NEWLINE();
+  return COMMA;
+}
 
-\?([0-9A-Za-z_][a-zA-Z0-9$_:?!]?|.)? {
-          cstring.is_char_const = true;
-          if (yyleng == 1)
-            UNTERMINATED_STRING();
+"?"([0-9A-Za-z_][a-zA-Z0-9$_:?!]?|.)? {
+  if (yyleng == 1)
+    {
+      STRING_START(true, false);
+      UNTERMINATED_STRING();
+    }
 
-          if (yyleng == 3)
-            {
-              lexer_error("invalid character constant");
-              yyterminate();
-            }
+  if (yyleng == 3)
+    lexer_error("invalid character constant");
 
-          unsigned char c = yytext[1];
-          if (c == '\\')
-            {
-              sb_empty(&cstring.sb);
-              BEGIN(SC_ESC);
-            }
-          else if (!IS_8PRINT(c))
-            {
-              int esc = 0;
-              switch (c)
-                {
+  yylval->integer.base = cstbase_char;
+
+  unsigned char c = yytext[1];
+  if (c == '\\')
+    {
+      STRING_START(true, false);
+      BEGIN(SC_ESC);
+    }
+  else if (!IS_8PRINT(c))
+    {
+      int esc = 0;
+      switch (c)
+        {
 #define _E(escchr, chr) case escchr: esc = chr; break
-                  FOR_CHAR_ESCAPES(_E, SEP_SEMI);
+          FOR_CHAR_ESCAPES(_E, SEP_SEMI);
 #undef _E
-                }
-              if (esc)
-                lexer_error("invalid character constant: use '?\\%c'", esc);
-              else
-                lexer_error("invalid character constant: use '?\\%03o'", c);
-              yyterminate();
-            }
-          else if (IS_8SPACE(c) || strchr("(){}[]\"", c) != NULL)
-            {
-              lexer_error("'?%c' must be written '?\\%c'", c, c);
-              yyterminate();
-            }
-          else
-            {
-              yylval.integer = c;
-              return INTEGER;
-            }
         }
+      if (esc)
+        lexer_error("invalid character constant: use '%s?\\%c%s'",
+                    CMARKUP(string, esc));
+      else
+        lexer_error("invalid character constant: use '?%s\\%03o%s'",
+                    CMARKUP(string, c));
+    }
+  else if (IS_8SPACE(c) || strchr("(){}[]\"", c) != NULL)
+    lexer_error("'%s?%c%s' must be written '%s?\\%c%s'",
+                CMARKUP(string, c), CMARKUP(string, c));
+  else
+    {
+      yylval->integer = (struct int_and_base){
+        .i    = c,
+        .base = cstbase_char
+      };
+      return INTEGER;
+    }
+}
 
 {INT}[0-9A-Za-z_.]? {
-          const char *s = yytext;
-          int base;
-          bool is_float;
-          if (!check_int(&s, yyleng, &base, "integer", &is_float,
-                         LLOC_LOC(yylloc)))
-            yyterminate();
+  const char *s = yytext;
+  int base;
+  bool is_float;
+  if (!check_int(&s, yyleng, &base, "integer", &is_float,
+                 LLOC_LOC(*yylloc)))
+    yyterminate();
 
-          if (!is_float)
-            {
-              if (!mudlle_strtolong(s, yytext + yyleng - s, &yylval.integer,
-                                    base, true))
-                {
-                  lexer_error("%sinteger constant out of range",
-                              base_name(base));
-                  yyterminate();
-                }
-              return INTEGER;
-            }
+  if (!is_float)
+    {
+      if (!mudlle_strtolong(s, yytext + yyleng - s, &yylval->integer.i,
+                            base, true))
+        lexer_error("%sinteger constant out of range",
+                    base_name(base));
+      yylval->integer.base = base;
+      return INTEGER;
+    }
 
-          sb_empty(&cstring.sb);
-          sb_addmem(&cstring.sb, yytext, yyleng);
-          cstring.loc = *LLOC_LOC(yylloc);
-          int last = yytext[yyleng - 1];
-          if (last == 'p' || last == 'P')
-            {
-              assert(base == 16);
-              BEGIN(FLOAT_EXP);
-            }
-          else if (last == 'e' || last == 'E')
-            {
-              assert(base == 10);
-              BEGIN(FLOAT_EXP);
-            }
-          else
-            {
-              assert(last == '.');
-              if (base == 10)
-                BEGIN(DEC_PERIOD);
-              else if (base == 16)
-                BEGIN(HEX_PERIOD);
-              else
-                abort();
-            }
-        }
+  STRING_START(false, false);
+  sb_addmem(&cstring.sb, yytext, yyleng);
+  int last = yytext[yyleng - 1];
+  yylval->mudlle_float.base = base;
+  if (last == 'p' || last == 'P')
+    {
+      assert(base == 16);
+      BEGIN(FLOAT_EXP);
+    }
+  else if (last == 'e' || last == 'E')
+    {
+      assert(base == 10);
+      BEGIN(FLOAT_EXP);
+    }
+  else
+    {
+      assert(last == '.');
+      if (base == 10)
+        BEGIN(DEC_PERIOD);
+      else if (base == 16)
+        BEGIN(HEX_PERIOD);
+      else
+        abort();
+    }
+}
 
-<DEC_PERIOD>{DIGIT}+[A-Za-z_]? {
-          sb_addmem(&cstring.sb, yytext, yyleng);
-          int last = yytext[yyleng - 1];
-          if (last == 'e' || last == 'E')
-            {
-              BEGIN(FLOAT_EXP);
-            }
-          else if (!isdigit(last))
-            {
-              cstring.loc.col += sb_len(&cstring.sb) - 1;
-              compile_error(
-                &cstring.loc,
-                "invalid suffix in floating-point constant: %c",
-                last);
-              yyterminate();
-            }
-          else
-            END_FLOAT();
-        }
+<DEC_PERIOD>{DIGIT}+[a-zA-Z$_:?!.]? {
+  sb_addmem(&cstring.sb, yytext, yyleng);
+  int last = yytext[yyleng - 1];
+  if (last == 'e' || last == 'E')
+    {
+      BEGIN(FLOAT_EXP);
+    }
+  else if (!isdigit((unsigned char)last))
+    {
+      cstring.loc.col += sb_len(&cstring.sb) - 1;
+      STRING_ERROR(
+        "invalid suffix in floating-point constant: %c",
+        last);
+    }
+  else
+    END_FLOAT();
+}
 
-<DEC_PERIOD>[^0-9] {
-          cstring.loc.col += sb_len(&cstring.sb) - 1;
-          compile_error(
-            &cstring.loc,
-            "expected digit after decimal period");
-          yyterminate();
-        }
-
-<DEC_PERIOD><<eof>> {
-          cstring.loc.col += sb_len(&cstring.sb) - 1;
-          compile_error(
-            &cstring.loc,
-            "expected digit after decimal period");
-          yyterminate();
-        }
+<DEC_PERIOD>[^0] { INVALID_FLOAT("expected digit after decimal period"); }
+<DEC_PERIOD><<eof>> { INVALID_FLOAT("expected digit after decimal period"); }
 
 <HEX_PERIOD>{HEXDIGIT}+[A-Za-z_]? {
-          sb_addmem(&cstring.sb, yytext, yyleng);
-          int last = yytext[yyleng - 1];
-          if (last == 'p' || last == 'P')
-            {
-              BEGIN(FLOAT_EXP);
-            }
-          else
-            {
-              cstring.loc.col += sb_len(&cstring.sb) - 1;
-              compile_error(
-                &cstring.loc,
-                "expected exponent in hexadecimal floating-point constant");
-              yyterminate();
-            }
-        }
+  sb_addmem(&cstring.sb, yytext, yyleng);
+  int last = yytext[yyleng - 1];
+  if (last == 'p' || last == 'P')
+    {
+      BEGIN(FLOAT_EXP);
+    }
+  else
+    {
+      cstring.loc.col += sb_len(&cstring.sb) - 1;
+      STRING_ERROR(
+        "expected exponent in hexadecimal floating-point constant");
+    }
+}
 
+<HEX_PERIOD>[^0] {
+  INVALID_FLOAT("expected hexadecimal digit after period");
+}
 <HEX_PERIOD><<eof>> {
-          cstring.loc.col += sb_len(&cstring.sb);
-          compile_error(
-            &cstring.loc,
-            "expected hexadecimal digit after period");
-          yyterminate();
-        }
+  INVALID_FLOAT("expected hexadecimal digit after period");
+}
 
 <FLOAT_EXP>[+-]?{DIGIT}{0,1024}[A-Za-z_]? {
-          sb_addmem(&cstring.sb, yytext, yyleng);
-          if (sb_len(&cstring.sb) > 1024)
-            {
-              cstring.loc.col += 1024;
-              compile_error(
-                &cstring.loc,
-                "too many characters in floating-point constant");
-              yyterminate();
-            }
-          int last = yytext[yyleng - 1];
-          if (last == '+' || last == '-')
-            {
-              cstring.loc.col += sb_len(&cstring.sb);
-              compile_error(
-                &cstring.loc,
-                "expected exponent in floating-point constant");
-              yyterminate();
-            }
-          if (!isdigit(last))
-            {
-              cstring.loc.col += sb_len(&cstring.sb);
-              compile_error(
-                &cstring.loc,
-                "invalid suffix in floating-point constant: %c", last);
-              yyterminate();
-            }
-          END_FLOAT();
-        }
+  sb_addmem(&cstring.sb, yytext, yyleng);
+  if (sb_len(&cstring.sb) > 1024)
+    {
+      cstring.loc.col += 1024;
+      STRING_ERROR("too many characters in floating-point constant");
+    }
+  int last = yytext[yyleng - 1];
+  if (last == '+' || last == '-')
+    {
+      cstring.loc.col += sb_len(&cstring.sb);
+      STRING_ERROR("expected exponent in floating-point constant");
+    }
+  if (!isdigit((unsigned char)last))
+    {
+      cstring.loc.col += sb_len(&cstring.sb);
+      STRING_ERROR(
+        "invalid suffix in floating-point constant: %c", last);
+    }
+  END_FLOAT();
+}
 
+<FLOAT_EXP>[^0] {
+  INVALID_FLOAT("expected exponent in floating-point constant");
+}
 <FLOAT_EXP><<eof>> {
-          cstring.loc.col += sb_len(&cstring.sb);
-          compile_error(
-            &cstring.loc,
-            "expected exponent in floating-point constant");
-          yyterminate();
-        }
+  INVALID_FLOAT("expected exponent in floating-point constant");
+}
 
-\#(arith|[bB](\[|-?{INT}?[0-9A-Za-z_]?))? {
-	  if (yyleng == 1)
-            {
-              yylloc.first_column += yyleng;
-              lexer_error("# must be followed by \"b\" (bigint) or \"arith\"");
-              yyterminate();
-            }
+"#" { BEGIN(HASH); }
 
-          if (toupper(yytext[1]) != 'B')
-              return ARITH;
+<HASH>"arith"{OPT_SYMBOL_TAIL} {
+  BEGIN(INITIAL);
+  if (yyleng != 5) goto bad_hash;
+  return ARITH;
+}
 
-          if (!yytext[2])
-            {
-              yylloc.first_column += yyleng;
-              lexer_error("#%c must be followed by a bigint constant",
-                          yytext[1]);
-              yyterminate();
-            }
+<HASH>[bB](\[|-?{INT}?[0-9A-Za-z_]?) {
+  BEGIN(INITIAL);
 
-          const char *s = yytext + 2;
-          bool neg = *s == '-';
-          if (neg) ++s;
-          int base;
-          struct loc loc = *LLOC_LOC(yylloc);
-          loc.col += s - yytext;
-          if (!check_int(&s, yytext + yyleng - s, &base, "bigint", NULL, &loc))
-            yyterminate();
-          size_t sz = yytext + yyleng - s + 1;
-          yylval.bigint = allocate(parser_memory, sizeof *yylval.bigint + sz);
-          strcpy(yylval.bigint->str, s);
-          yylval.bigint->base = base;
-          yylval.bigint->neg = neg;
-	  return BIGINT;
-        }
+  if (!yytext[1])
+    {
+      loc_add(&yylloc->first, yyleng);
+      lexer_error("#%c must be followed by a bigint constant",
+                  yytext[0]);
+    }
 
-\"	{
-          sb_empty(&cstring.sb);
-          cstring.loc = *LLOC_LOC(yylloc);
-          cstring.is_char_const = false;
-          BEGIN(STRING_CONST);
-        }
+#ifdef USE_GMP
+  const char *s = yytext + 1;
+  bool neg = *s == '-';
+  if (neg) ++s;
+  int base;
+  struct loc loc = *LLOC_LOC(*yylloc);
+  loc.col += s - yytext;
+  if (!check_int(&s, yytext + yyleng - s, &base, "bigint", NULL, &loc))
+    yyterminate();
+  size_t sz = yytext + yyleng - s + 1;
+  yylval->bigint = allocate(parser_heap(), sizeof *yylval->bigint + sz);
+  yylval->bigint->base = base;
+  yylval->bigint->neg  = neg;
+  memcpy(yylval->bigint->str, s, sz);
+  return BIGINT;
+#else   /* ! USE_GMP */
+  lexer_error("bigints are not supported");
+#endif  /* ! USE_GMP */
+}
+
+<HASH>"gone"{OPT_SYMBOL_TAIL} {
+  BEGIN(INITIAL);
+  if (yyleng != 4) goto bad_hash;
+  return HASH_GONE;
+}
+<HASH>r[ow]{OPT_SYMBOL_TAIL} {
+  BEGIN(INITIAL);
+  if (yyleng != 2) goto bad_hash;
+  yylval->rwmode = yytext[1] == 'o' ? rwmode_ro : rwmode_rw;
+  return yytext[1] == 'o' ? HASH_RO : HASH_RW;
+}
+<HASH>"im"{OPT_SYMBOL_TAIL} {
+  BEGIN(INITIAL);
+  if (yyleng != 2) goto bad_hash;
+  yylval->rwmode = rwmode_im;
+  return HASH_IM;
+}
+<HASH><<eof>> { goto bad_hash; }
+<HASH>. {
+ bad_hash:
+  lexer_error("# must be followed by \"arith\", \"b\" (bigint),"
+              " \"gone\", \"im\", \"ro\", or \"rw\"");
+}
+
+r#{0,256}[#\"] {
+  CASSERT(MAX_RAW_STRING_HASHES == 256);
+  if (yytext[yyleng - 1] != '"')
+    {
+      loc_add(&yylloc->first, yyleng);
+      if (yyleng == 1 + MAX_RAW_STRING_HASHES + 1)
+        lexer_error("raw string delimeters can have at most %d '#'"
+                    " characters", MAX_RAW_STRING_HASHES);
+      lexer_error("missing '\"' in raw string delimeter");
+    }
+  STRING_START(false, false);
+  cstring.raw_delim_len = yyleng - 1;
+  BEGIN(STRING_CONST_RAW);
+}
+
+\"{1,7} {
+  if (yyleng > 6)
+    {
+      loc_add(&yylloc->first, 6);
+      lexer_error("closing triple-quote must not be followed by"
+                  " another double quote");
+    }
+  if (yyleng == 2 || yyleng == 6)
+    {
+      yylval->string = CSTRLEN("");
+      return STRING;
+    }
+  if (yyleng > 3)
+    {
+      loc_add(&yylloc->first, 3);
+      lexer_error("leading double quote inside triple-quoted string"
+                  " must be escaped");
+    }
+  assert(yyleng == 1 || yyleng == 3);
+  STRING_START(false, yyleng > 1);
+  if (cstring.is_triple_quote)
+    BEGIN(STRING_CONST_TRIPLE);
+  else
+    BEGIN(STRING_CONST);
+}
 
 <STRING_CONST>\" {
-          BEGIN(INITIAL);
-          size_t len = sb_len(&cstring.sb);
-          yylval.string.len = len;
-          yylval.string.str = allocate(parser_memory, len);
-          memcpy(yylval.string.str, sb_str(&cstring.sb), len);
-          if (len > 512)
-            sb_free(&cstring.sb);
-          return STRING;
-        }
+ finish_string: ;
+  size_t len = sb_len(&cstring.sb);
+  yylval->string.len = len;
+  char *sbuf = allocate(parser_heap(), len);
+  memcpy(sbuf, sb_str(&cstring.sb), len);
+  yylval->string.str = sbuf;
+  if (len > 512)
+    sb_free(&cstring.sb);
+  yylloc->first = cstring.loc;
+  END_STRING();
+  BEGIN(INITIAL);
+  return STRING;
+}
 
-<STRING_CONST>[^\n\\\"]+ {
-          sb_addmem(&cstring.sb, yytext, yyleng);
-          if (sb_len(&cstring.sb) > MAX_STRING_SIZE)
-            {
-              lexer_error("string length exceeds %ld characters",
-                          (long)MAX_STRING_SIZE);
-              yyterminate();
-            }
-        }
+<STRING_CONST,STRING_CONST_TRIPLE>[^\n\\\"]+ {
+  sb_addmem(&cstring.sb, yytext, yyleng);
+  if (sb_len(&cstring.sb) > MAX_STRING_SIZE)
+    lexer_error("string length exceeds %s%ld%s characters",
+                CMARKUP(number, (long)MAX_STRING_SIZE));
+}
 
-<STRING_CONST,SC_NAME>\n { UNTERMINATED_STRING(); }
+<STRING_CONST>\n { UNTERMINATED_STRING(); }
 
-<STRING_CONST,SC_NAME,SC_ESC><<eof>> { UNTERMINATED_STRING(); }
+<STRING_CONST,STRING_CONST_RAW,STRING_CONST_TRIPLE,SC_NAME,SC_ESC><<eof>> {
+  UNTERMINATED_STRING();
+}
 
-<STRING_CONST>\\ { BEGIN(SC_ESC); }
+<STRING_CONST_TRIPLE,STRING_CONST_RAW>\n {
+  sb_addc(&cstring.sb, '\n');
+  LOCATION_NEWLINE();
+}
+
+<STRING_CONST_TRIPLE>\"{1,4} {
+  if (yyleng > 3)
+    {
+      LOCATION_STEP();
+      lexer_error("closing triple-quote must not be followed by"
+                  " another double quote");
+    }
+  if (yyleng == 3)
+    goto finish_string;
+  sb_addmem(&cstring.sb, yytext, yyleng);
+}
+
+<STRING_CONST_RAW>\"#{0,257} {
+  CASSERT(MAX_RAW_STRING_HASHES == 256);
+  if (yyleng < (int)cstring.raw_delim_len)
+    sb_addmem(&cstring.sb, yytext, yyleng);
+  else if (yyleng > (int)cstring.raw_delim_len)
+    {
+      LOCATION_STEP();
+      loc_add(&yylloc->first, cstring.raw_delim_len - yyleng);
+      lexer_error("extra '#' in raw string terminator");
+    }
+  else
+    goto finish_string;
+}
+
+<STRING_CONST_RAW>[^\n\"]{1,1024} {
+  sb_addmem(&cstring.sb, yytext, yyleng);
+  if (sb_len(&cstring.sb) > MAX_STRING_SIZE)
+    lexer_error("string length exceeds %s%ld%s characters",
+                CMARKUP(number, (long)MAX_STRING_SIZE));
+}
+
+<STRING_CONST,STRING_CONST_TRIPLE>\\ { BEGIN(SC_ESC); }
 
 <SC_ESC>\n {
-          if (cstring.is_char_const)
-            UNTERMINATED_STRING();
-          END_ESC_CHAR();
-          LOCATION_NEWLINE();
-        }
+  if (cstring.is_char_const)
+    UNTERMINATED_STRING();
+  LOCATION_NEWLINE();
+
+ end_esc_char:
+  if (cstring.is_char_const)
+    {
+      END_STRING();
+      BEGIN(INITIAL);
+      assert(sb_len(&cstring.sb) == 1);
+      yylval->integer.i = (unsigned char)sb_str(&cstring.sb)[0];
+      return INTEGER;
+    }
+  if (cstring.is_triple_quote)
+    BEGIN(STRING_CONST_TRIPLE);
+  else
+    BEGIN(STRING_CONST);
+}
 
 <SC_ESC>N\{? {
-          if (yytext[1] != '{')
-            {
-              lexer_error("\\N must be followed by left curly bracket ({)");
-              yyterminate();
-            }
-          BEGIN(SC_NAME);
-        }
+  if (yytext[1] != '{')
+    {
+      LOCATION_STEP();
+      lexer_error("\\N must be followed by left curly bracket ({)");
+    }
+  BEGIN(SC_NAME);
+}
 
-<SC_NAME>[- A-Z]{0,1024}[^\n]? {
-          int last = yytext[yyleng - 1];
-          if (last != '}')
-            {
-              yylloc.first_column = yylloc.last_column - 1;
-              if (yyleng > 1024)
-                {
-                  lexer_error("too long character name");
-                  yyterminate();
-                }
-              else if (isupper(last) || last == '-' || last == ' ')
-                {
-                  ++yylloc.first_column;
-                  lexer_error("unterminated character name");
-                }
-              else if (isprint(last) && !isspace(last))
-                lexer_error("invalid character in character name: %c", last);
-              else
-                lexer_error("invalid%s character in character name: \\x%02x",
-                          isspace(last) ? " space" : "", last);
-              yyterminate();
-            }
-          int c = lookup_named_character(yytext, yyleng - 1);
-          if (c < 0)
-            {
-              lexer_error("unknown named character");
-              yyterminate();
-            }
-          sb_addc(&cstring.sb, c);
-          END_ESC_CHAR();
+<SC_NAME>[- A-Z]{0,1024}[^A]? {
+  unsigned char last = yytext[yyleng - 1];
+  if (last != '}')
+    {
+      LOCATION_STEP();
+      loc_add(&yylloc->first, -1);
+      if (yyleng > 1024)
+        lexer_error("too long character name");
+      else if (isupper(last) || last == '-' || last == ' '
+               || last == '\n')
+        {
+          loc_add(&yylloc->first, 1);
+          lexer_error("unterminated character name");
         }
+      else if (isprint(last) && !isspace(last))
+        lexer_error("invalid character in character name: %c", last);
+      else
+        lexer_error("invalid%s character in character name: \\x%02x",
+                    isspace(last) ? " space" : "", last);
+    }
+  int c = lookup_named_character(yytext, yyleng - 1);
+  if (c < 0)
+    {
+      LOCATION_STEP();
+      loc_add(&yylloc->first, -yyleng);
+      lexer_error("unknown named character");
+    }
+  yylval->integer.base = cstbase_named_char;
+  sb_addc(&cstring.sb, c);
+  goto end_esc_char;
+}
 
 <SC_ESC>{OCTDIGIT}{1,3}[a-zA-Z0-9$_:?!]? {
-          int last = yytext[yyleng - 1];
-          /* check for invalid next character for octal constants */
-          if ((last < '0' || last > '7') || yyleng > 3)
-            {
-              if (cstring.is_char_const)
-                {
-                  yylloc.first_column = yylloc.last_column;
-                  lexer_error("invalid character constant");
-                  yyterminate();
-                }
-              --yyleng;
-            }
-          else
-            last = 0;
-          int val = 0;
-          for (int i = 0; i < yyleng; ++i)
-            val = val * 8 + yytext[i] - '0';
-          if (val > 255)
-            {
-              lexer_error("invalid octal character: \\%03o", val);
-              yyterminate();
-            }
-          sb_addc(&cstring.sb, val);
-          if (last)
-            sb_addc(&cstring.sb, last);
-          END_ESC_CHAR();
+  int last = yytext[yyleng - 1];
+  /* check for invalid next character for octal constants */
+  if ((last < '0' || last > '7') || yyleng > 3)
+    {
+      if (cstring.is_char_const)
+        {
+          LOCATION_STEP();
+          lexer_error("invalid character constant");
         }
+      --yyleng;
+    }
+  else
+    last = 0;
+  int val = 0;
+  for (int i = 0; i < yyleng; ++i)
+    val = val * 8 + yytext[i] - '0';
+  if (val > 255)
+    {
+      LOCATION_STEP();
+      loc_add(&yylloc->first, -yyleng - 1);
+      lexer_error("invalid octal character: \\%03o", val);
+    }
+  sb_addc(&cstring.sb, val);
+  if (last)
+    sb_addc(&cstring.sb, last);
+  goto end_esc_char;
+}
 
 <SC_ESC>x{HEXDIGIT}{0,2}[a-zA-Z0-9$_:?!] {
-          if (yyleng < 3 || !isxdigit(yytext[2])
-              || (yyleng == 4 && cstring.is_char_const))
-            {
-              lexer_error("invalid hexadecimal character constant");
-              yyterminate();
-            }
-          sb_addc(&cstring.sb, hexval(yytext[1]) * 16 + hexval(yytext[2]));
-          if (yyleng == 4)
-            sb_addc(&cstring.sb, yytext[3]);
-          END_ESC_CHAR();
-        }
+  int d2 = -1;
+  if (yyleng >= 3)
+    d2 = xdigit_val(yytext[2]);
+  if (d2 < 0 || d2 > 15 || (yyleng == 4 && cstring.is_char_const))
+    {
+      LOCATION_STEP();
+      loc_add(&yylloc->first, -yyleng - 1);
+      lexer_error("invalid hexadecimal character constant");
+    }
+  int d1 = xdigit_val(yytext[1]);
+  assert(d1 >= 0);
+  sb_addc(&cstring.sb, (d1 << 4) + d2);
+  if (yyleng == 4)
+    sb_addc(&cstring.sb, yytext[3]);
+  goto end_esc_char;
+}
 
 <SC_ESC>([A-Za-z_][a-zA-Z0-9$_:?!]?|.) {
-          if (yyleng == 2 && cstring.is_char_const)
-            {
-              lexer_error("invalid character constant");
-              yyterminate();
-            }
-          int c = yytext[0];
-          switch (c)
-            {
+  if (yyleng == 2 && cstring.is_char_const)
+    {
+      LOCATION_STEP();
+      lexer_error("invalid character constant");
+    }
+  int c = yytext[0];
+  switch (c)
+    {
+    case 'x':
+      LOCATION_STEP();
+      lexer_error("invalid hexadecimal character constant");
 #define _E(escchr, chr) case chr: c = escchr; break
-              FOR_CHAR_ESCAPES(_E, SEP_SEMI);
+      FOR_CHAR_ESCAPES(_E, SEP_SEMI);
 #undef _E
-            }
-          sb_addc(&cstring.sb, c);
-          if (yyleng == 2)
-            sb_addc(&cstring.sb, yytext[1]);
-          END_ESC_CHAR();
-        }
+    }
+  sb_addc(&cstring.sb, c);
+  if (yyleng == 2)
+    sb_addc(&cstring.sb, yytext[1]);
+  goto end_esc_char;
+}
+
+"$"{USER_VAR_NAME} {
+  if (!lstate.pconfig->user_syms)
+    goto bad_char;
+
+  if (yyleng > MAX_VARIABLE_LENGTH)
+    lexer_error("symbol name exceeds %s%d%s characters",
+                CMARKUP(number, MAX_VARIABLE_LENGTH));
+
+  size_t size = yyleng + 1;
+  char *sym = allocate(parser_heap(), size);
+  memcpy(sym, yytext, size);
+  yylval->symbol = sym;
+  return SYMBOL;
+}
 
 {GLOBAL_PREFIX}?{SYMBOL_NAME} {
-          for (int i = 0; i < NKEYWORDS; i++)
-            if (strcasecmp(yytext, keywords[i].name) == 0)
-              return keywords[i].value;
+  for (size_t i = 0; i < NKEYWORDS; i++)
+    if (strcasecmp(yytext, keywords[i].name) == 0)
+      return keywords[i].value;
 
-          size_t len = yyleng;
-          bool is_global = strncmp(yytext, GLOBAL_ENV_PREFIX,
-                                   strlen(GLOBAL_ENV_PREFIX)) == 0;
-          if (is_global)
-            len -= strlen(GLOBAL_ENV_PREFIX);
+  size_t len = yyleng;
+  if (is_global_var_name(yytext))
+    len -= strlen(GLOBAL_ENV_PREFIX);
 
-          if (len > MAX_VARIABLE_LENGTH)
-            {
-              lexer_error("symbol name exceeds %d characters",
-                          MAX_VARIABLE_LENGTH);
-              yyterminate();
-            }
+  if (len > MAX_VARIABLE_LENGTH)
+    lexer_error("symbol name exceeds %s%d%s characters",
+                CMARKUP(number, MAX_VARIABLE_LENGTH));
 
-          size_t size = yyleng + 1;
-          char *sym = allocate(parser_memory, size);
-          memcpy(sym, yytext, size);
-          yylval.symbol = sym;
-          return is_global ? GLOBAL_SYMBOL : SYMBOL;
-        }
+  size_t size = yyleng + 1;
+  char *sym = allocate(parser_heap(), size);
+  memcpy(sym, yytext, size);
+  yylval->symbol = sym;
+  return SYMBOL;
+}
 
-.	{
-          unsigned char c = yytext[0];
-          if (isprint(c))
-            lexer_error("bad character %c (%#02x)", c, c);
-          else
-            lexer_error("bad character %#02x", c);
-          yyterminate();
-        }
-
+. {
+ bad_char: ;
+  unsigned char c = yytext[0];
+  if (isprint(c))
+    lexer_error("bad character %c (0x%02x)", c, c);
+  else
+    lexer_error("bad character 0x%02x", c);
+}
 
 %%
 
@@ -821,7 +960,7 @@ static bool check_int(const char **str, size_t len, int *base,
   if (b == 0)
     {
       lastp = s;
-      if (!isdigit(*lastp))
+      if (!isdigit((unsigned char)*lastp))
         goto invalid_last;
       b = 10;
     }
@@ -838,7 +977,7 @@ static bool check_int(const char **str, size_t len, int *base,
     }
 
   if (b == 16
-      ? !isxdigit(*lastp)
+      ? !isxdigit((unsigned char)*lastp)
       : *lastp < '0' || *lastp >= '0' + b)
     goto invalid_last;
 
@@ -849,11 +988,11 @@ static bool check_int(const char **str, size_t len, int *base,
  invalid_last:
   loc = *sloc;
   loc.col += lastp + len - end;
-  compile_error(&loc, "invalid %s in %s%s constant: %c",
-                (isdigit(*lastp)
+  compile_error(&loc, "invalid %s in %s%s constant: %s%c%s",
+                (isdigit((unsigned char)*lastp)
                  ? "digit"
                  : b == 0 ? "leading character" : "character"),
-                base_name(b), type, *lastp);
+                base_name(b), type, CMARKUP(string, *lastp));
   return false;
 
  incomplete:
@@ -870,23 +1009,29 @@ static size_t string_read(void *ptr, size_t size, size_t nmemb, FILE *stream)
   size_t total = 0;
   for (;;)
     {
-      if (lstate.s.str == NULL)
+      if (lstate.s.cstr == lstate.pconfig->nstrs)
         return total;
 
-      size_t cnt = (lstate.s.len < max_size
-                    ? lstate.s.len
-                    : max_size);
-      memcpy(dst, lstate.s.str, cnt);
+      size_t cnt = MIN(lstate.s.len, max_size);
+      memcpy(dst, lstate.s.cur, cnt);
       max_size -= cnt;
-      lstate.s.str += cnt;
+      lstate.s.cur += cnt;
       lstate.s.len -= cnt;
       total += cnt;
       if (max_size == 0)
         return total;
       dst += cnt;
 
-      lstate.s.str = *++lstate.s.strs;
-      lstate.s.len = lstate.s.str ? strlen(lstate.s.str) : 0;
+      if (++lstate.s.cstr == lstate.pconfig->nstrs)
+        {
+          lstate.s.cur = NULL;
+          lstate.s.len = 0;
+        }
+      else
+        {
+          lstate.s.cur = lstate.pconfig->strs[lstate.s.cstr].str;
+          lstate.s.len = lstate.pconfig->strs[lstate.s.cstr].len;
+        }
     }
 }
 
@@ -895,77 +1040,52 @@ bool allow_comma_expression(void)
   return lstate.allow_comma_expr;
 }
 
-void save_reader_state(struct reader_state *state)
+void set_lex_config(const struct parser_config *pconfig)
 {
-  *state = (struct reader_state){
-    .data = malloc(sizeof *state->data)
-  };
-  *state->data = lstate;
-  state->data->loc = yylloc;
-  lstate = (struct lexer_state){ 0 };
-  yylloc = (YYLTYPE){ 0 };
-}
+  if (pconfig == NULL)
+    {
+      lstate.pconfig = NULL;
+      return;
+    }
 
-void restore_reader_state(struct reader_state *state)
-{
-  yylloc = state->data->loc;
-  lstate = *state->data;
-  free(state->data);
-  *state = (struct reader_state){ 0 };
-}
-
-static void init_reader(FILE *f, const struct filename *fname,
-                        bool force_const, reader_fn reader)
-{
-  assert(lstate.reader == NULL);
-  assert(reader != NULL);
-  assert(fname != NULL);
+  assert(lstate.pconfig == NULL);
 
   if (mbuf == NULL)
     {
-      mbuf = yy_create_buffer(f, YY_BUF_SIZE);
+      mbuf = yy_create_buffer(pconfig->f, YY_BUF_SIZE);
       yy_switch_to_buffer(mbuf);
     }
   else
-    yyrestart(f);
+    yyrestart(pconfig->f);
+
+  static const int start_tokens[] = {
+    [parser_mode_file]         = YY_NULL,
+    [parser_mode_constant]     = START_CONSTANT,
+    [parser_mode_storable]     = START_STORABLE,
+    [parser_mode_any_expr]     = START_ANY_EXPR,
+    [parser_mode_primary_expr] = START_PRIMARY_EXPR,
+    [parser_mode_paren_expr]   = START_PAREN_EXPR,
+  };
+  assert(pconfig->pmode >= 0 && pconfig->pmode < VLENGTH(start_tokens));
 
   lstate = (struct lexer_state){
-    .reader           = reader,
-    .force_constant   = force_const,
-    .allow_comma_expr = !force_const
+    .reader           = pconfig->f == NULL ? string_read : fread,
+    .start_token      = start_tokens[pconfig->pmode],
+    .allow_comma_expr = (pconfig->pmode != parser_mode_constant
+                         && pconfig->pmode != parser_mode_storable),
+    .track_comments   = pconfig->comments,
+    .pconfig          = pconfig,
+    .s = {
+      .cur   = pconfig->nstrs == 0 ? NULL : pconfig->strs[0].str,
+      .len   = pconfig->nstrs == 0 ? 0 : pconfig->strs[0].len
+    }
   };
 
-  yylloc = (YYLTYPE){
-    .first_column = 1,
-    .first_line   = 1,
-    .last_column  = 1,
-    .last_line    = 1,
-    .fname        = fname
-  };
-}
-
-void read_from_file(FILE *f, const struct filename *fname)
-{
-  init_reader(f, fname, false, fread);
-
+  cstring.loc = (struct loc)INIT_LOC;
   BEGIN(INITIAL);
 }
 
-void read_from_strings(const char *const *strs, const struct filename *fname,
-                       bool force_const)
+struct comment_list *lexer_comments(void)
 {
-  assert(fname != NULL);
-  init_reader(NULL, fname, force_const, string_read);
-
-  lstate.s.strs = strs;
-  lstate.s.str  = *strs;
-  lstate.s.len  = strlen(lstate.s.str);
-  BEGIN(INITIAL);
-}
-
-const struct loc *lexer_location(void)
-{
-  static struct loc loc;
-  loc = *LLOC_LOC(yylloc);
-  return &loc;
+  return lstate.comments;
 }

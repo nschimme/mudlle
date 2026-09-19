@@ -22,14 +22,13 @@
 #ifndef RUNTIME_SYMBOL_H
 #define RUNTIME_SYMBOL_H
 
-#include "../error.h"
-#include "../types.h"
 
-struct table;
+extern const struct prim_op *const table_set_ext;
 
-
-value code_table_ref(struct table *tab, struct string *s);
-value code_table_set(struct table *tab, struct string *s, value c);
+value table_ref(struct table *table, struct string *s,
+                const struct prim_op *op);
+value do_table_set(struct table *table, struct string *s, value x,
+                   const struct prim_op *op);
 value code_symbol_set(struct symbol *s, value val);
 
 struct symbol *table_symbol_ref(struct table *table, struct string *s,

@@ -22,13 +22,7 @@
 #include "mudlle-config.h"
 
 #include <errno.h>
-#include <fcntl.h>
-#include <setjmp.h>
-#include <stddef.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 
 #include <netinet/in.h>
 
@@ -36,16 +30,23 @@
 
 #include "alloc.h"
 #include "assoc.h"
-#include "builtins.h"
-#include "context.h"
 #include "dwarf.h"
+#include "jitdump.h"
 #include "mvalgrind.h"
+#include "profile.h"
 #include "table.h"
 #include "utils.h"
 
-#include "runtime/basic.h"
-#include "runtime/runtime.h"
 
+struct weak_ref {
+  struct weak_ref *next;
+  struct obj *obj;
+  void *cbdata;
+  weak_ref_free_fn cbfree;
+};
+
+/* List of all weak refs */
+static struct weak_ref *weak_refs;
 
 /* A semi-generational GC:
    - is copying for mutable data
@@ -101,6 +102,16 @@
    that the mcode field is aligned on a multiple of CODE_ALIGNMENT */
 #define MCODE_OFFSET PADDING(offsetof(struct mcode, mcode), CODE_ALIGNMENT)
 
+/* adds 'bytes' bytes to pointer 'ptr' */
+#define PTRADD(ptr, bytes)                                              \
+  _Generic((ptr),                                                       \
+           /* add new types as needed */                                \
+           uint64_t *:   (uint64_t *)((ulong)(ptr) + (bytes)),          \
+           struct obj *: (struct obj *)((ulong)(ptr) + (bytes)))
+
+#define PTR_IN_RANGE(ptr, start, end)                           \
+  ((uint8_t *)(ptr) >= (start) && (uint8_t *)(ptr) < (end))
+
 /* Roots */
 struct gcpro *gcpro;		/* Local (C) variables which need protection */
 
@@ -115,7 +126,7 @@ static struct gc_root {
   value *data;
 } roots[MAXROOTS];
 
-static ulong last_root;
+static ulong static_roots_used;
 
 union free_obj {
   struct grecord g;
@@ -127,9 +138,10 @@ CASSERT(offsetof(union free_obj, next)
 #define FREE_SIZES 12
 static union free_obj *free_lists[FREE_SIZES];
 
-enum {
-  nomem_grow_memory = 1,
-  nomem_out_of_memory
+enum gcmem_result {
+  gcmem_success = 0,
+  gcmem_grow_memory,
+  gcmem_out_of_memory
 };
 static bool alloc_can_fail;     /* if true, gc_reserve() may longjmp() */
 static sigjmp_buf nomem;
@@ -142,7 +154,12 @@ static void save_restore(struct obj *obj);
 #ifndef NOCOMPILER
 static void scan_mcode(struct mcode *code);
 #endif
-static void flush_icache(uint8_t *from, uint8_t *to);
+static void flush_icache(const uint8_t *from, const uint8_t *to);
+
+static struct weak_ref *minor_forward_weak_refs(void);
+static struct weak_ref *major_forward_weak_refs(void);
+
+static void free_weak_refs(struct weak_ref *node);
 
 static struct assoc_array static_data_table = {
   .type = &long_to_voidp_assoc_array_type
@@ -155,12 +172,7 @@ static void free_static_data_table(void)
 
 static ulong *static_data(struct obj *obj)
 {
-  ulong *r = (ulong *)assoc_array_lookup_ref(&static_data_table, obj);
-  if (r != NULL)
-    return r;
-
-  assoc_array_set(&static_data_table, obj, NULL);
-  return (ulong *)assoc_array_lookup_ref(&static_data_table, obj);
+  return (ulong *)assoc_array_force_ref(&static_data_table, obj);
 }
 
 static inline ulong htonlong(ulong l)
@@ -168,7 +180,7 @@ static inline ulong htonlong(ulong l)
 #ifdef WORDS_BIGENDIAN
   return l;
 #else
-  CASSERT_EXPR(sizeof l == 4 || sizeof l == 8);
+  CASSERT(sizeof l == 4 || sizeof l == 8);
   if (sizeof l == 4)
     return htonl(l);
   /* __builtin_bswap64() is available in GCC versions 4.3 and later */
@@ -184,11 +196,11 @@ static inline ulong ntohlong(ulong l)
 void internal_staticpro(void *pro, const char *desc, const char *file,
                         int line)
 {
-  assert(last_root < MAXROOTS);
+  assert(static_roots_used < MAXROOTS);
 
   if (*desc == '&')
     ++desc;
-  roots[last_root++] = (struct gc_root){
+  roots[static_roots_used++] = (struct gc_root){
     .data = pro,
     .desc = desc,
     .file = file,
@@ -218,9 +230,9 @@ struct list *get_dynpro_data(void)
 
 struct vector *get_staticpro_data(void)
 {
-  struct vector *res = alloc_vector(last_root);
+  struct vector *res = alloc_vector(static_roots_used);
   GCPRO(res);
-  for (int i = 0; i < last_root; ++i)
+  for (size_t i = 0; i < static_roots_used; ++i)
     {
       struct vector *v = alloc_vector(4);
       v->data[2] = makeint(roots[i].line);
@@ -254,47 +266,49 @@ void internal_dynpro(struct dynpro *what, value obj, const char *file,
   dynpro_head.next = what;
 }
 
-void undynpro(struct dynpro *what)
+void internal_undynpro(struct dynpro *what, const char *file, int lineno)
 {
   what->prev->next = what->next;
   what->next->prev = what->prev;
-  *what = (struct dynpro){ 0 };
+  *what = (struct dynpro){ .file = file, .lineno = lineno };
 }
 
-void maybe_dynpro(struct dynpro *what, value obj)
+void internal_maybe_dynpro(struct dynpro *what, value obj,
+                           const char *file, int lineno)
 {
-  if (staticp(obj))
+  if (staticp(what->obj))
     {
       assert(what->next == NULL && what->prev == NULL);
-      GCCHECK(obj);
-      what->obj = obj;
+      if (!staticp(obj))
+        {
+          internal_dynpro(what, obj, file, lineno);
+          return;
+        }
     }
   else
-    dynpro(what, obj);
-}
-
-void maybe_undynpro(struct dynpro *what)
-{
-  if (!staticp(what->obj))
     {
-      what->prev->next = what->next;
-      what->next->prev = what->prev;
+      assert(what->next != NULL && what->prev != NULL);
+      if (staticp(obj))
+        undynpro(what);
     }
-  *what = (struct dynpro){ 0 };
+  GCCHECK(obj);
+  what->obj    = obj;
+  what->file   = file;
+  what->lineno = lineno;
 }
 
 struct dynpro *internal_protect(value v, const char *file, int lineno)
 {
-  struct dynpro *newp = xmalloc(sizeof *newp);
+  struct dynpro *newp = malloc(sizeof *newp);
   *newp = (struct dynpro){ 0 };
   internal_dynpro(newp, v, file, lineno);
   return newp;
 }
 
-value unprotect(struct dynpro *pro)
+value internal_unprotect(struct dynpro *pro, const char *file, int lineno)
 {
   value v = pro->obj;
-  undynpro(pro);
+  internal_undynpro(pro, file, lineno);
   free(pro);
   return v;
 }
@@ -310,11 +324,11 @@ ulong gcblocksize;
 /* Memory for generation 0 extends from startgen0 to endgen0. Allocation
    is downward, with posgen0 pointing at the start of the last allocation.
 */
-extern uint8_t *startgen0, *endgen0; /* used by x86builtins.S */
+extern uint8_t *endgen0;        /* used by x64builtins.S */
 uint8_t *startgen0, *endgen0, *posgen0;
 static ulong minor_offset, save_offset;
 
-static struct ary mcode_ary;    /* currently seen mcode objects */
+static struct mcode_array mcode_array; /* currently seen mcode objects */
 
 /* During GC, the newstart0, newend0, newpos0 variables fulfill the same roles
    for the next copy of generation 0
@@ -345,7 +359,7 @@ static bool newarea;		/* true during new_major_collection */
 static ulong major_offset;
 static bool saw_mcode;		/* true if forwarded an mcode object */
 
-static gc_forward_fn special_forward;
+static gc_forward_fn special_forward_obj;
 
 #ifdef GCDEBUG
 ulong minorgen, majorgen;
@@ -357,28 +371,35 @@ static ulong newminorgen, newmajorgen;
 struct gcstats gcstats;
 
 #ifdef GCQDEBUG
-static ulong maxobjsize = 1024; /* biggest object created (ignores stuff done
-				   by compiler, but those aren't big) */
-
 static unsigned allowed_obj_flags = OBJ_READONLY | OBJ_IMMUTABLE;
 
 void gccheck_qdebug(value x)
 {
   if (!pointerp(x))
     return;
-  assert(~(long)x & 2);
+  assert(((ulong)x & (sizeof (value) - 1)) == 0);
   struct obj *o = x;
-  assert(!((o->size > maxobjsize
+  assert(!((o->size > MAX_MUDLLE_OBJECT_SIZE
             && o->garbage_type != garbage_forwarded)
            || o->size < sizeof *o
            || o->garbage_type >= garbage_free
-           || o->type >= last_type
+           || o->type >= mudlle_types
            || o->flags & ~allowed_obj_flags));
 }
 #endif
 
 /* Range affected by current GC */
 static uint8_t *gcrange_start, *gcrange_end;
+
+void set_gcblock_fork_mode(bool enable)
+{
+#ifdef __linux__
+  if (gcblocksize > 0
+      && madvise(gcblock, gcblocksize,
+                 enable ? MADV_DOFORK : MADV_DONTFORK) != 0)
+    perror("set_gcblock_fork_mode madvise()");
+#endif
+}
 
 static void free_gc_block(void *b, size_t size)
 {
@@ -393,35 +414,33 @@ static void free_gc_block(void *b, size_t size)
 
 static void *alloc_gc_block(size_t size)
 {
-  static long pagesize;
-  if (pagesize == 0)
-    {
-      pagesize = sysconf(_SC_PAGESIZE);
-      assert(pagesize > 0);
-    }
-
   void *b;
   int r = posix_memalign(&b, pagesize, size);
   if (r != 0)
     {
       assert(r == ENOMEM);
       if (alloc_can_fail)
-        siglongjmp(nomem, nomem_out_of_memory);
+        siglongjmp(nomem, gcmem_out_of_memory);
+      mudlle_log("alloc_gc_block(): out of memory");
       abort();
     }
-  mprotect(b, size, PROT_READ | PROT_WRITE | PROT_EXEC);
+  if (mprotect(b, size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+    perror("mprotect()");
   return b;
 }
+
+struct obj *static_gone;
 
 /* Garbage collector initialisation & cleanup */
 void garbage_init(void)
 {
   /* All hell will break loose if this isn't true */
-  CASSERT_EXPR(sizeof (value) == 4 || sizeof (value) == 8);
-  CASSERT_EXPR(sizeof (ulong) == sizeof (value));
+  CASSERT(sizeof (value) == 4 || sizeof (value) == 8);
+  CASSERT(sizeof (ulong) == sizeof (value));
 
   gcblocksize = INITIAL_BLOCKSIZE;
   gcblock = alloc_gc_block(gcblocksize);
+  set_gcblock_fork_mode(false);
 
   /* No first generation yet */
   startgen1 = endgen1 = gcblock;
@@ -435,6 +454,9 @@ void garbage_init(void)
   minorgen = 98146523;		/* Must be odd */
   majorgen = 19643684;		/* Must be even */
 #endif
+
+  static_gone = allocate_ctemp(type_gone, sizeof *static_gone);
+  staticpro(&static_gone);
 }
 
 static value move_object(struct obj *obj, struct obj *newobj, long newgen)
@@ -448,7 +470,7 @@ static value move_object(struct obj *obj, struct obj *newobj, long newgen)
 #ifdef GCDEBUG
   newobj->generation = newgen;
 #endif
-  newobj = (struct obj *)((uint8_t *)newobj + major_offset);
+  newobj = PTRADD(newobj, major_offset);
   if (obj->garbage_type == garbage_static_string)
     {
       newobj->garbage_type = garbage_string;
@@ -463,31 +485,34 @@ static value move_object(struct obj *obj, struct obj *newobj, long newgen)
   return newobj;
 }
 
+#define special_forward(ptr) maybe_forward(special_forward_obj, (ptr))
+
 static void special_forward_code(struct code *code)
 {
-  if (pointerp(code->help)) special_forward(&code->help);
-  if (pointerp(code->filename)) special_forward(&code->filename);
-  if (pointerp(code->nicename)) special_forward(&code->nicename);
-  if (pointerp(code->varname)) special_forward(&code->varname);
-  if (pointerp(code->arguments.obj)) special_forward(&code->arguments.obj);
-  if (pointerp(code->linenos)) special_forward(&code->linenos);
+  special_forward(&code->help);
+  special_forward(&code->filenames);
+  special_forward(&code->varname);
+  special_forward(&code->arguments);
+  special_forward(&code->linenos);
 }
 
 static void save_restore_code(struct code *code)
 {
   save_restore(&code->help->o);
-  save_restore(&code->filename->o);
-  save_restore(&code->nicename->o);
+  save_restore(&code->filenames->o);
   save_restore(&code->varname->o);
-  save_restore(&code->arguments.argv->o);
+  save_restore(&code->arguments->o);
   save_restore(&code->linenos->o);
 }
 
-#define FOR_GRECORDS(o, i)                                              \
-  for (struct obj **i = ((struct grecord *)(o))->data,                  \
-         **const _recend = (struct obj **)((char *)(o) + (o)->size);    \
-       (i) < _recend;                                                   \
-       ++i)
+#define GRECORD_DATA(rec) ((struct obj **)((struct grecord *)(rec))->data)
+#define GRECORD_END(rec)  ((struct obj **)((char *)(rec) + (rec)->size))
+
+#define for_grecords(rec, o)                    \
+  for (struct obj **o = GRECORD_DATA(rec),      \
+         **const _recend = GRECORD_END(rec);    \
+       (o) < _recend;                           \
+       ++o)
 
 static uint8_t *scan(uint8_t *ptr)
 {
@@ -498,11 +523,11 @@ static uint8_t *scan(uint8_t *ptr)
   switch (obj->garbage_type)
     {
     case garbage_record:
-      FOR_GRECORDS(obj, o)
-        if (pointerp(*o))
-          special_forward(o);
-      break;
-    case garbage_code:
+    case garbage_mtemp:
+      for_grecords (obj, o)
+        special_forward(o);
+      return ptr;
+    case garbage_icode:
       {
         struct icode *icode = (struct icode *)obj;
 
@@ -513,9 +538,8 @@ static uint8_t *scan(uint8_t *ptr)
 
         value *const cend = icode->constants + icode->nb_constants;
         for (value *c = icode->constants; c < cend; ++c)
-          if (pointerp(*c))
-            special_forward(c);
-        break;
+          special_forward(c);
+        return ptr;
       }
     case garbage_mcode:
 #ifdef NOCOMPILER
@@ -523,20 +547,15 @@ static uint8_t *scan(uint8_t *ptr)
 #else
       saw_mcode = true;
       scan_mcode((struct mcode *)obj);
+      return ptr;
 #endif
-      break;
-    case garbage_primitive: case garbage_temp:
+    case garbage_primitive: case garbage_ctemp:
     case garbage_string: case garbage_forwarded:
-      break;
+      return ptr;
     case garbage_static_string: case garbage_free:
       abort();
-#if 0
-    /* Sanity checks */
-    default:
-      abort();
-#endif
     }
-  return ptr;
+  abort();
 }
 
 #define MOVE_PAST_ZERO(data, endpos)					\
@@ -568,7 +587,7 @@ static void safe_forward(value *ptr)
      only once */
   if (pointerp(*ptr) && !((ulong)*ptr & 0x2)) /* Hack */
     {
-      special_forward(ptr);
+      special_forward_obj(ptr);
       *ptr = (value)((ulong)*ptr | 0x2);
     }
 }
@@ -585,14 +604,14 @@ static void forward_roots(void)
   forward_registers();
 
   /* Static roots */
-  for (int i = 0; i < last_root; i++)
+  for (size_t i = 0; i < static_roots_used; i++)
     safe_forward(roots[i].data);
 
   /* Dynamic roots */
   for (struct dynpro *dyn = dynpro_head.next;
        dyn != &dynpro_head;
        dyn = dyn->next)
-    if (pointerp(dyn->obj)) special_forward(&dyn->obj);
+    special_forward(&dyn->obj);
 
   /* Forward protected C vars */
   for (struct gcpro *aprotect = gcpro; aprotect; aprotect = aprotect->next)
@@ -600,8 +619,7 @@ static void forward_roots(void)
 
   /* Forward jmpbufs in ccontexts */
   for (struct catch_context *mcc = catch_context; mcc; mcc = mcc->parent)
-    if (pointerp(mcc->mjmpbuf))
-      special_forward(&mcc->mjmpbuf);
+    special_forward(&mcc->mjmpbuf);
 
   /* Forward the call stack */
   for (struct call_stack *stk = call_stack; stk; stk = stk->next)
@@ -610,24 +628,25 @@ static void forward_roots(void)
       switch (stk->type)
 	{
 	case call_c:
-	  if (pointerp(cstk->c.u.prim)) special_forward(&cstk->c.u.prim);
-          /* fallthrough */
+	  special_forward(&cstk->c.u.prim);
+          FALLTHROUGH;
         case call_string_args:
         case call_string_argv:
         case call_primop:
           for (int i = 0; i < cstk->c.nargs; ++i)
-            if (pointerp(cstk->args[i])) special_forward(&cstk->args[i]);
+            special_forward(&cstk->args[i]);
 	  continue;
+
+        case call_mstring:
+          special_forward(&cstk->c.u.mstring);
+          continue;
 
 	case call_bytecode:
           {
             struct call_stack_mudlle *mstk = (struct call_stack_mudlle *)stk;
-            if (pointerp(mstk->fn))
-              special_forward(&mstk->fn);
-            if (pointerp(mstk->code))
-              special_forward(&mstk->code);
-            if (pointerp(mstk->locals))
-              special_forward(&mstk->locals);
+            special_forward(&mstk->fn);
+            special_forward(&mstk->code);
+            special_forward(&mstk->locals);
             continue;
           }
 
@@ -637,7 +656,8 @@ static void forward_roots(void)
 
         case call_invalid:
         case call_invalid_argp:
-          if (pointerp(cstk->c.u.value)) special_forward(&cstk->c.u.value);
+        case call_invalid_argv:
+          special_forward(&cstk->c.u.value);
           continue;
 	}
       abort();
@@ -646,13 +666,15 @@ static void forward_roots(void)
   /* Forward the oports in the session_context */
   for (struct session_context *sc = session_context; sc; sc = sc->parent)
     {
-      if (sc->_mudout) special_forward(&sc->_mudout);
-      if (sc->_muderr) special_forward(&sc->_muderr);
+      special_forward(&sc->ports.out);
+      special_forward(&sc->ports.err);
     }
+
+  forward_profile_roots(special_forward_obj);
 
 
   /* Static roots */
-  for (int i = 0; i < last_root; i++)
+  for (size_t i = 0; i < static_roots_used; i++)
     unmark_safe(roots[i].data);
 
   /* Forward protected C vars */
@@ -666,7 +688,7 @@ static void forward_roots(void)
 static inline void gcstats_add_gen(struct obj *obj, ulong size, int gen)
 {
   gcstats.gen[gen].types[obj->type].nb++;
-  if (obj->flags & OBJ_READONLY)
+  if (obj_readonlyp(obj))
     gcstats.gen[gen].types[obj->type].rosize += size;
   else
     gcstats.gen[gen].types[obj->type].rwsize += size;
@@ -683,7 +705,7 @@ static bool minor_forward_immutablep(void *_ptr)
 
   if (obj->garbage_type == garbage_forwarded)
     {
-      *ptr = (value)size;
+      *ptr = (struct obj *)size;
       return (uint8_t *)size < newpos1; /* true iff forwarded to gen1 */
     }
 
@@ -708,7 +730,7 @@ static bool minor_forward_immutablep(void *_ptr)
         {
           uint8_t *alignedpos =
             (uint8_t *)(MUDLLE_ALIGN((ulong)newpos1, CODE_ALIGNMENT)
-                          + MCODE_OFFSET);
+                        + MCODE_OFFSET);
 
           if (alignedpos - CODE_ALIGNMENT >= newpos1)
             alignedpos -= CODE_ALIGNMENT;
@@ -727,7 +749,8 @@ static bool minor_forward_immutablep(void *_ptr)
         {
           struct mcode *mcode = (struct mcode *)newobj;
           assert(TYPE(mcode, mcode));
-          ary_add(&mcode_ary, mcode);
+          ARRAY_ADD(mcode_array, mcode);
+          jitdump_move((struct mcode *)obj, mcode);
         }
 
 #ifdef GCSTATS
@@ -747,9 +770,10 @@ static bool minor_forward_immutablep(void *_ptr)
   /* Mutable, forward to generation 0 */
 
   /* Must have been in gen 0 before */
-  /*assert((uint8_t *)obj >= startgen0 && (uint8_t *)obj < endgen0);*/
+  /* assert(PTR_IN_RANGE(obj, startgen0, endgen0); */
 
-  newobj = (struct obj *)(newpos0 -= MUDLLE_ALIGN(size, sizeof (value)));
+  newpos0 -= MUDLLE_ALIGN(size, sizeof (value));
+  newobj = (struct obj *)newpos0;
   /*assert(newpos0 >= newstart0);*/
   memcpy(newobj, obj, size);
 
@@ -761,7 +785,7 @@ static bool minor_forward_immutablep(void *_ptr)
 #endif
 
   obj->garbage_type = garbage_forwarded;
-  newobj = (struct obj *)((uint8_t *)newobj + minor_offset);
+  newobj = PTRADD(newobj, minor_offset);
   obj->size = (long)newobj;
   *ptr = newobj;
 
@@ -780,12 +804,13 @@ static uint8_t *minor_scan(uint8_t *ptr)
   ptr += MUDLLE_ALIGN(obj->size, sizeof (value));
 
   /* Generation 0 never contains code, so only records contain pointers */
-  if (obj->garbage_type == garbage_record)
+  if (obj->garbage_type == garbage_record
+      || obj->garbage_type == garbage_mtemp)
     {
       bool imm = (obj->flags & (OBJ_READONLY | OBJ_IMMUTABLE)) == OBJ_READONLY;
 
       /* Scan & check if it can be made immutable */
-      FOR_GRECORDS(obj, o)
+      for_grecords (obj, o)
         if (pointerp(*o) && !minor_forward_immutablep(o))
           imm = false;
 
@@ -805,7 +830,7 @@ static void minor_collection(void)
 
 
   saw_mcode = false;
-  special_forward = minor_forward;
+  special_forward_obj = minor_forward;
   major_offset = 0;
 
   /* Allocate below current block, but move it up afterwards */
@@ -848,6 +873,9 @@ static void minor_collection(void)
   while (data < newpos1) data = major_scan(data);
   assert(data == newpos1);
 
+  /* this must be done last */
+  struct weak_ref *weak_tofree = minor_forward_weak_refs();
+
   /* Move new generation 0 into place */
   nsize0 = newend0 - newpos0;
   posgen0 = endgen0 - nsize0;
@@ -870,9 +898,11 @@ static void minor_collection(void)
   minorgen = newminorgen;
 #endif
 #ifdef GCSTATS
-  gcstats.usage_minor = endgen0 - posgen0;
-  gcstats.usage_major = endgen1 - startgen1;
+  gcstats.usage_minor = (ulong)(endgen0 - posgen0);
+  gcstats.usage_major = (ulong)(endgen1 - startgen1);
 #endif
+
+  free_weak_refs(weak_tofree);
 
 }
 
@@ -893,11 +923,12 @@ static void major_forward(void *_ptr)
 {
   struct obj **ptr = _ptr;
   struct obj *obj = *ptr, *newobj;
-  long size = obj->size, newgen;
+  ulong size = obj->size;
+  long newgen;
 
   if (obj->garbage_type == garbage_forwarded)
     {
-      *ptr = (value)size;
+      *ptr = (struct obj *)size;
       return;
     }
 
@@ -911,7 +942,7 @@ static void major_forward(void *_ptr)
 
   bool is_mcode = false;
 
-  if ((uint8_t *)obj >= posgen0 && (uint8_t *)obj < endgen0)
+  if (PTR_IN_RANGE(obj, posgen0, endgen0))
     {
       if (!newarea) return;	/* No gen 0 data needs copying */
 
@@ -933,12 +964,10 @@ static void major_forward(void *_ptr)
         /* We align the actual code on a 16 byte boundary. This is
            a good idea on x86, and probably elsewhere too */
         {
-          uint8_t *alignedpos =
-            (uint8_t *)(MUDLLE_ALIGN((ulong)newpos1 + major_offset,
-                                     CODE_ALIGNMENT)
-                        + MCODE_OFFSET);
-
-          alignedpos -= major_offset;
+          uint8_t *alignedpos = (uint8_t *)(
+            MUDLLE_ALIGN((ulong)newpos1 + major_offset, CODE_ALIGNMENT)
+            + MCODE_OFFSET
+            - major_offset);
           if (alignedpos - CODE_ALIGNMENT >= newpos1)
             alignedpos -= CODE_ALIGNMENT;
           /* We clear memory between newpos1 and alignedpos so
@@ -955,8 +984,9 @@ static void major_forward(void *_ptr)
       if (newpos1 > newend1) /* We are in trouble, spill to temp block */
         {
           /* Allocate a block big enough to handle the spill */
-          assert(!tempblock1 && !newarea); /* Only once ! */
-          oldpos1 = (uint8_t *)newobj; oldstart1 = newstart1;
+          assert(tempblock1 == NULL && !newarea); /* Only once ! */
+          oldpos1 = (uint8_t *)newobj;
+          oldstart1 = newstart1;
 
           ulong tsz1 = (endgen1 - startgen1) - (oldpos1 - oldstart1);
           /* allocate extra space to handle code alignment overhead */
@@ -966,15 +996,15 @@ static void major_forward(void *_ptr)
           assert(tempsize1 > tsz1);
 
 #ifdef GCSTATS
-          fprintf(stderr, "MUDLLE: Temp block size %ld (%ld prealign)"
-                  " remain %td already-moved %td\n",
-                  tempsize1, tsz1,
-                  endgen1 - startgen1,
-                  oldpos1 - oldstart1);
+          mudlle_log("Temp block size %ld (%ld prealign)"
+                     " remain %td already-moved %td",
+                     tempsize1, tsz1,
+                     endgen1 - startgen1,
+                     oldpos1 - oldstart1);
 #endif
 
           assert(size <= tempsize1);
-          tempblock1 = xmalloc(tempsize1);
+          tempblock1 = malloc(tempsize1);
           newstart1 = tempblock1;
           newend1 = tempblock1 + tempsize1;
           newpos1 = tempblock1 + MUDLLE_ALIGN(size, sizeof (value));
@@ -991,8 +1021,9 @@ static void major_forward(void *_ptr)
 
   if (is_mcode)
     {
-      assert(*ptr == (struct obj *)((uint8_t *)newobj + major_offset));
-      ary_add(&mcode_ary, (struct mcode *)*ptr);
+      assert(*ptr == PTRADD(newobj, major_offset));
+      ARRAY_ADD(mcode_array, (struct mcode *)*ptr);
+      jitdump_move((struct mcode *)obj, (struct mcode *)*ptr);
     }
 }
 
@@ -1003,7 +1034,7 @@ static void major_collection(void)
 
   saw_mcode = false;
   newarea = false;
-  special_forward = major_forward;
+  special_forward_obj = major_forward;
   major_offset = startgen1 - endgen1;
 
   newstart0 = newpos0 = newend0 = NULL;
@@ -1046,6 +1077,9 @@ static void major_collection(void)
 	}
     }
 
+  struct weak_ref *weak_tofree = major_forward_weak_refs();
+  assert(weak_tofree == NULL);  /* only happens during new major */
+
   if (tempblock1)		/* We ran out of memory ! */
     {
       /* Just move block, and return. A new major collection will be started
@@ -1087,7 +1121,7 @@ static void new_major_collection(ulong newsize)
   saw_mcode = false;
   newarea = true;
   major_offset = 0;
-  special_forward = major_forward;
+  special_forward_obj = major_forward;
 
   /* Setup areas */
   newpos0 = newend0 = newblock + newsize;
@@ -1129,12 +1163,17 @@ static void new_major_collection(ulong newsize)
   assert(data == newpos1);
   assert(newpos1 <= newpos0);
 
+  struct weak_ref *weak_tofree = major_forward_weak_refs();
+
   /* Remove old block */
+  set_gcblock_fork_mode(true);
   free_gc_block(gcblock, gcblocksize);
+
   free(tempblock1);
   tempblock1 = NULL;
   gcblock = newblock;
   gcblocksize = newsize;
+  set_gcblock_fork_mode(false);
 
   /* Reset generation 1 */
   startgen1 = newstart1;
@@ -1152,24 +1191,32 @@ static void new_major_collection(ulong newsize)
 
   assert(startgen0 <= posgen0);
 
+  free_weak_refs(weak_tofree);
+
 #ifdef GCDEBUG
   minorgen = newminorgen;
   majorgen = newmajorgen;
 #endif
 #ifdef GCSTATS
   gcstats.usage_major = endgen1 - startgen1;
-  assert(gcstats.usage_minor == endgen0 - posgen0);
+  /* some memory may have been freed up by freeing weak references */
+  assert(gcstats.usage_minor >= (ulong)(endgen0 - posgen0));
 #endif
 }
 
 void garbage_collect(long n)
 {
-  /* clear all free lists */
-  memset(free_lists, 0, sizeof free_lists);
-
-#if 0
-  fprintf(stderr, "GC %ld ...", n); fflush(stderr);
-#endif
+  /* clear all free lists and restore size fields in freed objects */
+  for (size_t i = 0; i < VLENGTH(free_lists); ++i)
+    {
+      ulong rsize = sizeof (struct obj) + i * sizeof (value);
+      for (union free_obj *next = free_lists[i], *f; (f = next); )
+        {
+          next = f->next;
+          f->g.o.size = rsize;
+        }
+      free_lists[i] = NULL;
+    }
 
 #ifdef GCSTATS
   /* Copy allocation stats */
@@ -1178,15 +1225,11 @@ void garbage_collect(long n)
   gcstats.a = GCSTATS_ALLOC_NULL;
 #endif
 
-  ary_empty(&mcode_ary);
+  ARRAY_EMPTY(mcode_array);
 
   /* No space, try a minor collection */
   minor_collection();
   reset_dwarf_mcodes(0);
-
-#if 0
-  fprintf(stderr, "minor\n"); fflush(stderr);
-#endif
 
   /* If block is too full, do a major collection.
      not(Too full) is:
@@ -1195,37 +1238,38 @@ void garbage_collect(long n)
        - generation 1 has not doubled in size
        - minor area not THRESHOLD_MAJOR % full. */
   if (startgen0 < posgen0
-      && 2 * (endgen1 - startgen1) < gcblocksize - (endgen0 - (posgen0 - n))
-      && (endgen1 - startgen1) < 2 * oldsize1
-      && (endgen0 - (posgen0 - n)) * THRESHOLD_MAJOR_B <
-      (endgen0 - startgen0) * THRESHOLD_MAJOR_A)
+      && (2 * (size_t)(endgen1 - startgen1)
+          < gcblocksize - (endgen0 - (posgen0 - n)))
+      && (size_t)(endgen1 - startgen1) < 2 * oldsize1
+      && ((endgen0 - (posgen0 - n)) * THRESHOLD_MAJOR_B
+          < (endgen0 - startgen0) * THRESHOLD_MAJOR_A))
     goto done_minor;
 
 #ifdef GCSTATS
   fflush(stdout);
-  fprintf(stderr, "MUDLLE: Major collection: gen0: %td of %td, gen1: %td,"
-          " blocksize: %ld\n",
-	  endgen0 - (posgen0 - n), endgen0 - startgen0, endgen1 - startgen1,
-          gcblocksize);
+  mudlle_log("Major collection: gen0: %td of %td, gen1: %td,"
+             " blocksize: %ld",
+             endgen0 - (posgen0 - n), endgen0 - startgen0, endgen1 - startgen1,
+             gcblocksize);
   if (startgen0 >= posgen0)
-    fprintf(stderr, "MUDLLE: generation 0 lacks space\n");
-  else if (2 * (endgen1 - startgen1)
+    mudlle_log("generation 0 lacks space");
+  else if (2 * (size_t)(endgen1 - startgen1)
            >= gcblocksize - (endgen0 - (posgen0 - n)))
-    fprintf(stderr, "MUDLLE: Cause: not 2x generation 1\n");
-  else if ((endgen1 - startgen1) >= 2 * oldsize1)
-    fprintf(stderr, "MUDLLE: Generation 1 has doubled in size, was %ld\n",
-            oldsize1);
+    mudlle_log("Cause: not 2x generation 1");
+  else if ((size_t)(endgen1 - startgen1) >= 2 * oldsize1)
+    mudlle_log("Generation 1 has doubled in size, was %ld", oldsize1);
   else
-    fprintf(stderr, "MUDLLE: Cause generation 0 too full\n");
+    mudlle_log("Cause generation 0 too full");
 #endif  /* GCSTATS */
 
-  ary_empty(&mcode_ary);
+  ARRAY_EMPTY(mcode_array);
   major_collection();
 
 #ifdef GCSTATS
-  if (!tempblock1)
-    fprintf(stderr, "MUDLLE: Now: gen0: %td of %td, gen1: %td\n",
-	    endgen0 - (posgen0 - n), endgen0 - startgen0, endgen1 - startgen1);
+  if (tempblock1 == NULL)
+    mudlle_log("Now: gen0: %td of %td, gen1: %td",
+               endgen0 - (posgen0 - n), endgen0 - startgen0,
+               endgen1 - startgen1);
 #endif
 
   /* If block is too full, increase its size
@@ -1238,17 +1282,17 @@ void garbage_collect(long n)
          block size)
   */
   ulong size1;
-  if (tempblock1)
+  if (tempblock1 != NULL)
     size1 = (newpos1 - newstart1) + (oldpos1 - oldstart1);
   else
     size1 = endgen1 - startgen1;
 
   ulong used0 = endgen0 - (posgen0 - n);
-  if (!tempblock1
+  if (tempblock1 == NULL
       && size1 * 2 + used0 < gcblocksize
       && startgen0 < posgen0
-      && used0 * THRESHOLD_INCREASE_B <
-      (endgen0 - startgen0) * THRESHOLD_INCREASE_A)
+      && (used0 * THRESHOLD_INCREASE_B
+          < (size_t)(endgen0 - startgen0) * THRESHOLD_INCREASE_A))
     goto done_major;
 
   /* Running out of memory. Increase block size */
@@ -1256,21 +1300,19 @@ void garbage_collect(long n)
   newsize = MUDLLE_ALIGN(newsize, sizeof (value));
 
 #ifdef GCSTATS
-  fprintf(stderr, "MUDLLE: Increasing block size to %ld\n", newsize);
-  fprintf(stderr, "MUDLLE: Stats: gen 0: %ld of %td, gen1: %ld\n",
-	  used0, endgen0 - startgen0, size1);
-  if (tempblock1)
-    fprintf(stderr, "MUDLLE: Cause: spill block of %ld bytes\n", tempsize1);
+  mudlle_log("Increasing block size to %ld", newsize);
+  mudlle_log("Stats: gen 0: %ld of %td, gen1: %ld",
+             used0, endgen0 - startgen0, size1);
+  if (tempblock1 != NULL)
+    mudlle_log("Cause: spill block of %ld bytes", tempsize1);
   else if (size1 * 2 + used0 >= gcblocksize)
-    fprintf(stderr,
-            "MUDLLE: Cause: not 2x generation 1 size (%ld) available\n",
-            size1);
+    mudlle_log("Cause: not 2x generation 1 size (%ld) available",
+               size1);
   else if (startgen0 >= posgen0)
-    fprintf(stderr, "MUDLLE: Cause: not enough space for both generations\n");
+    mudlle_log("Cause: not enough space for both generations");
   else
-    fprintf(stderr, "MUDLLE: Cause: generation 0 is too full"
-            " (used %ld, size %td)\n",
-	    used0, endgen0 - startgen0);
+    mudlle_log("Cause: generation 0 is too full (used %ld, size %td)",
+               used0, endgen0 - startgen0);
 #endif  /* GCSTATS */
 
   /* And make sure there will be n bytes available and that generation 0 is
@@ -1280,9 +1322,8 @@ void garbage_collect(long n)
   if (need > newsize)
     {
 #ifdef GCSTATS
-      fprintf(stderr, "MUDLLE: Reincreasing block size to %ld to allow"
-              " 2x generation0\n",
-	      need);
+      mudlle_log("Reincreasing block size to %ld to allow 2x generation 0",
+                 need);
 #endif
       newsize = need;
     }
@@ -1292,18 +1333,18 @@ void garbage_collect(long n)
   if (need > newsize)
     {
 #ifdef GCSTATS
-      fprintf(stderr, "MUDLLE: Reincreasing block size to %ld to allow"
-              " 3x generation1\n",
-	      need);
+      mudlle_log("Reincreasing block size to %ld to allow 3x generation 1",
+                 need);
 #endif
       newsize = need;
     }
 
-  ary_empty(&mcode_ary);
+  ARRAY_EMPTY(mcode_array);
   new_major_collection(newsize);
 #ifdef GCSTATS
-  fprintf(stderr, "MUDLLE: New stats: gen 0: %td of %td, gen1: %td\n",
-	  endgen0 - (posgen0 - n), endgen0 - startgen0, endgen1 - startgen1);
+  mudlle_log("New stats: gen 0: %td of %td, gen1: %td",
+             endgen0 - (posgen0 - n), endgen0 - startgen0,
+             endgen1 - startgen1);
 #endif
 
   assert(posgen0 - n >= startgen0);
@@ -1311,16 +1352,16 @@ void garbage_collect(long n)
  done_major:
   reset_dwarf_mcodes(1);
  done_minor:
-  register_dwarf_mcodes(1, &mcode_ary);
-  ary_free(&mcode_ary);
+  register_dwarf_mcodes(1, &mcode_array);
+  ARRAY_FREE(mcode_array);
 
   free_static_data_table();
 }
 
-long gc_reserve(long x)
+long gc_reserve(long n)
 /* The basic allocation routine. Makes sure that n bytes can be allocated. */
 {
-  const long len = MUDLLE_ALIGN(x, sizeof (value));
+  const long len = MUDLLE_ALIGN(n, sizeof (value));
 
   if (posgen0 >= startgen0 + len)
     return posgen0 - startgen0;
@@ -1329,25 +1370,16 @@ long gc_reserve(long x)
   return -(posgen0 - startgen0);
 }
 
-static value fast_gc_allocate(long n)
-/* Requires: n == MUDLLE_ALIGN(n, sizeof (value))
-*/
+static struct obj *fast_gc_allocate(long n)
+/* Requires: n == MUDLLE_ALIGN(n, sizeof (value)) */
 {
   posgen0 -= n;
   assert(posgen0 >= startgen0);
 
-#ifdef GCQDEBUG
-  if (n > maxobjsize)
-    {
-      assert(n <= MAX_MUDLLE_OBJECT_SIZE);
-      maxobjsize = n;
-    }
-#endif
-
 #ifdef GCDEBUG
   ((struct obj *)posgen0)->generation = minorgen;
 #endif
-  return posgen0;
+  return (struct obj *)posgen0;
 }
 
 /* free gc'ed object known to be mutable and not referenced */
@@ -1358,43 +1390,43 @@ void gc_free(struct obj *o)
   union free_obj *f = (union free_obj *)o;
   ulong size = grecord_len(&f->g);
   if (size >= FREE_SIZES)
-    {
-      return;
-    }
+    return;
   f->next = free_lists[size];
   f->g.o.garbage_type = garbage_free;
   free_lists[size] = f;
 }
 
-value gc_allocate(long n)
-/* Effects: Allocates n bytes and returns a pointer to the start of
+static struct obj *get_free_list(ulong size)
+{
+  if (size >= sizeof (struct obj) + sizeof (value) * FREE_SIZES)
+    return NULL;
+
+  ulong fields = (size - sizeof (struct obj)) / sizeof (value);
+  union free_obj *f = free_lists[fields];
+  if (f == NULL)
+    return NULL;
+
+  free_lists[fields] = f->next;
+#ifdef GCDEBUG
+  f->g.o.generation = minorgen;
+#endif
+  return &f->g.o;
+}
+
+struct obj *gc_allocate(long n)
+/* Effects: Allocates 'n' bytes and returns a pointer to the start of
      the allocated area.
      DOES ABSOLUTELY NO INITIALISATION. BEWARE!
    Returns: Pointer to allocated area
 */
 {
   assert(n >= 0 && n <= MAX_MUDLLE_OBJECT_SIZE);
-
   ulong aligned = MUDLLE_ALIGN(n, sizeof (value));
 
   /* check for available free_lists entry */
-  if (aligned < sizeof (struct obj) + sizeof (value) * FREE_SIZES)
-    {
-      ulong fields = (aligned - sizeof (struct obj)) / sizeof (value);
-      union free_obj *f = free_lists[fields];
-      if (f != NULL)
-	{
-	  free_lists[fields] = f->next;
-#ifdef GCDEBUG
-	  f->g.o.generation = minorgen;
-#endif
-	  return f;
-	}
-    }
-
-#ifdef GCQDEBUG
-  if (n > maxobjsize) maxobjsize = n;
-#endif
+  struct obj *fobj = get_free_list(aligned);
+  if (fobj != NULL)
+    return fobj;
 
   gc_reserve(aligned);
   return fast_gc_allocate(aligned);
@@ -1403,169 +1435,112 @@ value gc_allocate(long n)
 /* Basic allocation */
 /* ---------------- */
 
-struct grecord *unsafe_allocate_record(enum mudlle_type type, ulong entries)
+static struct obj *allocate_obj(bool is_fast,
+                                enum garbage_type garbage_type,
+                                enum mudlle_type type,
+                                size_t size,
+                                unsigned flags)
 {
-  ulong size = sizeof (struct obj) + entries * sizeof (value);
-  struct grecord *newp = gc_allocate(size);
-  *newp = (struct grecord){
-    .o = {
-      .size	    = size,
-      .garbage_type = garbage_record,
-      .type	    = type,
-      .flags	    = entries == 0 ? OBJ_READONLY | OBJ_IMMUTABLE : 0,
-#ifdef GCDEBUG
-      .generation   = newp->o.generation
-#endif
+  struct obj *obj;
+  if (is_fast)
+    {
+      obj = get_free_list(size);
+      if (obj == NULL)
+        obj = fast_gc_allocate(size);
     }
-  };
+  else
+    obj = gc_allocate(size);
 
-  /* WARNING: data is not initialised!!! */
-#ifdef GCSTATS
-  gcstats_add_alloc(type, size);
-#endif
-
-#ifdef ALLOC_STATS
-  record_allocation(type, size);
-#endif
-
-  return newp;
-}
-
-struct grecord *allocate_record(enum mudlle_type type, ulong entries)
-{
-  struct grecord *newp = unsafe_allocate_record(type, entries);
-
-  /* Initialise data to NULL */
-  memset(newp->data, 0, entries * sizeof *newp->data);
-
-  return newp;
-}
-
-struct gstring *allocate_string(enum mudlle_type type, ulong bytes)
-{
-  ulong size = sizeof (struct obj) + bytes;
-  struct gstring *newp = gc_allocate(size);
-
-  *newp = (struct gstring){
-    .o = {
-      .size	    = size,
-      .garbage_type = garbage_string,
-      .type	    = type,
-      .flags	    = OBJ_IMMUTABLE,
+  *obj = (struct obj){
+    .size	  = size,
+    .garbage_type = garbage_type,
+    .type	  = type,
+    .flags	  = flags,
 #ifdef GCDEBUG
-      .generation   = newp->o.generation
+    .generation   = newp->o.generation
 #endif
-    }
   };
 
 #ifdef GCSTATS
   gcstats_add_alloc(type, MUDLLE_ALIGN(size, sizeof (value)));
 #endif
+
 #ifdef ALLOC_STATS
   record_allocation(type, size);
 #endif
+  return obj;
+}
 
+struct grecord *alloc_record_noinit(
+  enum garbage_type garbage_type, enum mudlle_type type, size_t entries)
+{
+  ulong size = sizeof (struct obj) + entries * sizeof (value);
+  return (struct grecord *)allocate_obj(
+    false, garbage_type, type, size,
+    entries == 0 ? OBJ_READONLY | OBJ_IMMUTABLE : 0);
+}
+
+struct grecord *allocate_record(enum mudlle_type type, ulong entries)
+{
+  struct grecord *newp = alloc_record_noinit(garbage_record, type, entries);
+  memset(newp->data, 0, entries * sizeof *newp->data);
   return newp;
+}
+
+struct grecord *allocate_mtemp(enum mudlle_type type, size_t entries)
+{
+  struct grecord *newp = alloc_record_noinit(garbage_mtemp, type, entries);
+  memset(newp->data, 0, entries * sizeof *newp->data);
+  return newp;
+}
+
+struct obj *allocate_string(enum mudlle_type type, ulong bytes)
+{
+  ulong size = sizeof (struct obj) + bytes;
+  return allocate_obj(false, garbage_string, type, size, OBJ_IMMUTABLE);
 }
 
 struct primitive *allocate_primitive(const struct prim_op *op)
 {
+  assert(op->help != NULL);
+
   enum mudlle_type type = (op->nargs < 0
                            ? type_varargs
                            : (op->seclevel == 0 || (op->flags & OP_FASTSEC)
                               ? type_primitive
                               : type_secure));
 
-  struct primitive *newp = gc_allocate(sizeof *newp);
-  *newp = (struct primitive){
-    .o = {
-      .size         = sizeof *newp,
-      .garbage_type = garbage_primitive,
-      .type         = type,
-      .flags        = OBJ_IMMUTABLE | OBJ_READONLY,
-#ifdef GCDEBUG
-      .generation   = newp->o.generation,
-#endif
-    },
-    .op = op
-  };
-
-#ifdef GCSTATS
-  gcstats_add_alloc(type, newp->o.size);
-#endif
-
+  struct primitive *newp = (struct primitive *)allocate_obj(
+    false, garbage_primitive, type, sizeof *newp,
+    OBJ_IMMUTABLE | OBJ_READONLY);
+  newp->op = op;
   return newp;
 }
 
-struct obj *allocate_temp(enum mudlle_type type, size_t size)
+struct obj *allocate_ctemp(enum mudlle_type type, size_t size)
 {
-  struct obj *obj = gc_allocate(size);
-  *obj = (struct obj){
-    .size	  = size,
-    .garbage_type = garbage_temp,
-    .type	  = type,
-    .flags	  = OBJ_IMMUTABLE,
-#ifdef GCDEBUG
-    .generation   = obj->generation
-#endif
-  };
-#ifdef GCSTATS
-  gcstats_add_alloc(type, size);
-#endif
-  return obj;
+  return allocate_obj(false, garbage_ctemp, type, size,
+                      OBJ_IMMUTABLE | OBJ_READONLY);
 }
 
 struct vector *allocate_locals(ulong n)
-/* Effect: Allocate a vector of local variables in an optimised fashion.
-*/
+/* Effect: Allocate a vector of local variables in an optimised fashion. */
 {
   ulong vecsize = sizeof (struct obj) + n * sizeof (value);
-  const ulong varsize = sizeof (struct obj) + sizeof (value);
-  struct vector *locals;
-  value *var;
+  const ulong varsize = sizeof (struct variable);
 
   gc_reserve(vecsize + n * varsize);
 
-  locals = fast_gc_allocate(vecsize);
-  *locals = (struct vector){
-    .o = {
-      .size         = vecsize,
-      .garbage_type = garbage_record,
-      .type         = type_internal,
-      .flags        = 0,
-#ifdef GCDEBUG
-      .generation   = locals->o.generation
-#endif
-    }
-  };
-#ifdef GCSTATS
-  gcstats_add_alloc(type_internal, vecsize);
-#endif
+  struct vector *locals = (struct vector *)allocate_obj(
+    true, garbage_mtemp, type_internal, vecsize, 0);
 
-  var = locals->data;
+  value *var = locals->data;
   while (n--)
     {
-#ifdef ALLOC_STATS
-      struct variable *v = alloc_variable(NULL);
-#else
-      struct variable *v = fast_gc_allocate(varsize);
-      *v = (struct variable){
-        .o = {
-          .size         = varsize,
-          .garbage_type = garbage_record,
-          .type         = type_variable,
-          .flags        = 0,
-#ifdef GCDEBUG
-          .generation   = v->o.generation
-#endif
-        },
-        .vvalue = NULL
-      };
-#endif
+      struct variable *v = (struct variable *)allocate_obj(
+        true, garbage_record, type_variable, varsize, 0);
+      v->vvalue = NULL;
       *var++ = v;
-#ifdef GCSTATS
-      gcstats_add_alloc(type_variable, varsize);
-#endif
     }
 
   return locals;
@@ -1577,28 +1552,22 @@ struct vector *allocate_locals(ulong n)
 /* makes obj immutable if possible without recursion; return true on success */
 bool try_make_immutable(struct obj *obj)
 {
-  if (obj->garbage_type != garbage_record
+  if ((obj->garbage_type != garbage_record
+       && obj->garbage_type != garbage_mtemp)
       || (obj->flags & (OBJ_READONLY | OBJ_IMMUTABLE)) != OBJ_READONLY)
     return false;
 
-  struct grecord *rec = (struct grecord *)obj;
-  struct obj **recend = (struct obj **)((uint8_t *)rec + rec->o.size);
-  for (struct obj **o = rec->data; ; ++o)
+  for_grecords (obj, o)
     {
-      if (o == recend)
-        {
-          /* Readonly objects can be made immutable if all their
-             contents are themselves immutable.
-             Note that this will not detect non-trivial recursive
-             immutable objects */
-
-          rec->o.flags |= OBJ_IMMUTABLE;
-          return true;
-        }
       /* if contains non-immutable pointer (not to itself), give up */
       if (*o != obj && !immutablep(*o))
         return false;
     }
+  /* Readonly objects can be made immutable if all their contents are
+     themselves immutable.
+     Note that this will not detect non-trivial recursive immutable objects */
+  obj->flags |= OBJ_IMMUTABLE;
+  return true;
 }
 
 void detect_immutability(void)
@@ -1621,8 +1590,6 @@ void detect_immutability(void)
     }
 }
 
-
-
 /* Persistent data */
 /* --------------- */
 
@@ -1632,8 +1599,7 @@ static ulong from_offset;	/* Value to add to pointers in forward to get
 static uint8_t *save_hwm;
 
 static void save_restore(struct obj *obj)
-/* Effects: Restores the information used during GC for obj (forwarding)
-*/
+/* Effects: Restores the information used during GC for obj (forwarding) */
 {
  again:
   if (!pointerp(obj))
@@ -1664,13 +1630,14 @@ static void save_restore(struct obj *obj)
   switch (obj->garbage_type)
     {
     case garbage_record:
+    case garbage_mtemp:
       {
         struct grecord *rec = (struct grecord *)obj;
-        n = (rec->o.size - sizeof (struct obj)) / sizeof (struct obj *);
+        n = grecord_len(rec);
         no = (value *)rec->data;
         goto tail;
       }
-    case garbage_code:
+    case garbage_icode:
       {
         struct icode *icode = (struct icode *)obj;
 
@@ -1682,10 +1649,9 @@ static void save_restore(struct obj *obj)
     case garbage_mcode:
       save_restore_mcode((struct mcode *)obj);
       return;
-    case garbage_primitive: case garbage_temp:
-    case garbage_string: case garbage_forwarded:
+    case garbage_string: case garbage_primitive: case garbage_ctemp:
       return;
-    case garbage_static_string: case garbage_free:
+    case garbage_forwarded: case garbage_static_string: case garbage_free:
       abort();
     }
   abort();
@@ -1712,7 +1678,7 @@ static void size_forward(void *_ptr)
   size = obj->size;
   /* GC to generation 0, allocating forwards */
   if (obj->garbage_type == garbage_forwarded)
-    *ptr = (value)size;
+    *ptr = (struct obj *)size;
   else
     {
       long asize = MUDLLE_ALIGN(size, sizeof (value));
@@ -1721,7 +1687,7 @@ static void size_forward(void *_ptr)
           ulong *sdata = static_data(obj);
           if (*sdata)
             {
-              *ptr = (value)*sdata;
+              *ptr = (struct obj *)*sdata;
               return;
             }
           static_size += asize;
@@ -1732,83 +1698,137 @@ static void size_forward(void *_ptr)
       newpos0 += asize;
       if (!(obj->flags & OBJ_IMMUTABLE))
         mutable_size += asize;
-      if (newpos0 > newend0) siglongjmp(nomem, nomem_grow_memory);
+      if (newpos0 > newend0)
+        siglongjmp(nomem, gcmem_grow_memory);
 
       *ptr = move_object(obj, newobj, minorgen);
     }
 }
 
-bool gc_size(value xarg, struct gc_size *sizearg)
+static void try_gc_size(value x, ulong gcsize, struct gc_size *size)
+{
+  /* be really sure that there is enough space for the header */
+  GCPRO(x);
+  alloc_can_fail = true;
+  gc_reserve(gcsize);
+  alloc_can_fail = false;
+  UNGCPRO();
+
+  major_offset = 0;
+  special_forward_obj = size_forward;
+  newstart0 = newpos0 = posgen0 - gcsize; newend0 = posgen0;
+
+  /* forward the root value */
+  static_size = mutable_size = 0;
+  value *save = (value *)newpos0;
+  newpos0 += sizeof (value);
+  *save = x;
+  special_forward(save);
+
+  /* Scan copied data */
+  save_hwm = (uint8_t *)(save + 1);
+  while (save_hwm < newpos0)
+    {
+      struct obj *o = (struct obj *)save_hwm;
+      save_hwm = scan(save_hwm);
+      o->size = htonlong(o->size); /* save_restore undoes this */
+    }
+  assert(save_hwm == newpos0);
+
+  /* Restore old block (contains forwarded data) */
+  save_restore(x);
+  free_static_data_table();
+
+  *size = (struct gc_size){
+    .s_total   = (ulong)(newpos0 - newstart0),
+    .s_mutable = mutable_size,
+    .s_static  = static_size
+  };
+}
+
+static enum gcmem_result gc_size_setjmp(value x, ulong gcsize,
+                                        struct gc_size *size)
+{
+  switch (sigsetjmp(nomem, 0))
+    {
+    case 0:
+      try_gc_size(x, gcsize, size);
+      return gcmem_success;
+
+    case gcmem_grow_memory:
+      return gcmem_grow_memory;
+
+    case gcmem_out_of_memory:
+      return gcmem_out_of_memory;
+    }
+  abort();
+}
+
+bool gc_size(value x, struct gc_size *size)
 /* Effects: Sets *sizearg to number of bytes accessible from x
    Returns: true if successful; false otherwise (out of memory)
 */
 {
-  volatile value x = xarg;
-  struct gcpro *const volatile old_gcpro = gcpro;
-  struct gc_size *const volatile size = sizearg;
-  volatile ulong gcsize = DEF_SAVE_SIZE;
+  struct gcpro *const old_gcpro = gcpro;
+  ulong gcsize = DEF_SAVE_SIZE;
 
+  bool result = true;
+  GCPRO(x);
   for (;;)
-    switch (sigsetjmp(nomem, 0))
+    switch (gc_size_setjmp(x, gcsize, size))
       {
-      case 0:
-        /* Be really sure that there is enough space for the header */
-        {
-          value xlocal = x; /* don't try to protect volatile object */
-          GCPRO(xlocal);
-          alloc_can_fail = true;
-          gc_reserve(gcsize);
-          alloc_can_fail = false;
-          UNGCPRO();
-          x = xlocal;
-        }
+      case gcmem_success:
+        goto done;
 
-        major_offset = 0;
-        special_forward = size_forward;
-        newstart0 = newpos0 = posgen0 - gcsize; newend0 = posgen0;
-
-        /* Forward the root value */
-        static_size = mutable_size = 0;
-        value *save = (value *)newpos0;
-        newpos0 += sizeof (value);
-        *save = x;
-        if (pointerp(x)) special_forward(save);
-
-        /* Scan copied data */
-        save_hwm = (uint8_t *)(save + 1);
-        while (save_hwm < newpos0)
-          {
-            struct obj *o = (struct obj *)save_hwm;
-            save_hwm = scan(save_hwm);
-            o->size = htonlong(o->size); /* save_restore undoes this */
-          }
-        assert(save_hwm == newpos0);
-
-        /* Restore old block (contains forwarded data) */
-        save_restore(x);
-        free_static_data_table();
-
-        *size = (struct gc_size){
-          .s_total = (ulong)(newpos0 - newstart0),
-          .s_mutable = mutable_size,
-          .s_static = static_size
-        };
-        return true;
-
-      case nomem_grow_memory:
+      case gcmem_grow_memory:
         /* No memory, try again */
         save_restore(x);
         gcsize *= 2;
         break;
 
-      case nomem_out_of_memory:
+      case gcmem_out_of_memory:
         /* No memory, don't try again */
         gcpro = old_gcpro;
         alloc_can_fail = false;
         free_static_data_table();
-        return false;
+        result = false;
+        goto done;
       }
+ done:
+  UNGCPRO();
+  return result;
 }
+
+const bool saveable_object_type[] = {
+  [type_icode]      = false,
+  [type_closure]    = false,
+  [type_variable]   = true,
+  [type_internal]   = false,
+  [type_primitive]  = false,
+  [type_varargs]    = false,
+  [type_secure]     = false,
+  [type_integer]    = false,
+  [type_string]     = true,
+  [type_vector]     = true,
+  [type_pair]       = true,
+  [type_symbol]     = true,
+  [type_table]      = true,
+  [type_private]    = false,
+  [type_object]     = false,
+  [type_character]  = false,
+  [type_gone]       = false,
+  [type_oport]      = false,
+  [type_mcode]      = false,
+  [type_float]      = true,
+  [type_bigint]     = true,
+  [type_null]       = false,
+  [type_connection] = false,
+  [type_cookie]     = false,
+  [type_file]       = false,
+  [type_weak_ref]   = false,
+  [type_regexp]     = false,
+};
+CASSERT_VLEN(saveable_object_type, mudlle_types);
 
 /*
   Saved data format:
@@ -1823,17 +1843,20 @@ static void save_forward(struct obj **ptr)
   GCCHECK(obj);
 
   if (obj->garbage_type == garbage_primitive
-      || obj->garbage_type == garbage_temp
-      || obj->garbage_type == garbage_code
+      || obj->garbage_type == garbage_ctemp
+      || obj->garbage_type == garbage_icode
       || obj->garbage_type == garbage_mcode
-      || obj->type == type_closure
-      || obj->type == type_oport
-      || obj->type == type_internal
-      || obj->type == type_private)
+      || obj->garbage_type == garbage_mtemp)
     {
       /* Set ptr to the gone value */
       *ptr = (struct obj *)(newstart0 + sizeof (uint8_t *));
       return;
+    }
+
+  assert(obj->type < VLENGTH(saveable_object_type));
+  if (!saveable_object_type[obj->type])
+    {
+      abort();
     }
 
   if (obj->garbage_type == garbage_static_string)
@@ -1841,7 +1864,7 @@ static void save_forward(struct obj **ptr)
       ulong *sdata = static_data(obj);
       if (*sdata)
         {
-          *ptr = (value)*sdata;
+          *ptr = (struct obj *)*sdata;
           return;
         }
     }
@@ -1869,7 +1892,7 @@ static void save_forward(struct obj **ptr)
   long size = obj->size;
   if (obj->garbage_type == garbage_forwarded)
     {
-      *ptr = (value)size;
+      *ptr = (struct obj *)size;
       return;
     }
 
@@ -1878,7 +1901,7 @@ static void save_forward(struct obj **ptr)
   long align_pad = PADDING(size, sizeof (value));
   uint8_t *padpos = newpos0 + size;
   newpos0 = padpos + align_pad;
-  if (newpos0 > newend0) siglongjmp(nomem, nomem_grow_memory);
+  if (newpos0 > newend0) siglongjmp(nomem, gcmem_grow_memory);
   memset(padpos, 0, align_pad);
   *ptr = move_object(obj, newobj, minorgen);
   newobj->flags = htons(newobj->flags);
@@ -1917,7 +1940,76 @@ static uint8_t *save_scan(uint8_t *ptr)
   return ptr;
 }
 
-void *gc_save(value xarg, unsigned long *sizearg)
+static void try_gc_save(value x, ulong gcsize, size_t *size, uint8_t **result)
+{
+  GCPRO(x);
+  gc_reserve(gcsize);
+  UNGCPRO();
+
+  major_offset = 0;
+  newstart0 = newpos0 = posgen0 - gcsize; newend0 = posgen0;
+
+  /* Save data needed for reload: address of start of block */
+  save_offset = 0 - (ulong)newstart0;
+
+  *(uint8_t **)newpos0 = (uint8_t *)htonlong((ulong)newstart0 + save_offset);
+  newpos0 += sizeof (uint8_t *);
+
+  /* And then, a nice gone value */
+  *(struct obj *)newpos0 = (struct obj){
+    .size         = htonlong(sizeof (struct obj)),
+    .garbage_type = garbage_string,
+    .type         = type_gone,
+    .flags        = htons(OBJ_READONLY | OBJ_IMMUTABLE),
+#ifdef GCDEBUG
+    .generation   = minorgen,
+#endif
+  };
+  newpos0 += sizeof (struct obj);
+
+  /* Forward the root value */
+  union obj_adr *save = (union obj_adr *)newpos0;
+  newpos0 += sizeof *save;
+  save->a = (ulong)x;
+  if (pointerp(x))
+    {
+      save_forward(&save->o);
+      save->a += save_offset;
+    }
+  save->a = htonlong(save->a);
+
+  /* Scan copied data */
+  save_hwm = (uint8_t *)(save + 1);
+  while (save_hwm < newpos0)
+    save_hwm = save_scan(save_hwm);
+  assert(save_hwm == newpos0);
+
+  /* Restore old block (contains forwarded data) */
+  save_restore(x);
+
+  *size = newpos0 - newstart0;
+  free_static_data_table();
+  *result = newstart0;
+}
+
+static enum gcmem_result gc_save_setjmp(value x, ulong gcsize, size_t *size,
+                                        uint8_t **result)
+{
+  switch (sigsetjmp(nomem, 0))
+    {
+    case 0:
+      try_gc_save(x, gcsize, size, result);
+      return gcmem_success;
+
+    case gcmem_grow_memory:
+      return gcmem_grow_memory;
+
+    default:
+      abort();
+    }
+}
+
+const void *gc_save(value x, size_t *size)
 /* Effects: Saves a value x into a contiguous block of memory so
      that it can be reloaded by gc_load.
 
@@ -1938,69 +2030,17 @@ void *gc_save(value xarg, unsigned long *sizearg)
      *size contains the # of bytes required for x.
 */
 {
-  volatile value x = xarg;
-  unsigned long *const volatile size = sizearg;
-  volatile ulong gcsize = DEF_SAVE_SIZE;
+  ulong gcsize = DEF_SAVE_SIZE;
+  uint8_t *result;
 
+  GCPRO(x);
   for (;;)
-    switch (sigsetjmp(nomem, 0))
+    switch (gc_save_setjmp(x, gcsize, size, &result))
       {
-      case 0:
-        /* Be really sure that there is enough space for the header */
-        {
-          value xlocal = x; /* don't try to protect volatile object */
-          GCPRO(xlocal);
-          gc_reserve(gcsize);
-          UNGCPRO();
-          x = xlocal;
-        }
+      case gcmem_success:
+        goto done;
 
-        major_offset = 0;
-        newstart0 = newpos0 = posgen0 - gcsize; newend0 = posgen0;
-
-        /* Save data needed for reload: address of start of block */
-        save_offset = 0 - (ulong)newstart0;
-
-        *(uint8_t **)newpos0
-          = (uint8_t *)htonlong((ulong)newstart0 + save_offset);
-        newpos0 += sizeof (uint8_t *);
-
-        /* And then, a nice gone value */
-        *(struct obj *)newpos0 = (struct obj){
-          .size         = htonlong(sizeof (struct obj)),
-          .garbage_type = garbage_string,
-          .type         = type_gone,
-          .flags        = htons(OBJ_READONLY | OBJ_IMMUTABLE),
-#ifdef GCDEBUG
-          .generation   = minorgen,
-#endif
-        };
-        newpos0 += sizeof (struct obj);
-
-        /* Forward the root value */
-	union obj_adr *save = (union obj_adr *)newpos0;
-        newpos0 += sizeof *save;
-	save->a = (ulong)x;
-        if (pointerp(x))
-          {
-            save_forward(&save->o);
-            save->a += save_offset;
-          }
-        save->a = htonlong(save->a);
-
-        /* Scan copied data */
-        save_hwm = (uint8_t *)(save + 1);
-        while (save_hwm < newpos0) save_hwm = save_scan(save_hwm);
-        assert(save_hwm == newpos0);
-
-        /* Restore old block (contains forwarded data) */
-        save_restore(x);
-
-        *size = newpos0 - newstart0;
-        free_static_data_table();
-        return newstart0;
-
-      case nomem_grow_memory:
+      case gcmem_grow_memory:
         /* No memory, try again */
         save_restore(x);
         gcsize *= 2;
@@ -2009,6 +2049,9 @@ void *gc_save(value xarg, unsigned long *sizearg)
       default:
         abort();
       }
+ done:
+  UNGCPRO();
+  return result;
 }
 
 struct obj32
@@ -2028,43 +2071,35 @@ struct grecord32
   uint32_t data[];
 };
 
-/* legacy tables only exist in 32-bit; union to avoid aliasing problems */
-union legacy_table
-{
-  struct obj o;
-  struct {
-    struct obj32 o;
-    union {
-      struct {
-        uint32_t size;
-        uint32_t used;
-        uint32_t buckets;
-      } old;
-      struct {
-        uint32_t used;
-        uint32_t buckets;
-      } new;
-    } u;
-  } o32;
+/* legacy tables only exist in 32-bit */
+struct legacy_table {
+  struct obj32 o;
+  union {
+    struct {
+      uint32_t size;
+      uint32_t used;
+      uint32_t buckets;
+    } old;
+    struct {
+      uint32_t used;
+      uint32_t buckets;
+    } new;
+  } u;
 };
+CASSERT(_Alignof (struct legacy_table) == 4);
 
 /* requires ltab->o.size to be in host endianness */
-static void update_legacy_table(union legacy_table *ltab)
+static void update_legacy_table(struct legacy_table *ltab)
 {
-  if (ltab->o32.o.type != type_table
-      || ltab->o32.o.size != sizeof ltab->o32.o + sizeof ltab->o32.u.old)
+  if (ltab->o.type != type_table
+      || ltab->o.size != sizeof ltab->o + sizeof ltab->u.old)
     return;
 
-  uint32_t used = ltab->o32.u.old.used;
-  uint32_t buckets = ltab->o32.u.old.buckets;
-  ltab->o32.u.new.used = used;
-  ltab->o32.u.new.buckets = buckets;
-
-  /* ensure we alias the correct type */
-  if (sizeof (ulong) == sizeof (uint32_t))
-    ltab->o.size = sizeof ltab->o32.o + sizeof ltab->o32.u.new;
-  else
-    ltab->o32.o.size = sizeof ltab->o32.o + sizeof ltab->o32.u.new;
+  uint32_t used = ltab->u.old.used;
+  uint32_t buckets = ltab->u.old.buckets;
+  ltab->u.new.used = used;
+  ltab->u.new.buckets = buckets;
+  ltab->o.size = sizeof ltab->o + sizeof ltab->u.new;
 }
 
 static void load_forward(void *_ptr)
@@ -2078,35 +2113,36 @@ static void load_forward(void *_ptr)
   /* And GC them to generation 0 */
   /* This only works because garbage_type is a single byte... */
   if (obj->garbage_type == garbage_forwarded)
-    ptr->a = obj->size;
-  else
     {
-      /* Forward to generation 0 */
-      obj->size = ntohlong(obj->size);
-      if (sizeof (ulong) == sizeof (uint32_t))
-	update_legacy_table((union legacy_table *)obj);
-      obj->flags = ntohs(obj->flags);
-
-      ulong asize = MUDLLE_ALIGN(obj->size, sizeof (value));
-      newobj = (struct obj *)(newpos0 -= asize);
-      assert(newpos0 >= newstart0);
-#ifdef GCDEBUG
-      obj->generation = minorgen;
-#endif
-#ifdef GCQDEBUG
-      if (obj->size > maxobjsize) maxobjsize = obj->size;
-#endif
-      ptr->o = move_object(obj, newobj, minorgen);
+      ptr->a = obj->size;
+      return;
     }
+
+  assert(obj->type < VLENGTH(saveable_object_type));
+  if (!saveable_object_type[obj->type])
+    {
+      abort();
+    }
+
+  /* Forward to generation 0 */
+  obj->size = ntohlong(obj->size);
+  if (sizeof (ulong) == sizeof (uint32_t))
+    update_legacy_table((struct legacy_table *)obj);
+  obj->flags = ntohs(obj->flags);
+
+  ulong asize = MUDLLE_ALIGN(obj->size, sizeof (value));
+  newobj = (struct obj *)(newpos0 -= asize);
+  assert(newpos0 >= newstart0);
+#ifdef GCDEBUG
+  obj->generation = minorgen;
+#endif
+  ptr->o = move_object(obj, newobj, minorgen);
 }
 
-struct table_node {
-  struct table_node *next;
-  struct table *t;
-};
+ARRAY_STRUCT(table_array, struct table *);
 
-static uint8_t *load_scan(uint8_t *ptr, struct table_node **old_tables,
-                        bool make_sym_names_ro)
+static uint8_t *load_scan(uint8_t *ptr, struct table_array *old_tables,
+                          bool make_sym_names_ro)
 {
   struct obj *obj = (struct obj *)ptr;
 
@@ -2132,21 +2168,14 @@ static uint8_t *load_scan(uint8_t *ptr, struct table_node **old_tables,
 	  o->a = ntohlong(o->a);
 	  if (pointerp(o->o))
 	    {
-	      special_forward(o);
+	      special_forward_obj(o);
 	      if (imm)
 		assert(o->o->flags & OBJ_IMMUTABLE);
 	    }
 	}
 
-      if (old_tables && obj->type == type_table)
-        {
-          struct table_node *t = malloc(sizeof *t);
-          *t = (struct table_node){
-            .next = *old_tables,
-            .t    = (struct table *)obj
-          };
-          *old_tables = t;
-        }
+      if (old_tables != NULL && obj->type == type_table)
+        ARRAY_ADD(*old_tables, (struct table *)obj);
 
       if (make_sym_names_ro && obj->type == type_symbol)
         {
@@ -2161,7 +2190,7 @@ static uint8_t *load_scan(uint8_t *ptr, struct table_node **old_tables,
 }
 
 static value _gc_load(gc_forward_fn forwarder,
-		      uint8_t *load, value *_old, unsigned long size,
+		      uint8_t *load, value *old, unsigned long size,
 		      bool rehash_tables, bool make_sym_names_ro)
 /* Effects: Reloads a value saved with gc_save. <load,size> delimits
      the zone of memory containing gc_save's results.
@@ -2169,28 +2198,27 @@ static value _gc_load(gc_forward_fn forwarder,
    Returns: The loaded value
 */
 {
-  uint8_t *data, *unscanned0, *oldstart0;
-
   /* Data is loaded into generation 0 */
 
   major_offset = 0;
-  special_forward = forwarder;
+  special_forward_obj = forwarder;
   newstart0 = startgen0; newend0 = endgen0; newpos0 = posgen0;
 
   /* Old value of pointer to first value, forward it */
-  union obj_adr *old = (union obj_adr *)_old;
-  old->a = ntohlong(old->a);
-  if (pointerp(old->o)) special_forward(&old->o);
+  *old = (value)ntohlong((ulong)*old);
+
+  special_forward(old);
 
   /* track tables that have to be rehashed */
-  struct table_node *old_tables = NULL;
-  struct table_node **old_tables_ptr = rehash_tables ? &old_tables : NULL;
+  struct table_array old_tables = ARRAY_NULL;
+  struct table_array *old_tables_ptr = rehash_tables ? &old_tables : NULL;
 
   /* Must scan forwards, but data is allocated downwards => double loop */
-  unscanned0 = posgen0;		/* Upper bound of unscanned data */
+  uint8_t *unscanned0 = posgen0; /* Upper bound of unscanned data */
+  uint8_t *oldstart0;
   do
     {
-      oldstart0 = data = newpos0;
+      uint8_t *data = oldstart0 = newpos0;
       while (data < unscanned0)
         data = load_scan(data, old_tables_ptr, make_sym_names_ro);
       assert(data == unscanned0);
@@ -2200,14 +2228,11 @@ static value _gc_load(gc_forward_fn forwarder,
 
   posgen0 = newpos0;
 
-  for (struct table_node *t = old_tables, *next; t; t = next)
-    {
-      next = t->next;
-      rehash_table(t->t);
-      free(t);
-    }
+  ARRAY_FOR (old_tables, , struct table *, t)
+    rehash_table(t);
+  ARRAY_FREE(old_tables);
 
-  return old->o;
+  return *old;
 }
 
 static void internal_load_forward32(void *_ptr, bool strip_generation)
@@ -2215,12 +2240,12 @@ static void internal_load_forward32(void *_ptr, bool strip_generation)
   struct obj **ptr = _ptr;
 
   /* Correct pointer addresses on load */
-  struct obj32 *obj = (struct obj32 *)((uint8_t *)*ptr + from_offset);
+  struct obj32 *obj = (struct obj32 *)PTRADD(*ptr, from_offset);
 
   /* And GC them to generation 0 */
   if (obj->garbage_type == garbage_forwarded)
     {
-      *ptr = (value)(posgen0 - obj->size);
+      *ptr = (struct obj *)(posgen0 - obj->size);
       return;
     }
 
@@ -2245,15 +2270,20 @@ static void internal_load_forward32(void *_ptr, bool strip_generation)
           struct obj32 o;
         } new;
       } *dobj = (union obj32_debug *)obj;
-      CASSERT_EXPR(offsetof(union obj32_debug, new.o) == 4);
-      CASSERT_EXPR(sizeof (dobj->old) == sizeof (dobj->new));
+      CASSERT(offsetof(union obj32_debug, new.o) == 4);
+      CASSERT(sizeof (dobj->old) == sizeof (dobj->new));
       struct obj32 o = dobj->old.o;
       o.size -= sizeof dobj->old - sizeof o;
       dobj->new.o = o;
       obj = &dobj->new.o;
     }
 
-  update_legacy_table((union legacy_table *)obj);
+  if (!saveable_object_type[obj->type])
+    {
+      abort();
+    }
+
+  update_legacy_table((struct legacy_table *)obj);
 
   /* Forward to generation 0 and change from 32-bit format */
   uint32_t size = obj->size; /* 32-bit size */
@@ -2295,7 +2325,7 @@ static void internal_load_forward32(void *_ptr, bool strip_generation)
       {
         struct grecord32 *gobj = (struct grecord32 *)obj;
         ulong orecs = (size - sizeof *gobj) / sizeof gobj->data[0];
-        for (int i = 0; i < orecs; ++i)
+        for (ulong i = 0; i < orecs; ++i)
           {
             uint32_t d32 = ntohl(gobj->data[i]);
             /* only integers must be sign-extended */
@@ -2309,7 +2339,7 @@ static void internal_load_forward32(void *_ptr, bool strip_generation)
     }
 
   orig_obj->garbage_type = garbage_forwarded;
-  newobj = (struct obj *)((uint8_t *)newobj + major_offset);
+  newobj = PTRADD(newobj, major_offset);
   orig_obj->size = posgen0 - (uint8_t *)newobj;
 
   *ptr = newobj;
@@ -2331,12 +2361,12 @@ static void load_forward_debug(void *_ptr)
   struct obj **ptr = _ptr;
 
   /* Correct pointer addresses on load */
-  struct obj *obj = (struct obj *)((uint8_t *)*ptr + from_offset);
+  struct obj *obj = PTRADD(*ptr, from_offset);
 
   /* And GC them to generation 0 */
   if (obj->garbage_type == garbage_forwarded)
     {
-      *ptr = (value)obj->size;
+      *ptr = (struct obj *)obj->size;
       return;
     }
 
@@ -2428,29 +2458,37 @@ value gc_load(void *_load, unsigned long size,
 /* Machine specific portion of allocator */
 /* ------------------------------------- */
 
-#if (defined __i386__ || defined __x86_64__) && !defined NOCOMPILER
-static void flush_icache(uint8_t *from, uint8_t *to)
+#if defined __x86_64__ && !defined NOCOMPILER
+static void flush_icache(const uint8_t *from, const uint8_t *to)
 {
   VALGRIND_DISCARD_TRANSLATIONS((ulong)from, (ulong)(to - from));
 }
 
 struct mcode *find_pc_mcode(ulong pc, ulong range_start, ulong range_end)
 {
-  uint8_t *magic = (uint8_t *)((pc & ~(CODE_ALIGNMENT - 1))
-                           - sizeoffield(struct mcode, magic));
+  uint64_t *magic = (uint64_t *)(pc & ~(CODE_ALIGNMENT - 1)) - 1;
 
   if ((ulong)magic < range_start || pc > range_end)
     return NULL;
 
+ again:
   /* We have found a collectable code object.
      First find where it begins by locating its magic sequence */
-  while (((uint32_t *)magic)[0] != 0xffffffff
-         || ((uint32_t *)magic)[1] != 0xffffffff)
-    magic -= CODE_ALIGNMENT;
+  while (*magic != MCODE_MAGIC)
+    magic = PTRADD(magic, -CODE_ALIGNMENT);
 
-  struct mcode *mcode = (struct mcode *)(
-    magic - offsetof(struct mcode, magic));
+  struct mcode *mcode = (struct mcode *)PTRADD(
+    magic, -offsetof(struct mcode, magic));
   assert((ulong)mcode >= range_start);
+
+  if (mcode->code.o.type != type_mcode)
+    {
+      magic -= CODE_ALIGNMENT;
+      goto again;
+    }
+
+  assert(mcode->code.o.garbage_type == garbage_mcode
+         || mcode->code.o.garbage_type == garbage_forwarded);
 
   /* pc may be after the last instruction byte as that may be a
      (noreturn) call to berror_xxx */
@@ -2468,7 +2506,7 @@ static void forward_pc(ulong *pcreg)
 
   GCCHECK(base);
   struct mcode *oldbase = base;
-  special_forward(((char *)&base)); /* type punning */
+  special_forward_obj(&base);
 
   /* And adjust the pc value for the new base location */
   *pcreg = (ulong)base + (*pcreg - (ulong)oldbase);
@@ -2476,59 +2514,15 @@ static void forward_pc(ulong *pcreg)
 
 static void forward_ccontext(struct ccontext *cc)
 {
-#define FWD(field) if (pointerp(cc->field)) special_forward(&cc->field)
- #define __FWD_CALLEE(n, reg) FWD(callee.reg)
- #define __FWD_CALLER(n, reg) FWD(caller.reg)
+#define FWD(field) special_forward(&cc->field)
+#define __FWD_CALLEE(n, reg) FWD(callee.reg)
+#define __FWD_CALLER(n, reg) FWD(caller.reg)
   FOR_CALLEE_SAVE(__FWD_CALLEE, SEP_SEMI);
   FOR_CALLER_SAVE(__FWD_CALLER, SEP_SEMI);
- #undef __FWD_CALLER
- #undef __FWD_CALLEE
+#undef __FWD_CALLER
+#undef __FWD_CALLEE
 #undef FWD
 }
-
-#ifdef __i386__
-static ulong *skip_prim_args(ulong *sp)
-{
-  /* move sp past arguments to a call to any primitive */
-  const uint8_t *return_pc = (const uint8_t *)sp[-1];
-  static const uint8_t closure_dispatch[] = {
-    /* add $offsetof(icode, magic_dispatch),%ecx */
-    0x83, 0xc1, offsetof(struct icode, magic_dispatch),
-    /* call %*ecx */
-    0xff, 0xd1
-  };
-  if (memcmp(closure_dispatch, return_pc - sizeof closure_dispatch,
-             sizeof closure_dispatch) == 0)
-    {
-      /* Calling known closures. This can be the first frame when
-         calling interpreted closures; i.e., interpreter_invoke() */
-      return sp;
-    }
-
-  assert(return_pc[-5] == 0xe8);
-  /* we might be garbage-collecting, so we have to find which address
-     the call preceding return_pc should be computed relatively to */
-  struct mcode *base = find_pc_mcode((ulong)return_pc, (ulong)gcrange_start,
-                                     (ulong)gcrange_end);
-  ulong gcofs = base == NULL ? 0 : (ulong)base->myself - (ulong)base;
-
-  ulong primadr = (ulong)return_pc + *(ulong *)(return_pc - 4) + gcofs;
-  if (primadr >= (ulong)&builtin_start && primadr < (ulong)&builtin_end)
-    return sp;
-
-  assert(lookup_primitive(primadr) != NULL);
-
-  /* check for (optional) add $N,%esp */
-  if (return_pc[0] == 0x83 && return_pc[1] == 0xc4)
-    {
-      ulong primstacksize = return_pc[2];
-      assert(primstacksize % sizeof (ulong) == 0);
-      return (ulong *)((ulong)sp + primstacksize);
-    }
-
-  return sp;
-}
-#endif
 
 static void forward_registers(void)
 {
@@ -2541,21 +2535,15 @@ static void forward_registers(void)
       ulong *sp, *bp;
       ccontext_frame(cc, &bp, &sp);
 
-      // The return address is at sp[-1]
+      /* The return address is at sp[-1] */
       ulong *return_pc = &sp[-1];
-
-#ifdef __i386__
-      /* First frame is special: it may contain C arguments that might
-	 be overwritten; make sure to skip them */
-      sp = skip_prim_args(sp);
-#endif
 
       forward_pc(return_pc);
 
       forward_pc(bp + 1);
       /* forward mudlle values & caller's closure) */
       for (ulong *x = sp; x < bp; x++)
-	if (pointerp(*x)) special_forward((value *)x);
+	special_forward((value *)x);
 
       sp = bp + 2;
       assert(bp[0] > (ulong)bp);
@@ -2571,7 +2559,7 @@ static void forward_registers(void)
 	  forward_pc(bp + 1);
           /* forward mudlle values & caller's closure) */
 	  for (ulong *x = sp; x < bp; x++)
-	    if (pointerp(*x)) special_forward(x);
+	    special_forward((value *)x);
 
 	  sp = bp + 2;
 	  assert(bp[0] > (ulong)bp);
@@ -2581,7 +2569,7 @@ static void forward_registers(void)
 
       ulong *argsend = ccontext_argsend(cc);
       for (ulong *x = sp; x < argsend; x++)
-	if (pointerp(*x)) special_forward(x);
+	special_forward((value *)x);
     }
 
   /* Also forward saved ccontexts */
@@ -2604,124 +2592,66 @@ static void unmark_safe_registers(void)
     }
 }
 
-static uint32_t get_cst_ofs32(void **srcp)
+#ifdef __x86_64__
+static void for_mcode_constants(struct mcode *code, gc_forward_fn cb)
 {
-  return *((*(uint32_t **)srcp)++);
-}
-
-static uint32_t get_cst_ofs16(void **srcp)
-{
-  return *((*(uint16_t **)srcp)++);
-}
-
-static void *add_cst_ofs32(void *dst, uint32_t ofs)
-{
-  *(uint32_t *)dst = ofs;
-  return (uint32_t *)dst + 1;
-}
-
-static void *add_cst_ofs16(void *dst, uint32_t ofs)
-{
-  *(uint16_t *)dst = ofs;
-  return (uint16_t *)dst + 1;
-}
-
-void mcode_fields(struct mcode_fields *f, const struct mcode *mcode)
-{
-#ifdef __i386__
-  const uint32_t nb_pc_rel = 0;
-  const uint32_t nb_rel = mcode->nb_rel;
-#else
-  const uint32_t nb_pc_rel = mcode->nb_pc_rel;
-  const uint32_t nb_rel = 0;
-#endif
-  mcode_fields_spec(f, (char *)mcode->mcode, mcode->code_length,
-                    nb_pc_rel, nb_rel, mcode->nb_constants);
-}
-
-void mcode_fields_spec(struct mcode_fields *f, char *mcode,
-                       ulong code_len, uint32_t nb_pc_rel,
-                       uint32_t nb_rel, uint32_t nb_constants)
-{
-  *f = (struct mcode_fields){ 0 };
-
-#ifdef __i386__
-  const unsigned npcrel = 0;
-#elif defined __x86_64__
-  const unsigned npcrel = nb_pc_rel;
-#endif
-  ulong tot_clen = code_len;
-  if (npcrel)
+  ulong ofs = code->code_length;
+  if (code->npcrel > 0)
     {
-      tot_clen = MUDLLE_ALIGN(tot_clen, sizeof (value));
-      f->code_pad = tot_clen - code_len;
-      tot_clen += npcrel * sizeof (value);
+      ofs = MUDLLE_ALIGN(ofs, sizeof (value));
+      ofs += code->npcrel * sizeof (value);
     }
 
-  uint32_t nofs = nb_rel + nb_constants;
-  if (nofs)
+  const uint8_t *csts = code->mcode + ofs;
+  const uint8_t *end = (const uint8_t *)code + code->code.o.size;
+  for (enum mcode_const_type ct = 0; ct < mcode_const_types; ++ct)
     {
-      unsigned cstsize;
-      if (tot_clen > UINT16_MAX)
+      if (csts == end)
+        return;
+      assert(csts < end);
+      uint64_t ncsts = read_leb_u(&csts);
+      uint64_t prev_cofs = 0;
+      while (ncsts-- > 0)
         {
-          cstsize = sizeof (uint32_t);
-          f->get_cst_ofs = get_cst_ofs32;
-          f->add_cst_ofs = add_cst_ofs32;
+          uint64_t cofs = prev_cofs + read_leb_u(&csts);
+          union {
+            ulong u;
+            value v;
+          } u;
+          memcpy(&u, code->mcode + cofs, sizeof (value));
+          if (ct == mcode_ct_code_entry)
+            {
+              u.u -= offsetof(struct mcode, mcode);
+              cb(&u.v);
+              u.u += offsetof(struct mcode, mcode);
+            }
+          else if (pointerp(u.v))
+            cb(&u.v);
+          else
+            goto skip_copy;
+          memcpy(code->mcode + cofs, &u.u, sizeof (value));
+        skip_copy:
+          prev_cofs = cofs + sizeof (value);
         }
-      else
-        {
-          cstsize = sizeof (uint16_t);
-          f->get_cst_ofs = get_cst_ofs16;
-          f->add_cst_ofs = add_cst_ofs16;
-        }
-      tot_clen = MUDLLE_ALIGN(tot_clen, cstsize);
-      if (npcrel == 0)
-        f->code_pad = tot_clen - code_len;
-      f->cst_offsets = mcode + tot_clen;
-      tot_clen += nofs * cstsize;
     }
-  f->code_size = tot_clen;
 }
+#endif  /* __x86_64__ */
 
 static void scan_mcode(struct mcode *code)
 {
   special_forward_code(&code->code);
+  for_mcode_constants(code, special_forward_obj);
+}
 
-  struct mcode_fields f;
-  mcode_fields(&f, code);
-
-  for (int i = code->nb_constants; i > 0; --i)
-    {
-      uint32_t ofs = f.get_cst_ofs(&f.cst_offsets);
-      value *c = (value *)(code->mcode + ofs);
-      if (pointerp(*c))
-	special_forward(c);
-    }
-
-#ifdef __i386__
-  /* Relocate calls to builtins */
-  uint8_t *old_base = (uint8_t *)code->myself;
-  code->myself = (struct mcode *)((uint8_t *)code + major_offset);
-  ulong delta = old_base - (uint8_t *)code->myself;
-  for (int i = code->nb_rel; i > 0; --i)
-    {
-      uint32_t ofs = f.get_cst_ofs(&f.cst_offsets);
-      *(ulong *)(code->mcode + ofs) += delta;
-    }
-#endif
+static void save_restore_forward(void *ptr)
+{
+  save_restore(*(struct obj **)ptr);
 }
 
 static void save_restore_mcode(struct mcode *code)
 {
   save_restore_code(&code->code);
-
-  struct mcode_fields f;
-  mcode_fields(&f, code);
-  for (int i = code->nb_constants; i > 0; --i)
-    {
-      uint32_t ofs = f.get_cst_ofs(&f.cst_offsets);
-      save_restore(*(value *)(code->mcode + ofs));
-    }
+  for_mcode_constants(code, save_restore_forward);
 }
 
 static void patch_value(value *x, value oldglobals, value newglobals)
@@ -2732,9 +2662,7 @@ static void patch_value(value *x, value oldglobals, value newglobals)
 
 void patch_globals_stack(value oldglobals, value newglobals)
 {
-#ifdef __i386__
- #define REG_GLOBALS esi
-#elif defined __x86_64__
+#ifdef __x86_64__
  #define REG_GLOBALS rbx
 #endif
 
@@ -2769,7 +2697,7 @@ void patch_globals_stack(value oldglobals, value newglobals)
     patch_value(&mcc->old_ccontext.callee.REG_GLOBALS, oldglobals, newglobals);
 }
 
-#endif  /* (__i386__ || __x86_64__) && ! NOCOMPILER */
+#endif  /* __x86_64__ && ! NOCOMPILER */
 
 #ifdef NOCOMPILER
 struct mcode *find_pc_mcode(ulong pc, ulong range_start, ulong range_end)
@@ -2777,7 +2705,7 @@ struct mcode *find_pc_mcode(ulong pc, ulong range_start, ulong range_end)
   return NULL;
 }
 
-static void flush_icache(uint8_t *from, uint8_t *to)
+static void flush_icache(const uint8_t *from, const uint8_t *to)
 {
 }
 
@@ -2794,7 +2722,7 @@ static void save_restore_mcode(struct mcode *code)
 }
 #endif  /* NOCOMPILER */
 
-static struct ary func_ary;
+static ARRAY_T(struct obj *) func_array;
 
 static void func_forward(void *_ptr)
 {
@@ -2805,8 +2733,8 @@ static void func_forward(void *_ptr)
       || obj->garbage_type == garbage_static_string)
     return;
 
-  if (is_typeset(obj, TYPESET_PRIMITIVE | TSET(code) | TSET(mcode)))
-    ary_add(&func_ary, obj);
+  if (is_typeset(obj, TYPESET_PRIMITIVE | TSET(icode) | TSET(mcode)))
+    ARRAY_ADD(func_array, obj);
 
   obj->flags |= OBJ_FLAG_0;
   scan((void *)obj);
@@ -2834,30 +2762,31 @@ struct vector *all_mudlle_code(void)
 #ifdef GCQDEBUG
       allowed_obj_flags |= OBJ_FLAG_0;
 #endif
-      special_forward = func_forward;
+      special_forward_obj = func_forward;
       forward_roots();
-      special_forward = func_unforward;
+      special_forward_obj = func_unforward;
       forward_roots();
 #ifdef GCQDEBUG
       allowed_obj_flags &= ~OBJ_FLAG_0;
 #endif
 
-      ulong gcgen = gcstats.minor_count + gcstats.major_count;
+      ulong gcgen = gc_generation();
       if (res == NULL)
-        res = alloc_vector(ary_entries(&func_ary));
+        res = alloc_vector(ARRAY_ENTRIES(func_array));
       else
-        assert(vector_len(res) == ary_entries(&func_ary));
-      if (gcgen == gcstats.minor_count + gcstats.major_count)
+        assert(vector_len(res) == ARRAY_ENTRIES(func_array));
+      if (gcgen == gc_generation())
         break;
       /* if there was a GC while allocating res, func_ary() contains
          old pointers and we need to recreate it */
 
-      ary_empty(&func_ary);
+      ARRAY_EMPTY(func_array);
     }
 
-  memcpy(res->data, func_ary.data, sizeof (value) * ary_entries(&func_ary));
+  memcpy(res->data, &ARRAY_GET(func_array, 0),
+         sizeof (value) * ARRAY_ENTRIES(func_array));
 
-  ary_free(&func_ary);
+  ARRAY_FREE(func_array);
 
   return res;
 }
@@ -2871,4 +2800,132 @@ value make_immutable(value v)
   if (!try_make_immutable(v))
     abort();
   return v;
+}
+
+static bool obj_in_gen0(struct obj *obj)
+{
+  return PTR_IN_RANGE(obj, startgen0, endgen0);
+}
+
+struct obj *alloc_weak_ref(enum mudlle_type type, size_t bytes,
+                           void *cbdata, weak_ref_free_fn cbfree)
+{
+  struct obj *obj = allocate_obj(false, garbage_ctemp, type, bytes, 0);
+  struct weak_ref *ref = malloc(sizeof *ref);
+  *ref = (struct weak_ref){
+    .next   = weak_refs,
+    .obj    = obj,
+    .cbdata = cbdata,
+    .cbfree = cbfree
+  };
+  weak_refs = ref;
+  return obj;
+}
+
+static void free_weak_refs(struct weak_ref *fnode)
+{
+  for (struct weak_ref *next; fnode != NULL; fnode = next)
+    {
+      next = fnode->next;
+      fnode->cbfree(fnode->cbdata);
+      free(fnode);
+    }
+}
+
+static struct weak_ref *minor_forward_weak_refs(void)
+{
+  struct weak_ref *tofree = NULL;
+  for (struct weak_ref **refp = &weak_refs; *refp != NULL; )
+    {
+      struct weak_ref *ref = *refp;
+      struct obj *obj = ref->obj;
+      /* weak refs must be in gen0; they are never immutable */
+      assert(obj_in_gen0(obj));
+      if (obj->garbage_type == garbage_forwarded)
+        {
+          ulong newobj = obj->size - minor_offset;
+          assert(PTR_IN_RANGE(newobj, newpos0, newend0));
+          obj = (struct obj *)newobj;
+        }
+      else
+        {
+          /* 'ref' is in gen0 but the collection hasn't moved it.
+             It can thus be freed. */
+          *refp = ref->next;
+          ref->next = tofree;
+          tofree = ref;
+          continue;
+        }
+
+      if (obj->type == type_weak_ref)
+        {
+          struct mweak_ref *mref = (struct mweak_ref *)obj;
+          if (pointerp(mref->v))
+            {
+              struct obj *vobj = mref->v;
+              if (vobj->garbage_type != garbage_forwarded
+                  && obj_in_gen0(vobj))
+                {
+                  /* 'vobj' is in gen0 but the collection hasn't moved it.
+                     We can clear the reference. */
+                  mref->v = static_gone;
+                }
+              else
+                minor_forward(&mref->v);
+            }
+        }
+
+      minor_forward(&ref->obj);
+      refp = &ref->next;
+    }
+  return tofree;
+}
+
+static struct weak_ref *major_forward_weak_refs(void)
+{
+  struct weak_ref *tofree = NULL;
+  for (struct weak_ref **refp = &weak_refs; *refp != NULL; )
+    {
+      struct weak_ref *ref = *refp;
+      struct obj *obj = ref->obj;
+      /* weak refs must be in gen0; they are never immutable */
+      assert(obj_in_gen0(obj));
+      if (obj->garbage_type == garbage_forwarded)
+        {
+          ulong newobj = ref->obj->size;
+          obj = (struct obj *)newobj;
+        }
+      else if (newarea)
+        {
+          /* 'ref' is in gen0 during new major but the collection
+             hasn't moved it. It can thus be freed. */
+          *refp = ref->next;
+          ref->next = tofree;
+          tofree = ref;
+          continue;
+        }
+
+      if (obj->type == type_weak_ref)
+        {
+          struct mweak_ref *mref = (struct mweak_ref *)obj;
+          if (pointerp(mref->v))
+            {
+              struct obj *vobj = mref->v;
+              if (vobj->garbage_type != garbage_forwarded
+                  && vobj->garbage_type != garbage_static_string
+                  && (!obj_in_gen0(vobj) || newarea))
+                {
+                  /* 'obj' is in gen1 (or gen0 during new major) but the
+                     collection hasn't moved it. We can clear the reference. */
+                  mref->v = static_gone;
+                }
+              else
+                major_forward(&mref->v);
+            }
+        }
+
+      major_forward(&ref->obj);
+      refp = &ref->next;
+    }
+  return tofree;
 }

@@ -19,10 +19,7 @@
  * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-#include <string.h>
-
 #include "calloc.h"
-#include "code.h"
 #include "env.h"
 #include "global.h"
 #include "ins.h"
@@ -68,12 +65,12 @@ static struct locals_list *new_locals_list(struct alloc_block *heap,
                                            bool statics)
 {
   struct locals_list *newp = allocate(heap, sizeof *newp);
-
-  newp->next = next;
-  newp->index = idx;
-  newp->locals = vars;
-  newp->statics = statics;
-
+  *newp = (struct locals_list){
+    .next    = next,
+    .index   = idx,
+    .locals  = vars,
+    .statics = statics
+  };
   return newp;
 }
 
@@ -100,6 +97,11 @@ void env_push(struct vlist *locals, struct fncode *fn)
   env_stack = newp;
 }
 
+struct vlist *env_block_vlist(void)
+{
+  return env_stack->locals->locals;
+}
+
 struct variable_list *env_pop(uint16_t *nb_locals)
 {
   struct variable_list *closure = env_stack->closure;
@@ -114,7 +116,7 @@ bool env_block_push(struct vlist *locals, bool statics)
 {
   /* Add locals */
   env_stack->locals = new_locals_list(fnmemory(env_stack->fn), locals,
-				      env_stack->size, env_stack->locals,
+                                      env_stack->size, env_stack->locals,
                                       statics);
 
   /* Update size info, clears vars if necessary */
@@ -130,7 +132,10 @@ bool env_block_push(struct vlist *locals, bool statics)
       env_stack->max_size = nsize;
     }
   for (uint16_t i = env_stack->size; i < last_set; i++)
-    ins1(op_clear_local, i, env_stack->fn);
+    {
+      assert(i <= UINT8_MAX);
+      ins1(op_clear_local, i, env_stack->fn);
+    }
   env_stack->size = nsize;
 
   return true;
@@ -156,7 +161,7 @@ void env_end_loop(void)
 }
 
 static enum variable_class env_close(struct env_stack *env, ulong pos,
-                                ulong *offset)
+                                     ulong *offset)
 /* Effects: Adds local variable pos of environment env to all closures
      below it in the env_stack.
    Returns: vclass_local if env is the last environment on the stack,
@@ -166,28 +171,24 @@ static enum variable_class env_close(struct env_stack *env, ulong pos,
      environement is env_stack.
 */
 {
-  struct env_stack *subenv;
   enum variable_class vclass = vclass_local;
 
   /* Add <env,pos> to all environments below env */
-  for (subenv = env->prev; subenv; subenv = subenv->prev)
+  for (struct env_stack *subenv = env->prev; subenv; subenv = subenv->prev)
     {
       struct variable_list **closure;
       ulong coffset;
-      int found = false;
 
       /* Is <class,pos> already in closure ? */
-      for (coffset = 0, closure = &subenv->closure; *closure;
-	   coffset++, closure = &(*closure)->next)
-	if (vclass == (*closure)->vclass && pos == (*closure)->offset)
-	  {
-            /* Yes ! */
-	    found = true;
-	    break;
-	  }
-      if (!found)
-	/* Add variable to closure, at end */
-	*closure = new_varlist(fnmemory(subenv->fn), vclass, pos, NULL);
+      for (coffset = 0, closure = &subenv->closure;
+           *closure != NULL;
+           ++coffset, closure = &(*closure)->next)
+        if (vclass == (*closure)->vclass && pos == (*closure)->offset)
+          goto found;
+
+      /* Add variable to closure, at end */
+      *closure = new_varlist(fnmemory(subenv->fn), vclass, pos, NULL);
+    found:
 
       /* Copy reference to this closure position into <class,pos> */
       /* This is how the variable will be named in the next closure */
@@ -203,31 +204,38 @@ enum variable_class env_lookup(const char *name, ulong *offset,
                                bool *is_static)
 {
   *is_static = false;
-  if (strncasecmp(name, GLOBAL_ENV_PREFIX, strlen(GLOBAL_ENV_PREFIX)) == 0)
+  if (is_global_var_name(name))
     name += strlen(GLOBAL_ENV_PREFIX);
   else
-    for (struct env_stack *env = env_stack; env; env = env->next)
-      {
-	/* Look for variable in environment env */
-	for (struct locals_list *scope = env->locals;
-             scope;
-             scope = scope->next)
-          {
-            ulong pos = scope->index;
-            for (struct vlist *vars = scope->locals;
-                 vars;
-                 pos++, vars = vars->next)
-              if (strcasecmp(name, vars->var) == 0)
-                {
-                  if (do_read)
-                    vars->was_read = true;
-                  if (do_write)
-                    vars->was_written = true;
-                  *is_static = scope->statics;
-                  return env_close(env, pos, offset);
-                }
-          }
-      }
+    {
+      bool is_user = is_user_var_name(name);
+      for (struct env_stack *env = env_stack; env; env = env->next)
+        {
+          /* Look for variable in environment env */
+          for (struct locals_list *scope = env->locals;
+               scope;
+               scope = scope->next)
+            {
+              if (is_user && !scope->statics)
+                continue;
+
+              ulong pos = scope->index;
+              for (struct vlist *vars = scope->locals;
+                   vars;
+                   pos++, vars = vars->next)
+                if (strcasecmp(name, vars->var) == 0)
+                  {
+                    if (do_read)
+                      vars->was_read = true;
+                    if (do_write)
+                      vars->was_written = true;
+                    *is_static = scope->statics;
+                    return env_close(env, pos, offset);
+                  }
+            }
+        }
+      assert(!is_user);
+    }
 
   /* Not found, is global */
   *offset = global_lookup(name);

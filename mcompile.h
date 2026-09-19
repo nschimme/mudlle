@@ -24,8 +24,6 @@
 
 #include "mudlle-config.h"
 
-#include <stdbool.h>
-
 #include "types.h"
 
 struct alloc_block;
@@ -38,14 +36,16 @@ struct mfile;
 
 bool mstart(struct alloc_block *heap, struct mfile *f, seclev_t seclev);
 /* Effects: Start processing module f:
-     - unload f
      - load required modules
-     - change status of variables of f (defines, writes)
      - setup information for mrecall/massign/mexecute
 
      Sends error/warning messages.
    Returns: true if compilation can proceed
 */
+
+/* unloads 'f' and sets up variable statuses; should always succeed, but might
+   not due to bugs */
+bool mprerun(struct mfile *f);
 
 void mstop(struct mfile *f);
 /* Effects: Stop processing module f */

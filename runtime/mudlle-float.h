@@ -24,8 +24,6 @@
 
 #include "../error.h"
 
-#include "bigint.h"
-
 void float_init(void);
 
 enum runtime_error get_floatval(double *d, value v);
@@ -42,12 +40,14 @@ static inline double floatval(value v)
 #define DEF_FLOAT(var) system_define(#var, alloc_float(var))
 
 #ifdef USE_GMP
-#define FLOAT_TYPESET (TSET(integer) | TSET(bigint) | TSET(float))
+#define TYPESET_FLOAT (TSET(integer) | TSET(bigint) | TSET(float))
 #else
-#define FLOAT_TYPESET (TSET(integer) | TSET(float))
+#define TYPESET_FLOAT (TSET(integer) | TSET(float))
 #endif
 
-#define __CT_FLOAT_E(var, msg, dst) get_floatval(&(dst), var)
-#define CT_FLOAT(dst) F(FLOAT_TYPESET, __CT_FLOAT_E, dst)
+#define __CT_FLOAT_E(edst, var, msg, dst)       \
+  if (get_floatval(&(dst), var) != error_none)  \
+    abort()
+#define CT_FLOAT(dst) F(TYPESET_FLOAT, __CT_FLOAT_E, dst)
 
 #endif /* !RUNTIME_MUDLLE_FLOAT_H */

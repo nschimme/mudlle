@@ -25,10 +25,8 @@
 
 #include "mudlle-config.h"
 
-#include <stdlib.h>
-
 #include "charset.h"
-#include "mudlle-macro.h"
+#include "utils.h"
 
 /*
  * conversion table for latin1 to 7-bit ascii (for output)
@@ -276,48 +274,53 @@ const unsigned char latin1_to_lower[256] = {
 
 int str7icmp(const char *s1, const char *s2)
 {
-  int c1, c2;
-
-  while ((c1 = TO_7LOWER(*s1++)) == (c2 = TO_7LOWER(*s2++)) && c1)
-    ;
-
-  return (c1 < c2) ? -1 : (c1 != c2);
+  for (;;)
+    {
+      unsigned char c1 = TO_7LOWER(*s1++);
+      unsigned char c2 = TO_7LOWER(*s2++);
+      if (c1 != c2)
+        return c1 < c2 ? -1 : 1;
+      if (c1 == 0)
+        return 0;
+    }
 }
 
 int mem7icmp(const void *_s1, const void *_s2, size_t n)
 {
   const char *s1 = _s1, *s2 = _s2;
-  int c1, c2;
-
   while (n-- > 0)
-    if ((c1 = TO_7LOWER(*s1++)) != (c2 = TO_7LOWER(*s2++)))
-      return (c1 < c2) ? -1 : 1;
+    {
+      unsigned char c1 = TO_7LOWER(*s1++);
+      unsigned char c2 = TO_7LOWER(*s2++);
+      if (c1 != c2)
+        return c1 < c2 ? -1 : 1;
+    }
   return 0;
 }
 
-int str7nicmp(const char *s1, const char *s2, int n)
+int str7nicmp(const char *s1, const char *s2, size_t n)
 {
   while (n-- > 0)
     {
-      int c1 = TO_7LOWER(*s1++);
-      int c2 = TO_7LOWER(*s2++);
+      unsigned char c1 = TO_7LOWER(*s1++);
+      unsigned char c2 = TO_7LOWER(*s2++);
       if (c1 != c2)
-        return (c1 < c2) ? -1 : (c1 != c2);
+        return c1 < c2 ? -1 : 1;
       if (c1 == 0)
         return 0;
     }
   return 0;
 }
 
-void *mem7ichr(const void *_s, int _c, size_t n)
+void *mem7ichr(const void *s, int c, size_t n)
 {
-  int c = TO_7LOWER(_c);
-  const char *s = _s;
+  unsigned char c7 = TO_7LOWER(c);
+  const unsigned char *su = s;
   while (n > 0)
     {
-      if (c == TO_7LOWER(*s))
-        return (void *)s;
-      ++s;
+      if (c7 == TO_7LOWER(*su))
+        return (void *)su;
+      ++su;
       --n;
     }
   return NULL;
@@ -349,11 +352,6 @@ void str7lwr(char *str)
       ++str;
     }
 }
-
-struct char_name {
-  unsigned char c;
-  const char *name;
-};
 
 /* must be kept ascendingly sorted by name */
 #define FOR_ISO88591_CHARS(op)                                  \
@@ -550,14 +548,14 @@ struct char_name {
   op('¥', "YEN SIGN")
 
 #define __CHAR(a, b) a
-#define __NAME(a, b) { b, sizeof b - 1 }
-static const struct str_len {
-  const char *str;
-  size_t len;
-} iso88591names[] = {
+#define __NAME(a, b) [(unsigned char)a] = {     \
+    .len = sizeof b - 1,                        \
+    .str = b                                    \
+}
+static const struct cstrlen iso88591names[256] = {
   FOR_ISO88591_CHARS(__NAME)
 };
-static const unsigned char iso88591chars[] = {
+static const unsigned char sorted_iso88591chars[] = {
   FOR_ISO88591_CHARS(__CHAR)
 };
 #undef __CHAR
@@ -565,26 +563,35 @@ static const unsigned char iso88591chars[] = {
 
 static int cmp_char_name(const void *a, const void *b)
 {
-  const struct str_len *key = a;
-  const struct str_len *entry = b;
-  size_t clen = key->len < entry->len ? key->len : entry->len;
-  int r = memcmp(key->str, entry->str, clen);
+  const struct cstrlen *key = a;
+  const unsigned char *entry = b;
+  const struct cstrlen *ename = iso88591names + *entry;
+  size_t clen = MIN(key->len, ename->len);
+  int r = memcmp(key->str, ename->str, clen);
   if (r != 0)
     return r;
-  return clen < entry->len ? -1 : clen == key->len ? 0 : 1;
+  return clen < ename->len ? -1 : clen == key->len ? 0 : 1;
 }
 
 int lookup_named_character(const char *name, size_t namelen)
 {
-  struct str_len cdata = {
+  struct cstrlen cdata = {
     .str = name,
     .len = namelen
   };
-  const struct str_len *entry = bsearch(&cdata, iso88591names,
-                                        VLENGTH(iso88591names),
-                                        sizeof iso88591names[0],
-                                        cmp_char_name);
+  const unsigned char *entry = bsearch(
+    &cdata, sorted_iso88591chars,
+    VLENGTH(sorted_iso88591chars),
+    sizeof sorted_iso88591chars[0],
+    cmp_char_name);
   if (entry == NULL)
     return -1;
-  return iso88591chars[entry - iso88591names];
+  return *entry;
+}
+
+const char *iso88591_char_name(int c)
+{
+  if (c < 0 || (unsigned)c >= VLENGTH(iso88591names))
+    return NULL;
+  return iso88591names[c].str;
 }

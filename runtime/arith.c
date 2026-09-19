@@ -21,28 +21,24 @@
 
 #include "../mudlle-config.h"
 
+#include <float.h>
 #include <math.h>
-#include <stdlib.h>
+#include <string.h>
 
 #include "arith.h"
-#include "check-types.h"
 #include "mudlle-string.h"
 #include "prims.h"
 
-#include "../mvalues.h"
 #include "../random.h"
 
-
-static inline void check_integers(value a, value b,
-                                  const struct prim_op *op)
+static inline void check_integers(value a, value b, const struct prim_op *op)
 {
   if ((long)a & (long)b & 1)
     return;
   primitive_bad_type_error(integerp(a) ? b : a, type_integer, op, 2, a, b);
 }
 
-static inline void check_division(value a, value b,
-                                  const struct prim_op *op)
+static inline void check_division(value a, value b, const struct prim_op *op)
 {
   check_integers(a, b, op);
   if (b == makeint(0))
@@ -55,7 +51,17 @@ TYPEDOP(sqrt, , "`n1 -> `n2. Returns the truncated square root of the"
 {
   long l;
   CHECK_TYPES(n, CT_RANGE(l, 0, LONG_MAX));
-  return makeint((long)sqrt(l));
+  long r = sqrtl(l);
+  CASSERT(FLT_RADIX == 2);                /* if-logic below relies on this */
+  if (LDBL_MANT_DIG < TAGGED_INT_BITS - 1 /* sign bit doesn't count */
+      && (l >> LDBL_MANT_DIG) > 0)
+    {
+      /* the argument to sqrt() was rounded to the nearest long double and the
+         result might be too high */
+      while (r * r > l)
+        --r;
+    }
+  return makeint(r);
 }
 
 TYPEDOP(integerp, "integer?", "`x -> `b. Returns true if `x is an integer.",
@@ -107,17 +113,17 @@ EXT_TYPEDOP(subtract, "-", "`n1 `n2 -> `n3. Returns `n2 subtracted from `n1.",
 }
 
 TYPEDOP(negate, , "`n1 -> `n2. Returns the negation of `n1. For `MININT,"
-        " return `MININT.", (value v),
+        " return `MININT.", (value n),
 	(OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE
          | OP_CONST | OP_OPERATOR), "n.n")
 {
-  CHECK_TYPES(v, integer);
-  return (value)(2 - (long)v);
+  CHECK_TYPES(n, integer);
+  return (value)(2 - (long)n);
 }
 
 const struct prim_op *const negate_prim_ext = &op_negate;
 
-value code_multiply(value, value); /* used in x86builtins.S */
+value code_multiply(value v1, value v2); /* used in x64builtins.S */
 EXT_TYPEDOP(multiply, "*", "`n1 `n2 -> `n3. Returns `n1 multiplied by `n2.",
             (value v1, value v2), (v1, v2),
             (OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE
@@ -128,7 +134,7 @@ EXT_TYPEDOP(multiply, "*", "`n1 `n2 -> `n3. Returns `n1 multiplied by `n2.",
   return makeint(intval(v1) * intval(v2));
 }
 
-value code_divide(value, value);
+value code_divide(value v1, value v2);
 EXT_TYPEDOP(divide, "/", "`n1 `n2 -> `n3. Returns `n1 divided by `n2,"
             " truncating towards zero.\n"
             "Causes `error_divide_by_zero if `n2 is zero.",
@@ -141,11 +147,12 @@ EXT_TYPEDOP(divide, "/", "`n1 `n2 -> `n3. Returns `n1 divided by `n2,"
   return makeint(intval(v1) / intval(v2));
 }
 
-value code_remainder(value, value); /* used in x86builtins.S */
+value code_remainder(value v1, value v2); /* used in x64builtins.S */
 EXT_TYPEDOP(remainder, "%",
             "`n1 `n2 -> `n3. Returns the remainder of `n1 divided by `n2,"
             " truncated towards zero.\n"
-            "(`n1 / `n2) * `n2 + `n3 = `n1. Cf. `modulo().\n"
+            "(`n1 / `n2) * `n2 + `n3 = `n1.\n"
+            "`n3 will be zero or have the same sign as `n1. Cf. `modulo().\n"
             "Causes `error_divide_by_zero if `n2 is zero.",
             (value v1, value v2), (v1, v2),
             (OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE
@@ -157,8 +164,9 @@ EXT_TYPEDOP(remainder, "%",
 }
 
 TYPEDOP(modulo, , "`n1 `n2 -> `n3. Returns the remainder of `n1 divided"
-        " by `n2, rounding towards negative infinity.\n"
-        "floor(`n1 / `n2) * `n2 + `n3 = `n1. Cf. `%.\n"
+        " by `n2 rounded down towards negative infinity.\n"
+        "floor(`n1 / `n2) * `n2 + `n3 = `n1.\n"
+        "`n3 will be zero or have the same sign as `n2. Cf. `%.\n"
         "Causes `error_divide_by_zero if `n2 is zero.",
         (value v1, value v2),
         OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "nn.n")
@@ -205,14 +213,14 @@ TYPEDOP(min, , "`n1 `n2 -> `n3. Returns the lesser value of `n1 and `n2.",
 }
 
 TYPEDOP(abs, , "`n1 -> `n2. Returns the absolute value of `n1. For `MININT,"
-        " returns `MININT.", (value v),
+        " returns `MININT.", (value n),
         OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "n.n")
 {
-  CHECK_TYPES(v, integer);
-  return (value)(labs((long)v - 1) + 1);
+  CHECK_TYPES(n, integer);
+  return (value)(labs((long)n - 1) + 1);
 }
 
-EXT_TYPEDOP(bitor, "|", "`n1 `n2 -> `n3. Returns `n1 bitwise or `n2.",
+EXT_TYPEDOP(bitor, "|", "`n1 `n2 -> `n3. Returns `n1 bitwise OR `n2.",
             (value v1, value v2), (v1, v2),
             (OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE
              | OP_CONST | OP_OPERATOR),
@@ -222,7 +230,7 @@ EXT_TYPEDOP(bitor, "|", "`n1 `n2 -> `n3. Returns `n1 bitwise or `n2.",
   return (value)((long)v1 | (long)v2);
 }
 
-TYPEDOP(bitxor, "^", "`n1 `n2 -> `n3. Returns `n1 bitwise exclusive or `n2.",
+TYPEDOP(bitxor, "^", "`n1 `n2 -> `n3. Returns `n1 bitwise exclusive OR `n2.",
         (value v1, value v2),
         (OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE
          | OP_CONST | OP_OPERATOR), "nn.n")
@@ -231,7 +239,7 @@ TYPEDOP(bitxor, "^", "`n1 `n2 -> `n3. Returns `n1 bitwise exclusive or `n2.",
   return (value)(((long)v1 ^ (long)v2) | 1);
 }
 
-EXT_TYPEDOP(bitand, "&", "`n1 `n2 -> `n3. Returns `n1 bitwise and `n2.",
+EXT_TYPEDOP(bitand, "&", "`n1 `n2 -> `n3. Returns `n1 bitwise AND `n2.",
             (value v1, value v2), (v1, v2),
             (OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE
              | OP_CONST | OP_OPERATOR),
@@ -241,17 +249,19 @@ EXT_TYPEDOP(bitand, "&", "`n1 `n2 -> `n3. Returns `n1 bitwise and `n2.",
   return (value)((long)v1 & (long)v2);
 }
 
-#ifdef __i386__
- #define SHIFT_EXTRA_DOC \
-    "On 32-bit x86, only the 5 least significant bits of `n2 are used."
-#elif defined __x86_64__
+#if defined __x86_64__
  #define SHIFT_EXTRA_DOC \
     "On 64-bit x86, only the 6 least significant bits of `n2 are used."
+#elif defined __aarch64__
+ #define SHIFT_EXTRA_DOC \
+    "On 64-bit ARM, only the 6 least significant bits of `n2 are used."
 #else
  #error Unsupported architecture
 #endif
 
-value code_shift_left(value, value); /* used in x86builtins.S */
+#define SHIFT_MASK (CHAR_BIT * sizeof (long))
+
+value code_shift_left(value v1, value v2); /* used in x64builtins.S */
 EXT_TYPEDOP(shift_left, "<<", "`n1 `n2 -> `n3. Returns `n1 bitwise shifted"
             " left `n2.\n" SHIFT_EXTRA_DOC,
             (value v1, value v2), (v1, v2),
@@ -260,60 +270,42 @@ EXT_TYPEDOP(shift_left, "<<", "`n1 `n2 -> `n3. Returns `n1 bitwise shifted"
             "nn.n")
 {
   check_integers(v1, v2, THIS_OP);
-  return makeint(intval(v1) << intval(v2));
+  return makeint(uintval(v1) << (uintval(v2) % SHIFT_MASK));
 }
 
-value code_shift_right(value, value); /* used in x86builtins.S */
+value code_shift_right(value v1, value v2); /* used in x64builtins.S */
 EXT_TYPEDOP(shift_right, ">>", "`n1 `n2 -> `n3. Returns `n1 bitwise shifted"
-            " right `n2 steps.",
+            " right `n2 steps.\n" SHIFT_EXTRA_DOC,
             (value v1, value v2), (v1, v2),
             (OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE
              | OP_CONST | OP_OPERATOR),
             "nn.n")
 {
   check_integers(v1, v2, THIS_OP);
-  return makeint(intval(v1) >> intval(v2));
+  /* right shift of negative numbers is implemented-defined; assert that it
+     rounds to negative infinity */
+  CASSERT((-3 >> 1) == -2);
+  return makeint(intval(v1) >> (uintval(v2) % SHIFT_MASK));
 }
 
-TYPEDOP(rol, , "`n1 `n2 -> `n3. Returns `n1 bitwise rotate"
-        " left `n2 steps. Negative `n2 rotates right.",
-        (value v1, value v2),
-        OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "nn.n")
+EXT_TYPEDOP(bitnot, "~", "`n1 -> `n2. Returns the bitwise NOT of `n1.",
+            (value n), (n),
+            (OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE
+             | OP_CONST | OP_OPERATOR), "n.n")
 {
-  CHECK_TYPES(v1, integer,
-              v2, integer);
-  unsigned long l1 = uintval(v1);
-  long l2 = intval(v2);
-  l2 %= (int)TAGGED_INT_BITS;
-  if (l2 < 0)
-    l2 += TAGGED_INT_BITS;
-
-  return makeint((l1 << l2) | (l1 >> (TAGGED_INT_BITS - l2)));
+  CHECK_TYPES(n, integer);
+  return (value)((long)n ^ -2);
 }
 
-TYPEDOP(ror, , "`n1 `n2 -> `n3. Returns `n1 bitwise rotate"
-        " right `n2 steps. Negative `n2 rotates left.",
-        (value v1, value v2),
-        OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "nn.n")
+TYPEDOP(ffs, , "`n1 -> `n2. Returns the position of the first"
+        " (least significant) bit set in `n1.\n"
+        "The least significant bit is position 1.\n"
+        "If `n1 is zero, 0 is returned.",
+        (value n),
+        OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "n.n")
 {
-  long l2;
-  CHECK_TYPES(v1, integer,
-              v2, CT_INT(l2));
-  unsigned long l1 = uintval(v1);
-  l2 %= (int)TAGGED_INT_BITS;
-  if (l2 < 0)
-    l2 += TAGGED_INT_BITS;
-
-  return makeint((l1 >> l2) | (l1 << (TAGGED_INT_BITS - l2)));
-}
-
-TYPEDOP(bitnot, "~", "`n1 -> `n2. Returns the bitwise negation of `n1.",
-        (value v),
-        (OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE
-         | OP_CONST | OP_OPERATOR), "n.n")
-{
-  CHECK_TYPES(v, integer);
-  return (value)((long)v ^ -2);
+  CHECK_TYPES(n, integer);
+  return makeint(ffsl(intval(n)));
 }
 
 TYPEDOP(random, ,
@@ -323,10 +315,12 @@ TYPEDOP(random, ,
 	(value n1, value n2),
 	OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "nn.n")
 {
-  check_integers(n1, n2, THIS_OP);
+  CHECK_TYPES(n1, integer,
+              n2, integer);
   long min = intval(n1);
   long max = intval(n2);
-  if (min > max) runtime_error(error_bad_value);
+  if (min > max)
+    RUNTIME_ERROR(error_bad_value, "lower bound > upper bound");
 
   unsigned long range = max - min;
   if (range <= UINT32_MAX)
@@ -339,30 +333,37 @@ TYPEDOP(random, ,
  /* random state does not support cross-endian use */
  #error Unsupported endianness
 #endif
+CASSERT_SIZEOF(struct pcg32_random, 16);
+
+/* assert that the random state is properly aligned when stored a mudlle
+   string */
+CASSERT(_Alignof(struct pcg32_random) <= _Alignof(struct string)
+        && _Alignof(struct pcg32_random) <= offsetof(struct string, str));
 
 TYPEDOP(random_r, ,
 	"`s `n1 `n2 -> `n3. Returns a uniformly distributed pseudo-random"
-        " number between `n1 and `n2 (inclusive). `s contains the random"
-        " state and will be updated.\n"
+        " number between `n1 and `n2 (inclusive).\n"
+        "`s contains the random state and will be updated.\n"
         "Use `srandom() to create an initial random state.",
-        (struct string *mrng, value n1, value n2),
+        (struct string *mrng, value mmin, value mmax),
 	OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "snn.n")
 {
   CHECK_TYPES(mrng, string,
-              n1,   integer,
-              n2,   integer);
+              mmin, integer,
+              mmax, integer);
 
-  if (mrng->o.flags & OBJ_READONLY)
-    RUNTIME_ERROR(error_value_read_only, "random state is read-only");
+  if (obj_readonlyp(&mrng->o))
+    RUNTIME_ERROR_ARG(0, error_value_read_only, "random state is read-only");
 
   if (string_len(mrng) != sizeof (struct pcg32_random))
-    RUNTIME_ERROR(error_bad_value, "invalid random state");
+    RUNTIME_ERROR_ARG(0, error_bad_value, "invalid random state");
 
   struct pcg32_random *rng = (struct pcg32_random *)mrng->str;
 
-  long min = intval(n1);
-  long max = intval(n2);
-  if (min > max) runtime_error(error_bad_value);
+  long min = intval(mmin);
+  long max = intval(mmax);
+  if (min > max)
+    RUNTIME_ERROR(error_bad_value, "lower bound > upper bound");
 
   unsigned long range = max - min;
   if (range <= UINT32_MAX)
@@ -376,13 +377,146 @@ TYPEDOP(srandom, ,
         " generated value if null) for use with `random_r().",
         (value mseed), OP_LEAF | OP_NOESCAPE, "[nu].s")
 {
-  struct string *mrng = alloc_empty_string(sizeof (struct pcg32_random));
+  struct string *mrng = alloc_string_noinit(sizeof (struct pcg32_random));
   struct pcg32_random *rng = (struct pcg32_random *)mrng->str;
   if (mseed == NULL)
     pcg32_srandom(rng);
   else
     pcg32_srandom_r(rng, intval(mseed), intval(mseed));
   return mrng;
+}
+
+TYPEDOP(overflow_neg, "overflow:neg",
+        "`n0 -> `n1. Return -`n0, throwing an error on integer overflow.",
+        (value n),
+        OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "n.n")
+{
+  CHECK_TYPES(n, integer);
+  long r;
+  if (__builtin_sub_overflow(2, (long)n, &r))
+    RUNTIME_ERROR(error_bad_value, "overflow");
+  return (value)r;
+}
+
+TYPEDOP(overflow_abs, "overflow:abs",
+        "`n0 -> `n1. Return the absolute value of `n0, throwing an error on"
+        " integer overflow.",
+        (value n),
+        OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "n.n")
+{
+  CHECK_TYPES(n, integer);
+  if (n == makeint(MIN_TAGGED_INT))
+    RUNTIME_ERROR(error_bad_value, "overflow");
+  return (value)(labs((long)n - 1) + 1);
+}
+
+TYPEDOP(overflow_add, "overflow:add",
+        "`n0 `n1 -> `n2. Return `n0 + `n1, throwing an error on integer"
+        " overflow.",
+        (value a, value b),
+        OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "nn.n")
+{
+  CHECK_TYPES(a, integer,
+              b, integer);
+  long r;
+  if (__builtin_add_overflow((long)a, (long)b - 1, &r))
+    RUNTIME_ERROR(error_bad_value, (long)a > 0 ? "overflow" : "underflow");
+  return (value)r;
+}
+
+TYPEDOP(overflow_sub, "overflow:sub",
+        "`n0 `n1 -> `n2. Return `n0 - `n1, throwing an error on integer"
+        " overflow.",
+        (value a, value b),
+        OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "nn.n")
+{
+  CHECK_TYPES(a, integer,
+              b, integer);
+  long r;
+  if (__builtin_sub_overflow((long)a, (long)b - 1, &r))
+    RUNTIME_ERROR(error_bad_value, (long)a > 0 ? "overflow" : "underflow");
+  return (value)r;
+}
+
+TYPEDOP(overflow_mul, "overflow:mul",
+        "`n0 `n1 -> `n2. Return `n0 * `n1, throwing an error on integer"
+        " overflow.",
+        (value a, value b),
+        OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "nn.n")
+{
+  CHECK_TYPES(a, integer,
+              b, integer);
+  long r;
+  if (__builtin_mul_overflow((long)a >> 1, (long)b - 1, &r))
+    RUNTIME_ERROR(error_bad_value,
+                  ((long)a ^ (long)b) >= 0 ? "overflow" : "underflow");
+  return (value)(r | 1);
+}
+
+TYPEDOP(overflow_div, "overflow:div",
+        "`n0 `n1 -> `n2. Return `n0 / `n1, throwing an error on integer"
+        " overflow.\n"
+        "`n1 must be non-zero.",
+        (value a, value b),
+        OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "nn.n")
+{
+  CHECK_TYPES(a, integer,
+              b, integer);
+  if (b == makeint(0))
+    RUNTIME_ERROR(error_divide_by_zero, NULL);
+
+  if (a == makeint(MIN_TAGGED_INT) && b == makeint(-1))
+    RUNTIME_ERROR(error_bad_value, "overflow");
+  return makeint(intval(a) / intval(b));
+}
+
+TYPEDOP(overflow_shl, "overflow:shl",
+        "`n0 `n1 -> `n2. Return `n0 << `n1, throwing an error on integer"
+        " overflow, which happens if the new sign bit differs from any bits"
+        " shifted out.\n"
+        "`n1 must be non-negative.",
+        (value a, value b),
+        OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "nn.n")
+{
+  unsigned long bn;
+  CHECK_TYPES(a, integer,
+              b, CT_AUTO_RANGE(bn));
+  long an = intval(a);
+
+  if (bn >= TAGGED_INT_BITS)
+    {
+      if (an == 0)
+        return makeint(0);
+    }
+  else
+    {
+      /* the new (mudlle) sign bit must equal all bits shifted out, so the (C)
+         topmost 'bn + 2' bits must be equal */
+      long mask = ~0UL << (TAGGED_INT_BITS - 1 - bn);
+      long ah = an & mask;
+      if (ah == 0 || ah == mask)
+        return makeint(an << bn);
+    }
+
+  RUNTIME_ERROR(error_bad_value, an >= 0 ? "overflow" : "underflow");
+}
+
+TYPEDOP(overflow_shr, "overflow:shr",
+        "`n0 `n1 -> `n2. Return arithmetic right shift of `n0 by `n1 steps.\n"
+        "`n1 must non-negative.",
+        (value a, value b),
+        OP_TRIVIAL | OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_CONST, "nn.n")
+{
+  unsigned long bn;
+  CHECK_TYPES(a, integer,
+              b, CT_AUTO_RANGE(bn));
+  long an = intval(a);
+  if (bn >= TAGGED_INT_BITS)
+    return makeint(an >= 0 ? 0 : -1);
+  /* right shift of negative numbers is implemented-defined; assert that it
+     rounds to negative infinity */
+  CASSERT((-3 >> 1) == -2);
+  return makeint(an >> bn);
 }
 
 void arith_init(void)
@@ -409,14 +543,21 @@ void arith_init(void)
   DEFINE(shift_left);
   DEFINE(shift_right);
   DEFINE(bitnot);
-
-  DEFINE(rol);
-  DEFINE(ror);
+  DEFINE(ffs);
 
   DEFINE(sqrt);
   DEFINE(random);
   DEFINE(random_r);
   DEFINE(srandom);
+
+  DEFINE(overflow_abs);
+  DEFINE(overflow_neg);
+  DEFINE(overflow_add);
+  DEFINE(overflow_sub);
+  DEFINE(overflow_mul);
+  DEFINE(overflow_div);
+  DEFINE(overflow_shl);
+  DEFINE(overflow_shr);
 
   system_define("MAXINT", makeint(MAX_TAGGED_INT));
   system_define("MININT", makeint(MIN_TAGGED_INT));

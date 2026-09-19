@@ -19,16 +19,16 @@
  * ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-| arch |
-arch = if (INTBITS == 31) "x86" else "x64";
+| srcdir |
+if (INTBITS != 63) error(error_bad_value);
+srcdir = dirname(loading_file()) + "/";
 
-// Load interrpeted x86 compiler
+// Load interpreted compiler
 garbage_collect(700000);
-load("lib.mud") &&
-load("noinf.mud") &&
-load(arch + ".mud") &&
-load("compile.mud") &&
-load("interface.mud") &&
-load("dihash.mud") &&
+load(srcdir + "lib.mud") &&
+load(srcdir + "noinf.mud") &&
+load(srcdir + mc:archname + ".mud") &&
+load(srcdir + "compile.mud") &&
+load(srcdir + "interface.mud") &&
 protect_compiler_libs();
-mc:verbose = 4;
+mc:verbose = 0;

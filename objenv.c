@@ -19,18 +19,16 @@
  * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-#include <stddef.h>
 #include <string.h>
 
 #include "alloc.h"
-#include "mvalues.h"
 #include "objenv.h"
 
 struct env *alloc_env(ulong size)
 /* Returns: A new environment, of initial size size, initialised to NULL.
 */
 {
-  struct env *newp = (struct env *)allocate_record(
+  struct env *newp = (struct env *)allocate_mtemp(
     type_internal, grecord_fields(*newp));
   GCPRO(newp);
   struct vector *v = alloc_vector(size);
@@ -46,7 +44,7 @@ void env_reserve(struct env *env, ulong n)
 */
 {
   ulong used = intval(env->used);
-  ulong size = vector_len(env->values);
+  size_t size = vector_len(env->values);
 
   if (used + n > size)
     {
@@ -77,12 +75,18 @@ ulong env_grow_and_add_entry(struct env *env, value v)
   return used;
 }
 
+void env_make_room(struct env *env, ulong n)
+{
+  env_reserve(env, n);
+  env->used = mudlle_iadd(env->used, n);
+}
+
 #if 0
 void print_env(struct oport *f, struct env *env)
 {
-  ulong used = intval(env->used), i;
+  ulong used = intval(env->used);
   GCPRO(env);
-  for (i = 0; i < used; i++)
+  for (ulong i = 0; i < used; i++)
     {
       pprintf(f, "%lu: ", i);
       output_value(f, prt_examine, env->values->data[i]);

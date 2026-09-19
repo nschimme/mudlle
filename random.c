@@ -1,11 +1,12 @@
 #include "mudlle-config.h"
 
-#  include <assert.h>
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
+#include "mudlle.h"
 #include "random.h"
 
 static uint64_t random64(struct pcg32_random *rng);
@@ -174,6 +175,22 @@ uint32_t random_range32(uint32_t range)
   return random_range32_r(&pcg32_shared, range);
 }
 
+void randomize_array(void *base, size_t nmemb, size_t size)
+{
+  assert(nmemb <= UINT32_MAX);  /* easy to support if needed */
+  if (nmemb < 2)
+    return;
+  char buf[size];
+  const size_t last = nmemb - 1;
+  for (size_t i = 0; i < last; ++i)
+    {
+      size_t j = i + random_range32(last - i);
+      memcpy(buf, (char *)base + i * size, size);
+      memcpy((char *)base + i * size, (char *)base + j * size, size);
+      memcpy((char *)base + j * size, buf, size);
+    }
+}
+
 #if DBL_MANT_DIG <= 0 || DBL_MANT_DIG > 64
   #error Unsupported floating-point environment
 #endif
@@ -195,9 +212,9 @@ double drandom(void)
 
 void random_init(void)
 {
+  /* assert that this generates the last double less than 1.0 */
   double drandom_max = scalbn(DBL_MAX_MANT, -DBL_MANT_DIG);
-  assert(drandom_max < 1.0);
-  assert(nextafter(drandom_max, 1.0) == 1.0);
+  assert(drandom_max == nextafter(1.0, 0.0));
 
   struct {
     uint64_t initstate, initseq;

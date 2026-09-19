@@ -89,7 +89,8 @@ while (l != null)
   l = cdr(l);
 ];
 
-mlexists? = fn "fn l -> x. Returns first element x of l for which fn(x) is true, false if none found" (f, l)
+mlexists? = fn """fn l -> x. Returns first element x of l for which fn(x) is\
+ true, false if none found""" (f, l)
   loop
     [
       | x |

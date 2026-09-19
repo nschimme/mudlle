@@ -19,27 +19,25 @@
  * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-#include <string.h>
-
 #include "alloc.h"
-#include "call.h"
 #include "global.h"
 #include "module.h"
-#include "mvalues.h"
 #include "table.h"
+
+#include "runtime/mudlle-string.h"
 
 /* Module states automaton:
 
-            -> unloaded	<-
+            -> unloaded <-
            /      |       \
-	   |      |	   \
-	   |   loading	   |
-	   |    /   \ 	   |
-	   \   /     \	  /
-	    error   loaded
-	              |
-	              |
-	          protected
+           |      |        \
+           |   loading     |
+           |    /   \      |
+           \   /     \    /
+            error   loaded
+                      |
+                      |
+                  protected
 
 */
 
@@ -50,7 +48,7 @@ enum {
 };
 struct table *module_data;
 
-static ulong load_library;
+static ulong load_library_gidx;
 
 enum module_status module_status(const char *name)
 /* Returns: Status of module name:
@@ -106,30 +104,33 @@ bool module_unload(const char *name)
    Returns: false if name was protected or loading
 */
 {
-  enum module_status status = module_status(name);
-
-  if (status != module_unloaded)
+  switch (module_status(name))
     {
-      if (status == module_loading || status == module_protected)
-        return false;
-
-      ulong gsize = intval(environment->used);
-      for (ulong i = 0; i < gsize; i++)
-	{
-	  struct string *v = mvars->data[i];
-
-	  /* Unset module vars */
-	  if (pointerp(v) && strcasecmp(name, v->str) == 0)
-	    {
-	      mvars->data[i] = makeint(var_normal);
-	      GVAR(i) = NULL;
-	    }
-	}
-      /* Safe even if name comes from a mudlle string,
-	 because we know that entry name already exists */
-      module_set(name, module_unloaded, 0);
+    case module_unloaded:
+      return true;
+    case module_loading:
+    case module_protected:
+      return false;
+    case module_error:
+    case module_loaded:
+      break;
     }
 
+  ulong gsize = nglobals();
+  for (ulong i = 0; i < gsize; i++)
+    {
+      struct string *v = mvars->data[i];
+
+      /* Unset module vars */
+      if (pointerp(v) && strcasecmp(name, v->str) == 0)
+        {
+          mvars->data[i] = makeint(var_normal);
+          GVAR(i) = NULL;
+        }
+    }
+  /* Safe even if name comes from a mudlle string,
+     because we know that entry name already exists */
+  module_set(name, module_unloaded, 0);
   return true;
 }
 
@@ -143,11 +144,11 @@ static enum module_status module_load(const char *name)
    Returns: New module status
 */
 {
-  if (callablep(GVAR(load_library), 1))
+  if (callablep(GVAR(load_library_gidx), 1))
     {
       struct string *mname = alloc_string(name);
 
-      mcatch_call("call-load-library", GVAR(load_library), mname);
+      mcatch_call("load library", GVAR(load_library_gidx), mname);
     }
   return module_status(name);
 }
@@ -174,8 +175,9 @@ enum vstatus module_vstatus(long n, struct string **name)
    Requires: n be a valid global variable offset
 */
 {
+  assert(n >= 0 && n < nglobals());
+  *name = NULL;
   value v = mvars->data[n];
-
   if (integerp(v)) return intval(v);
   if (v == NULL) return var_system_write;
 
@@ -184,18 +186,30 @@ enum vstatus module_vstatus(long n, struct string **name)
   return var_module;
 }
 
-bool module_vset(long n, enum vstatus status, struct string *name)
+bool module_vset(long n, enum vstatus status, struct string *name,
+                 bool dry_run)
 /* Effects: Sets status of global variable n to status.
      name is the module name for status var_module
    Returns: true if successful, false if the change is impossible
      (i.e., status was already var_module or var_system_{mutable,write})
 */
 {
+  assert(n >= 0 && n < nglobals());
   assert(status >= 0 && status <= var_system_mutable);
   assert((name != NULL) == (status == var_module));
 
-  if (GCONSTANT(n) || mvars->data[n] == makeint(var_system_mutable))
+  value old_state  = mvars->data[n];
+  if (dry_run
+      && name != NULL
+      && TYPE(old_state, string)
+      && string_equalp(old_state, name))
+    return true;
+
+  if (GCONSTANT(n) || old_state == makeint(var_system_mutable))
     return false;
+
+  if (dry_run)
+    return true;
 
   if (status == var_module)
     mvars->data[n] = name;
@@ -212,5 +226,5 @@ void module_init(void)
 {
   module_data = alloc_table(DEF_TABLE_SIZE);
   staticpro(&module_data);
-  load_library = global_lookup("load_library");
+  load_library_gidx = global_lookup("load_library");
 }

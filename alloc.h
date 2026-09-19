@@ -24,8 +24,6 @@
 
 #include "mudlle-config.h"
 
-#include <stdlib.h>
-
 #include "types.h"
 
 #undef ALLOC_STATS
@@ -41,9 +39,13 @@ void garbage_init(void);
 extern uint8_t *gcblock;
 extern ulong gcblocksize;
 
+extern const bool saveable_object_type[];
+
+extern struct obj *static_gone;
+
 #define CODE_ALIGNMENT 16
 
-extern uint8_t *posgen0;
+extern uint8_t *startgen0, *posgen0;
 
 #ifdef GCDEBUG
 extern ulong majorgen, minorgen;
@@ -69,7 +71,7 @@ void gccheck_qdebug(value x);
 #ifndef GCCHECK2
 #define GCCHECK2(x) ((void)0)
 #endif
-#define GCCHECK(x) (CASSERT_EXPR(IS_MUDLLE_TYPE(x)), GCCHECK2(x))
+#define GCCHECK(x) (CHECK_MUDLLE_TYPE(x), GCCHECK2(x))
 
 /* Provide temporary protection for some values */
 extern struct gcpro *gcpro;	/* Local (C) variables which need protection */
@@ -98,7 +100,7 @@ struct gcpro {
 #define __GCPROEND(n) };				\
   ((void)(gcpro = &gcpros[DEC(n)]))
 
-#define __GCPRO1(v, ...) __GCPRO_N(1, v)
+#define __GCPRO1(v) __GCPRO_N(1, v)
 #define __GCPRO2(v, ...) __GCPRO1(__VA_ARGS__), __GCPRO_N(2, v)
 #define __GCPRO3(v, ...) __GCPRO2(__VA_ARGS__), __GCPRO_N(3, v)
 #define __GCPRO4(v, ...) __GCPRO3(__VA_ARGS__), __GCPRO_N(4, v)
@@ -119,25 +121,70 @@ struct gcpro {
 /* Protection for dynamically allocated variables, that may be freed */
 struct dynpro
 {
-  struct dynpro *prev, *next;
   value obj;
+  struct dynpro *prev, *next;
   const char *file;
   int lineno;
 };
 
+#define FOR_EXTRA_DYNPROS(op, sep, arg)
+
+#define FOR_DYNPROS(op, sep, arg)               \
+  op(connection, connection, mconn, arg) sep()        \
+  op(list,   list,      l,    arg) sep()        \
+  op(port,   oport,     port, arg) sep()        \
+  op(string, string,    str,  arg) sep()        \
+  op(vector, vector,    v,    arg)              \
+  FOR_EXTRA_DYNPROS(op, sep, arg)
+
+#define _DEF_DYNPRO(name, tag, field, arg)      \
+  union dynpro_ ## name {                       \
+    struct dynpro dp;                           \
+    struct tag *field;                          \
+  }
+FOR_DYNPROS(_DEF_DYNPRO, SEP_SEMI, );
+#undef _DEF_DYNPRO
+
+#define _CHK_DYNPRO(name, tag, field, arg)                      \
+  union dynpro_ ## name *: _Generic(                            \
+    (arg), struct tag *: true, default: false)
+#define CHECK_DYNPRO_VALUE(what, obj, objstr)                   \
+  static_assert_expr(                                           \
+    _Generic((what), struct dynpro *: IS_MUDLLE_TYPE(obj),      \
+             FOR_DYNPROS(_CHK_DYNPRO, SEP_COMMA, (obj))),       \
+    objstr " is of invalid type")
+
+#define _CAST_DYNPRO(name, tag, field, arg)             \
+  union dynpro_ ## name *: (struct dynpro *)(arg)
+#define DYNPRO_PTR(what)                                \
+  _Generic((what), struct dynpro *: (what),             \
+           FOR_DYNPROS(_CAST_DYNPRO, SEP_COMMA, (what)))
+
 void internal_dynpro(struct dynpro *what, value obj, const char *file,
                      int lineno);
-#define dynpro(what, obj)                                       \
-  (CHECK_MUDLLE_TYPE(obj), internal_dynpro((what), (obj), __FILE__, __LINE__))
-void undynpro(struct dynpro *what);
+#define dynpro(what, obj)                                               \
+  (CHECK_DYNPRO_VALUE((what), (obj), #obj),                             \
+   internal_dynpro(DYNPRO_PTR(what), (obj), __FILE__, __LINE__))
+
+void internal_undynpro(struct dynpro *what, const char *file, int lineno);
+#define undynpro(what) internal_undynpro(DYNPRO_PTR(what), __FILE__, __LINE__)
+
 struct dynpro *internal_protect(value v, const char *file, int lineno);
 #define protect(v) (CHECK_MUDLLE_TYPE(v),                       \
                     internal_protect(v, __FILE__,__LINE__))
-value unprotect(struct dynpro *pro);
+value internal_unprotect(struct dynpro *pro, const char *file, int lineno);
+#define unprotect(what) \
+  internal_unprotect(DYNPRO_PTR(what), __FILE__, __LINE__)
 
 /* dynpro() unless staticp() */
-void maybe_dynpro(struct dynpro *what, value obj);
-void maybe_undynpro(struct dynpro *what);
+void internal_maybe_dynpro(struct dynpro *what, value obj,
+                           const char *file, int line);
+#define maybe_dynpro(what, obj)                                 \
+  (CHECK_DYNPRO_VALUE((what), (obj), #obj),                     \
+   internal_maybe_dynpro(DYNPRO_PTR(what), (obj),               \
+                         __FILE__, __LINE__))
+#define maybe_undynpro(what)                                    \
+  internal_maybe_dynpro(DYNPRO_PTR(what), NULL, __FILE__, __LINE__)
 
 /* Protection of global variables */
 void internal_staticpro(void *pro, const char *desc, const char *file,
@@ -161,7 +208,6 @@ struct list *get_dynpro_data(void);
    after a minor collection
 */
 
-
 #define THRESHOLD_MAJOR_A 4
 #define THRESHOLD_MAJOR_B 5
 
@@ -181,25 +227,51 @@ struct list *get_dynpro_data(void);
 #define INCREASE_A 14
 #define INCREASE_B 10
 
-#define ASSERT_NOALLOC_START() uint8_t *__old_posgen0 = posgen0
-#define ASSERT_NOALLOC()       assert(__old_posgen0 == posgen0)
+/* Usage:
+ *   ASSERT_NOALLOC_START();
+ *     :
+ *   {                             \
+ *     ASSERT_NOALLOC();           |
+ *       <may alloc>                > optional
+ *     ASSERT_NOALLOC_RESTART();   |
+ *   }                             /
+ *     :
+ *   ASSERT_NOALLOC();
+ *
+ */
+#define ASSERT_NOALLOC_START()   uint8_t *__old_posgen0 = posgen0
+#define ASSERT_NOALLOC_RESTART() (void)(__old_posgen0 = posgen0)
+#define ASSERT_NOALLOC()         assert(__old_posgen0 == posgen0)
 
-struct grecord *allocate_record(enum mudlle_type type, ulong entries);
+static ALWAYS_INLINE bool alloc_available(ulong bytes)
+{
+  return !EXPECT_FALSE(posgen0 < startgen0 + bytes);
+}
+
+static ALWAYS_INLINE ulong record_size(ulong nentries)
+{
+  return sizeof (struct obj) + nentries * sizeof (value);
+}
+
+struct grecord *allocate_record(enum mudlle_type type, size_t entries);
+struct grecord *allocate_mtemp(enum mudlle_type type, size_t entries);
 
 /* Do not call this function if you don't understand how the gc works !! */
-struct grecord *unsafe_allocate_record(enum mudlle_type type, ulong entries);
-#define UNSAFE_ALLOCATE_RECORD(type, entries) \
-  ((struct type *)unsafe_allocate_record(type_ ## type, entries))
+struct grecord *alloc_record_noinit(
+  enum garbage_type garbage_type, enum mudlle_type type, size_t entries);
+#define ALLOC_RECORD_NOINIT(type, entries)      \
+  ((struct type *)alloc_record_noinit(          \
+    garbage_record, type_ ## type, (entries)))
 
 struct primitive *allocate_primitive(const struct prim_op *op);
 
-struct gstring *allocate_string(enum mudlle_type type, ulong bytes);
-struct obj *allocate_temp(enum mudlle_type type, size_t size);
+struct obj *allocate_string(enum mudlle_type type, ulong bytes);
+struct obj *allocate_ctemp(enum mudlle_type type, size_t size);
 struct vector *allocate_locals(ulong n);
 /* Effect: Allocate a vector of local variables in an optimised fashion.
 */
 
-value gc_allocate(long n);
+struct obj *gc_allocate(long n);
 /* Effects: Allocates n bytes and returns a pointer to the start of
      the allocated area.
      DOES ABSOLUTELY NO INITIALISATION. BEWARE!
@@ -228,7 +300,7 @@ bool gc_size(value x, struct gc_size *size);
    Modifies: mutable
 */
 
-void *gc_save(value x, unsigned long *size);
+const void *gc_save(value x, size_t *size);
 /* Effects: Saves a value x into a contiguous block of memory so
      that it can be reloaded by gc_load.
 
@@ -257,14 +329,14 @@ value gc_load(void *_load, unsigned long size,
 struct gcstats_gen {
   struct {
     ulong nb, rwsize, rosize;
-  } types[last_type];
+  } types[mudlle_types];
 };
 #define GCSTATS_GEN_NULL (struct gcstats_gen){ .types[0].nb = 0 }
 
 struct gcstats_alloc {
   struct {
     ulong nb, size;
-  } types[last_type];
+  } types[mudlle_types];
 };
 #define GCSTATS_ALLOC_NULL (struct gcstats_alloc){ .types[0].nb = 0 }
 #endif  /* GCSTATS */
@@ -280,6 +352,11 @@ struct gcstats
 };
 
 extern struct gcstats gcstats;
+
+static inline ulong gc_generation(void)
+{
+  return gcstats.minor_count + gcstats.major_count;
+}
 
 #ifdef GCSTATS
 static inline void gcstats_add_alloc(enum mudlle_type type, ulong size)
@@ -297,7 +374,7 @@ void garbage_collect(long n);
    Modifies: the world
 */
 
-#if defined __i386__ || defined __x86_64__
+#ifdef __x86_64__
 void patch_globals_stack(value oldglobals, value newglobals);
 #endif
 
@@ -308,6 +385,21 @@ long gc_reserve(long n); /* Make sure n bytes are available,
 			    and x >= n, otherwise return
 			    -N number of bytes available after gc. */
 
+void set_gcblock_fork_mode(bool enable);
+
 typedef void (*gc_forward_fn)(void *ptr);
+
+static inline void maybe_forward(gc_forward_fn forward, void *ptr)
+{
+  if (pointerp(*(value *)ptr))
+    forward(ptr);
+}
+#define maybe_forward(forward, ptr)                             \
+  maybe_forward((forward), (CHECK_MUDLLE_TYPE(*(ptr)), (ptr)))
+
+typedef void (*weak_ref_free_fn)(void *data);
+
+struct obj *alloc_weak_ref(enum mudlle_type type, size_t bytes,
+                           void *cbdata, weak_ref_free_fn cbfree);
 
 #endif

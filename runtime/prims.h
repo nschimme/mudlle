@@ -3,27 +3,16 @@
 #ifndef RUNTIME_PRIMS_H
 #define RUNTIME_PRIMS_H
 
+#include "../call.h"
+#include "../profile.h"
+
 #include "runtime.h"
 
-#include "../alloc.h"
-#include "../call.h"
-#include "../context.h"
+#define PRIMARGVALSPLUS(N) .args = { PRIMARGNAMESPLUS(N) }
+#define PRIMARGVALS(N)     IF_ZERO(N)(, .args = { PRIMARGNAMES(N) })
 
-#define PRIMARGVALSNVARARGS .args = { v0 }
-#define PRIMARGVALS0
-#define PRIMARGVALS1        .args = { PRIMARGNAMES1 }
-#define PRIMARGVALS2        .args = { PRIMARGNAMES2 }
-#define PRIMARGVALS3        .args = { PRIMARGNAMES3 }
-#define PRIMARGVALS4        .args = { PRIMARGNAMES4 }
-#define PRIMARGVALS5        .args = { PRIMARGNAMES5 }
-
-#define PRIMARGDEFSNVARARGS value args[1];
-#define PRIMARGDEFS0
-#define PRIMARGDEFS1        value args[1];
-#define PRIMARGDEFS2        value args[2];
-#define PRIMARGDEFS3        value args[3];
-#define PRIMARGDEFS4        value args[4];
-#define PRIMARGDEFS5        value args[5];
+#define PRIMARGDEFSPLUS(N) value args[INC(N)];
+#define PRIMARGDEFS(N)     IF_ZERO(N)(, value args[N];)
 
 #define _IS_VOID_void MARK
 #define __IS_VOID(arg) IS_MARK(_IS_VOID_ ## arg)
@@ -58,67 +47,77 @@
  *  x          identifier for the primitive; op_ ## x is its prim_op
  *  pname      string mudlle name of primitive; 0 for #x
  *  helpmsg    string help text
- *  nargs      number of arguments [0..MAX_PRIMITIVE_ARGS] or NVARARGS
- *  opargs     argument signature of op_code_ ## x function; if 'callargs'
+ *  nargs      S(<N>) or SPLUS(<N>)
+ *  opargs     argument signature of prim_impl_ ## x function; if 'callargs'
  *             is an argument list, also used for code_ ## x function
  *  callargs   argument names from 'opargs'; can be zero if
  *             'storage_class' is static
+ *  arglist    empty or list of names of arguments
  *  seclevel   security level; cf. CASSERT_SECLEVEL()
- *  flags      bitwise-or of OP_xxx flags
+ *  flags      bitwise OR of OP_xxx flags
  *  types      list of type signatures; e.g., ("n.n", ...), or a string
  *  storage_class    static or empty
  */
 #define FULLOP(x, pname, helpmsg, nargs, opargs, callargs,              \
-               seclevel, flags, types, storage_class)                   \
+               arglist, seclevel, flags, types, storage_class)          \
 _PCC_DEFINE(x)                                                          \
 static int defined_ ## x;  /* used to warn if not DEFINE'd */           \
-CASSERT(nargs >= NVARARGS && nargs <= MAX_PRIMITIVE_ARGS);              \
+CASSERT(NARG ## nargs >= -MAX_VARARG_FIXED                              \
+        && NARG ## nargs <= MAX_PRIMITIVE_ARGS);                        \
 STATIC_STRING(prim_name_ ## x, IF_EMPTY(pname)(#x, pname));             \
+STATIC_STRING(prim_help_ ## x, helpmsg);                                \
 static const char *const tsig_ ## x[] = {                               \
   IF_PAREN(types)(EXPAND_ARGS types, types), NULL                       \
 };                                                                      \
-static value prim_ ## x(PRIMARGS ## nargs);                             \
+static value prim_ ## x(PRIMARG ## nargs);                              \
+ IF_VOID opargs (                                                       \
+   static const char *const *const arglist_ ## x = NULL,                \
+   static const char *const arglist_ ## x[] = {                         \
+     IF_PAREN(arglist)(                                                 \
+       EXPAND_ARGS arglist,                                             \
+       FOR_ARGS(STRINGIFY, SEP_COMMA, EXPAND_ARGS opargs))              \
+   });                                                                  \
 static const struct prim_op op_ ## x = {                                \
-  GET_STATIC_STRING(prim_name_ ## x), helpmsg,                          \
-  (value (*)())prim_ ## x, _PCC_REF(x)                                  \
-  nargs, flags, tsig_ ## x, seclevel, __FILE__, __LINE__                \
+  GET_STATIC_STRING(prim_name_ ## x),                                   \
+  GET_STATIC_STRING(prim_help_ ## x),                                   \
+  prim_ ## x, _PCC_REF(x)                                               \
+  NARG ## nargs, flags, arglist_ ## x, tsig_ ## x,                      \
+  seclevel, __FILE__, __LINE__                                          \
 };                                                                      \
                                                                         \
-static value op_code_ ## x __CODE_DECL opargs;                          \
+static ALWAYS_INLINE value prim_impl_ ## x __CODE_DECL opargs;          \
 storage_class value code_ ## x                                          \
-  IF_PAREN(callargs)(opargs,(PRIMARGS ## nargs))                        \
+ IF_PAREN(callargs)(opargs,(PRIMARG ## nargs))                          \
 {                                                                       \
-  return op_code_ ## x(                                                 \
+  return prim_impl_ ## x(                                               \
     __CODE_ARGS(                                                        \
       x, opargs,                                                        \
-      IF_PAREN(callargs)(callargs,(PRIMARGNAMES ## nargs))));           \
+      IF_PAREN(callargs)(callargs,(PRIMARGNAME ## nargs))));            \
 }                                                                       \
                                                                         \
-static value prim_ ## x(PRIMARGS ## nargs)                              \
+static value prim_ ## x(PRIMARG ## nargs)                               \
 {                                                                       \
   _PCC_COUNT(x);                                                        \
-  CASSERT_EXPR(!((flags) & ~ALL_OP_FLAGS));                             \
-  CASSERT_EXPR(((nargs) < 0 || ((flags) & OP_TRIVIAL)                   \
+  CASSERT(!((flags) & ~ALL_OP_FLAGS));                                  \
+  CASSERT(((flags) & (OP_NOESCAPE | OP_LEAF)) != OP_NOESCAPE);          \
+  CASSERT((NARG ## nargs < 0 || ((flags) & OP_TRIVIAL) != 0             \
                 ? (seclevel) == 0                                       \
                 : true));                                               \
   CASSERT_SECLEVEL(seclevel);                                           \
-  CASSERT_EXPR((~(flags) & OP_TRACE)                                    \
-               || ((nargs) >= 0                                         \
-                   && ((seclevel) == 0                                  \
-                       || ((flags) & OP_FASTSEC))));                    \
   /* optimization: allow faster (type_primitive vs. type_secure) OPs */ \
   /* for M-secure OPs that don't need a valid seclevel (ie. don't    */ \
   /* need to check against >= LEGACY_SECLEVEL). */                      \
-  CASSERT_EXPR(!((flags) & OP_FASTSEC)                                  \
-               || ((seclevel) > 0 && (seclevel) < LEGACY_SECLEVEL));    \
+  CASSERT(((flags) & OP_FASTSEC) == 0                                   \
+          || ((seclevel) > 0 && (seclevel) < LEGACY_SECLEVEL));         \
   struct cstack {                                                       \
     struct call_stack_c_header c;                                       \
-    PRIMARGDEFS ## nargs                                                \
+    PRIMARGDEF ## nargs                                                 \
   } cstack;                                                             \
                                                                         \
-  bool secerr = ((seclevel) > 0 && (flags) & OP_FASTSEC                 \
-                 && intval(maxseclevel) < (seclevel));                  \
-  if (secerr || ((flags) & OP_TRACE))                                   \
+  bool only_trace = false;                                              \
+  if (((seclevel) > 0 && ((flags) & OP_FASTSEC) != 0                    \
+       && EXPECT_FALSE(c_maxseclevel() < (seclevel)))                   \
+      || (only_trace = ((flags) & OP_TRACE)))                           \
     {                                                                   \
       cstack = (struct cstack){                                         \
         .c = {                                                          \
@@ -127,51 +126,56 @@ static value prim_ ## x(PRIMARGS ## nargs)                              \
             .typ ## e = call_primop,                                    \
           },                                                            \
           .u.op = &op_ ## x,                                            \
-          .narg ## s = nargs == NVARARGS ? 1 : nargs                    \
+          .narg ## s = (NARG ## nargs < 0                               \
+                        ? -NARG ## nargs                                \
+                        : NARG ## nargs)                                \
         },                                                              \
-        PRIMARGVALS ## nargs                                            \
+        PRIMARGVAL ## nargs                                             \
       };                                                                \
       call_stack = &cstack.c.s;                                         \
-      if (secerr)                                                       \
+      if (!only_trace)                                                  \
         runtime_error(error_security_violation);                        \
     }                                                                   \
   /* the call site (do_interpret/bcall/bcall_secure) should have */     \
   /* thrown error_security_violation already. */                        \
   if ((seclevel) > 0)                                                   \
-    assert((seclevel) <= intval(maxseclevel));                          \
+    assert((seclevel) <= c_maxseclevel());                              \
   uint8_t *oldposgen0 = posgen0;                                        \
-  const struct prim_op *old_forbid_mudlle_calls = forbid_mudlle_calls;  \
+  const char *old_forbid_mudlle_calls = forbid_mudlle_calls;            \
   bool old_seclevel_valid = seclevel_valid;                             \
-  if (!((flags) & OP_TRIVIAL))                                          \
+  if (((flags) & OP_TRIVIAL) == 0)                                      \
     {                                                                   \
-      if ((flags) & (OP_LEAF | OP_NOESCAPE))                            \
-        forbid_mudlle_calls = &op_ ## x;                                \
-      seclevel_valid = (((seclevel) > 0 && !((flags) & OP_FASTSEC))     \
-                        || nargs == NVARARGS);                          \
+      if ((flags) & OP_LEAF)                                            \
+        forbid_mudlle_calls = prim_name_ ## x.str;                      \
+      seclevel_valid = (((seclevel) > 0                                 \
+                         && ((flags) & OP_FASTSEC) == 0)                \
+                        || NARG ## nargs < 0);                          \
     }                                                                   \
-  value r = code_ ## x(PRIMARGNAMES ## nargs);                          \
-  if (!((flags) & OP_TRIVIAL))                                          \
+  value r = code_ ## x(PRIMARGNAME ## nargs);                           \
+  if (((flags) & OP_TRIVIAL) == 0)                                      \
     {                                                                   \
       seclevel_valid = old_seclevel_valid;                              \
       if (((flags) & OP_NOALLOC) && oldposgen0 != posgen0)              \
         flag_check_failed(&op_ ## x, "noalloc");                        \
-      if ((flags) & (OP_LEAF | OP_NOESCAPE))                            \
+      if ((flags) & OP_LEAF)                                            \
         forbid_mudlle_calls = old_forbid_mudlle_calls;                  \
+      maybe_profile_tick();                                             \
     }                                                                   \
   if ((flags) & OP_TRACE)                                               \
     call_stack = call_stack->next;                                      \
   return r;                                                             \
 }                                                                       \
-static value op_code_ ## x __CODE_DECL opargs
+static value prim_impl_ ## x __CODE_DECL opargs
 
 #define __FULLOP(x, pname, helpmsg, nargs, opargs, callargs,            \
                seclevel, flags, types, storage_class)                   \
   FULLOP(x, pname, helpmsg, nargs, opargs,                              \
-         callargs, seclevel, flags, types, storage_class)
+         callargs, , seclevel, flags, types, storage_class)
 
 #define _FULLOP(x, pname, helpmsg, opargs, callargs,                    \
                 seclevel, flags, types, storage_class)                  \
-  __FULLOP(x, pname, helpmsg, IF_VOID opargs(0, VA_NARGS opargs),       \
+  __FULLOP(x, pname, helpmsg,                                           \
+           IF_VOID opargs(S(0), S(VA_NARGS opargs)),                    \
            opargs, callargs, seclevel, flags, types, storage_class)
 
 #define TYPEDOP(x, name, helpmsg, args, flags, types)                   \
@@ -181,9 +185,12 @@ static value op_code_ ## x __CODE_DECL opargs
   _FULLOP(x, name, helpmsg, opargs, callargs, 0, flags, types,          \
           /* extern */)
 
-#define VAROP(x, name, helpmsg, flags, types)                           \
-  FULLOP(x, name, helpmsg, NVARARGS,                                    \
-         (struct vector *args, ulong nargs), 0, 0, flags, types, static)
+#define _VAROP(x, name, helpmsg, nargs, args, flags, types)             \
+  FULLOP(x, name, helpmsg, nargs, args,                                 \
+         0, , 0, flags, types, static)
+#define VAROP(x, name, helpmsg, args, flags, types)                     \
+  _VAROP(x, name, helpmsg, SPLUS(DEC(VA_NARGS args)),                   \
+         args, flags, types)
 
 #define SECOP(x, name, helpmsg, args, seclevel, flags, types)           \
   _FULLOP(x, name, helpmsg, args, 0, seclevel, flags, types, static)
@@ -199,10 +206,7 @@ TYPEDOP(x, name, "UNIMPLEMENTED: " helpmsg, args, flags, types)         \
   undefined();                                                          \
 }
 
-#define DEFINE(x) do {                          \
-  (void)defined_ ## x;                          \
-  runtime_define(&op_ ## x);                    \
-} while (0)
+#define DEFINE(x) ((void)defined_ ## x, runtime_define(&op_ ## x))
 
 /* use this to silence warning if a primitive isn't DEFINED'd */
 #define NOT_DEFINED(x) static int UNUSED defined_ ## x
@@ -211,6 +215,13 @@ TYPEDOP(x, name, "UNIMPLEMENTED: " helpmsg, args, flags, types)         \
   STATIC_STRING(define_name, name);                             \
   system_string_define(GET_STATIC_STRING(define_name), (val));  \
 } while (0)
+
+#define DEFINE_INT(name) system_define(#name, makeint(name))
+
+/* Define integer constants prefix ## map(argN) with argN in foreach(op, sep).
+   Cf. PREFIX_MAP() */
+#define DEFINE_PREFIX_MAP(prefix, map, foreach) \
+  FOR_ARGS(DEFINE_INT, SEP_SEMI, PREFIX_MAP(prefix, map, foreach))
 
 /* Set 'dst' to a local, variable-length array copy of 'src'. Causes an
    error if it needs more than 'maxsize' characters. */
@@ -222,16 +233,14 @@ TYPEDOP(x, name, "UNIMPLEMENTED: " helpmsg, args, flags, types)         \
   char dst[__size_ ## dst];                             \
   memcpy(dst, __tmp_ ## dst->str, __size_ ## dst)
 
-/* stop at first NUL */
-#define ALLOCA_PATH(dst, src) do {                      \
-  struct string *__src = (src);                         \
-  TYPEIS(__src, string);                                \
-  size_t __l = strlen(__src->str);                      \
-  if (__l > PATH_MAX)                                   \
-    RUNTIME_ERROR(error_bad_value, "path too long");    \
-  char *__dst = alloca(__l + 1);                        \
-  memcpy(__dst, __src->str, __l + 1);                   \
-  (dst) = __dst;                                        \
+/* use with CT_PATHNAME */
+#define ALLOCA_PATH(dst, src) do {                              \
+  struct string *__src = (src);                                 \
+  size_t __l = string_len(__src);                               \
+  assert(__l <= PATH_MAX);                                      \
+  char *__dst = alloca(__l + 1);                                \
+  memcpy(__dst, __src->str, __l + 1);                           \
+  (dst) = __dst;                                                \
 } while (0)
 
 #define UNDEFINED_VALUE (makeint(42))
@@ -240,13 +249,14 @@ TYPEDOP(x, name, "UNIMPLEMENTED: " helpmsg, args, flags, types)         \
 
 /* Type signatures for primitives are strings of the format "xxx.y", where the
    x's stand for the type of arguments, y for the type of the result.
-   y is ommitted for functions with undefined results.
+   y is omitted for functions with undefined results.
+
    The following characters are used:
 
    f: function (closure, primitive, vararg, secure)
-   n: integer
    z: zero
-   Z: non-zero
+   Z: non-zero integer
+   n: integer (zero or non-zero integer)
    s: string
    v: vector
    l: list (pair or null)
@@ -256,14 +266,14 @@ TYPEDOP(x, name, "UNIMPLEMENTED: " helpmsg, args, flags, types)         \
    y: symbol
    d: float (mnemonic: double)
    b: bigint
-   r: reference
    x: any
-   o: other
+   o: other (see mc:itype_typeset in ins3.mud)
    1-9: same type as corresponding argument (must be a previous arg)
    A-Z: special typesets, as follows:
-    B: integer or bigint (auto-converts to bigint)
-    D: integer, bigint, or float (auto-converts to float)
-   *: Kleene closure of the previous type; must be followed by "."
+     B: integer or bigint (auto-convert to bigint)
+     D: integer, bigint, or float (auto-convert to float)
+   *: zero or more of the previous type; must be followed by "."
+
    [...]: one of the enclosed characters
 
   Cf. the "typesets" variable in inference.mud

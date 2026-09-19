@@ -19,13 +19,16 @@
  * ENHANCEMENTS, OR MODIFICATIONS.
  */
 
+| srcdir |
+srcdir = dirname(loading_file()) + "/";
+
+set_use_nicename!(false);
+
 load_library = fn (string s)
 [
   silent == true || dformat("loading %s%n", s);
-  if (load(s + ".mud"))
+  if (load(srcdir + s + ".mud"))
     silent == true || dformat("loaded %s%n", s)
-  else
-    error(error_bad_value);
 ];
 
 [

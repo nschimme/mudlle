@@ -23,7 +23,6 @@
 #define RUNTIME_BASIC_H
 
 #include "../error.h"
-#include "../types.h"
 
 enum {
   un_sysname,
@@ -35,16 +34,12 @@ enum {
   /* start mudlle const */
 };
 
-extern const struct prim_op *const dereference_prim_ext;
 extern const struct prim_op *const ref_prim_ext;
-extern const struct prim_op *const set_refb_prim_ext;
 extern const struct prim_op *const setb_prim_ext;
-extern const struct prim_op *const warning_prim_ext;
 
 void basic_init(void);
 value code_ref(value x1, value x2);
 value code_setb(value x1, value x2, value x3);
-value code_symbol_ref(value x, struct string *s);
 
 noreturn void ref_bad_type_error(value x1, value x2);
 noreturn void set_bad_type_error(value x1, value x2, value x3);
