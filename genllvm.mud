@@ -8,10 +8,11 @@ requires asmwriter, compiler, dlist, flow, ins3, misc, sequences, vars
 defines mc:gen_llvm_ir, mc:gen_llvm_function
 
 [
-  | llvm_read_var, llvm_write_var, gen_ins, gen_function, tmp_seq, terminated |
+  | llvm_read_var, llvm_write_var, gen_ins, gen_function, tmp_seq, terminated, globals_seen |
 
   tmp_seq = 0;
   terminated = false;
+  globals_seen = make_table();
 
   llvm_read_var = fn (vector var, w)
     [
@@ -35,7 +36,15 @@ defines mc:gen_llvm_ir, mc:gen_llvm_function
       else if (class == mc:v_function)
         format("@fn_%d", var[mc:v_fvalue][mc:c_fnumber])
       else if (class == mc:v_global || class == mc:v_global_constant || class == mc:v_global_define)
-        format("@g_%s", var[mc:v_name])
+        [
+          | gname, tname |
+          gname = var[mc:v_name];
+          globals_seen[gname] = var;
+          tmp_seq = tmp_seq + 1;
+          tname = format("%%gval_%d", tmp_seq);
+          writer:format(w, "  %s = load i64, ptr @g_%s\n", tname, gname);
+          tname
+        ]
       else
         [
           | vnum, tname |
@@ -51,7 +60,14 @@ defines mc:gen_llvm_ir, mc:gen_llvm_function
     [
       | class |
       class = var[mc:v_class];
-      if (class != mc:v_constant && class != mc:v_global && class != mc:v_global_constant && class != mc:v_global_define && class != mc:v_function)
+      if (class == mc:v_global || class == mc:v_global_constant || class == mc:v_global_define)
+        [
+          | gname |
+          gname = var[mc:v_name];
+          globals_seen[gname] = var;
+          writer:format(w, "  store i64 %s, ptr @g_%s\n", val_str, gname);
+        ]
+      else if (class != mc:v_constant && class != mc:v_function)
         [
           | vnum |
           vnum = var[mc:v_number];
@@ -83,7 +99,9 @@ defines mc:gen_llvm_ir, mc:gen_llvm_function
             [
               | class |
               class = v[mc:v_class];
-              if (class != mc:v_constant && class != mc:v_global && class != mc:v_global_constant && class != mc:v_global_define && class != mc:v_function)
+              if (class == mc:v_global || class == mc:v_global_constant || class == mc:v_global_define)
+                globals_seen[v[mc:v_name]] = v
+              else if (class != mc:v_constant && class != mc:v_function)
                 vars_seen[itoa(v[mc:v_number])] = v;
             ]
         ];
@@ -335,46 +353,78 @@ defines mc:gen_llvm_ir, mc:gen_llvm_function
             ]
           else
             [
-              | cmp, seq |
+              | cmp, seq, v1, v2 |
               tmp_seq = tmp_seq + 1;
               seq = tmp_seq;
               cmp = format("%%brcmp_%d", seq);
 
               if (op == mc:branch_true)
-                writer:format(w, "  %s = icmp ne i64 %s, 1\n", cmp, llvm_read_var(car(args), w))
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  writer:format(w, "  %s = icmp ne i64 %s, 1\n", cmp, v1);
+                ]
               else if (op == mc:branch_false)
-                writer:format(w, "  %s = icmp eq i64 %s, 1\n", cmp, llvm_read_var(car(args), w))
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  writer:format(w, "  %s = icmp eq i64 %s, 1\n", cmp, v1);
+                ]
               else if (op == mc:branch_eq)
-                writer:format(w, "  %s = icmp eq i64 %s, %s\n", cmp, llvm_read_var(car(args), w), llvm_read_var(cadr(args), w))
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  writer:format(w, "  %s = icmp eq i64 %s, %s\n", cmp, v1, v2);
+                ]
               else if (op == mc:branch_ne)
-                writer:format(w, "  %s = icmp ne i64 %s, %s\n", cmp, llvm_read_var(car(args), w), llvm_read_var(cadr(args), w))
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  writer:format(w, "  %s = icmp ne i64 %s, %s\n", cmp, v1, v2);
+                ]
               else if (op == mc:branch_lt)
-                writer:format(w, "  %s = icmp slt i64 %s, %s\n", cmp, llvm_read_var(car(args), w), llvm_read_var(cadr(args), w))
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  writer:format(w, "  %s = icmp slt i64 %s, %s\n", cmp, v1, v2);
+                ]
               else if (op == mc:branch_ge)
-                writer:format(w, "  %s = icmp sge i64 %s, %s\n", cmp, llvm_read_var(car(args), w), llvm_read_var(cadr(args), w))
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  writer:format(w, "  %s = icmp sge i64 %s, %s\n", cmp, v1, v2);
+                ]
               else if (op == mc:branch_le)
-                writer:format(w, "  %s = icmp sle i64 %s, %s\n", cmp, llvm_read_var(car(args), w), llvm_read_var(cadr(args), w))
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  writer:format(w, "  %s = icmp sle i64 %s, %s\n", cmp, v1, v2);
+                ]
               else if (op == mc:branch_gt)
-                writer:format(w, "  %s = icmp sgt i64 %s, %s\n", cmp, llvm_read_var(car(args), w), llvm_read_var(cadr(args), w))
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  writer:format(w, "  %s = icmp sgt i64 %s, %s\n", cmp, v1, v2);
+                ]
               else if (op >= mc:branch_type? && op < mc:branch_ntype?)
                 [
                   | type_idx, bit_and |
+                  v1 = llvm_read_var(car(args), w);
                   type_idx = op - mc:branch_type?;
                   bit_and = format("%%tag_%d", seq);
                   if (type_idx == 0) // integer
                     [
-                      writer:format(w, "  %s = and i64 %s, 1\n", bit_and, llvm_read_var(car(args), w));
+                      writer:format(w, "  %s = and i64 %s, 1\n", bit_and, v1);
                       writer:format(w, "  %s = icmp ne i64 %s, 0\n", cmp, bit_and);
                     ]
                   else
                     [
-                      writer:format(w, "  %s = and i64 %s, 1\n", bit_and, llvm_read_var(car(args), w));
+                      writer:format(w, "  %s = and i64 %s, 1\n", bit_and, v1);
                       writer:format(w, "  %s = icmp eq i64 %s, 0\n", cmp, bit_and);
                     ]
                 ]
               else
                 [
-                  writer:format(w, "  %s = icmp ne i64 %s, 1\n", cmp, llvm_read_var(car(args), w));
+                  v1 = llvm_read_var(car(args), w);
+                  writer:format(w, "  %s = icmp ne i64 %s, 1\n", cmp, v1);
                 ];
 
               writer:format(w, "  br i1 %s, label %%L_%d, label %%L_next_%d\n", cmp, dest_lbl, seq);
@@ -383,7 +433,7 @@ defines mc:gen_llvm_ir, mc:gen_llvm_function
         ]
       else if (class == mc:i_call)
         [
-          | dest_var, fn_var, call_args, cname, res |
+          | dest_var, fn_var, call_args, cname, res, arg_vstrs, fptr, prefix |
           dest_var = ins[mc:i_cdest];
           call_args = ins[mc:i_cargs];
           fn_var = car(call_args);
@@ -392,14 +442,24 @@ defines mc:gen_llvm_ir, mc:gen_llvm_function
           if (fn_var[mc:v_class] == mc:v_function)
             cname = format("@fn_%d", fn_var[mc:v_fvalue][mc:c_fnumber])
           else
-            cname = llvm_read_var(fn_var, w);
+            [
+              cname = llvm_read_var(fn_var, w);
+              tmp_seq = tmp_seq + 1;
+              fptr = format("%%fptr_%d", tmp_seq);
+              writer:format(w, "  %s = inttoptr i64 %s to ptr\n", fptr, cname);
+              cname = fptr;
+            ];
+
+          arg_vstrs = lmap(fn (arg) llvm_read_var(arg, w), call_args);
 
           tmp_seq = tmp_seq + 1;
           res = format("%%call_%d", tmp_seq);
-          writer:format(w, "  %s = call i64 %s(i64 1", res, cname);
-          lforeach(fn (arg) [
-            writer:format(w, ", i64 %s", llvm_read_var(arg, w));
-          ], call_args);
+          writer:format(w, "  %s = call i64 %s(", res, cname);
+          prefix = "";
+          lforeach(fn (vstr) [
+            writer:format(w, "%si64 %s", prefix, vstr);
+            prefix = ", ";
+          ], arg_vstrs);
           writer:write_line(w, ")");
           llvm_write_var(dest_var, res, w);
         ]
@@ -435,6 +495,8 @@ defines mc:gen_llvm_ir, mc:gen_llvm_function
   mc:gen_llvm_ir = fn "mod, {writer,null} w -> . Generates LLVM IR for module" (mod, {vector,null} w = null)
     [
       | fns, created_w |
+      globals_seen = make_table();
+
       if (w == null)
         [
           w = writer:new_string();
@@ -456,6 +518,10 @@ defines mc:gen_llvm_ir, mc:gen_llvm_function
 
       fns = mc:all_functions(mod[mc:m_body]);
       lforeach(fn (ifn) gen_function(ifn, w), fns);
+
+      table_foreach(fn (@<gname = _>) [
+        writer:format(w, "@g_%s = global i64 1\n", gname);
+      ], globals_seen);
 
       if (created_w)
         writer:get_string(w)
