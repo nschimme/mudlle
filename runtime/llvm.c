@@ -134,8 +134,14 @@ static void *llvm_orc_compile_ir(struct string *ir, struct string *symbol)
 
   llvm_orc_initialize();
   sequence = llvm_orc_module_sequence++;
+#if LLVM_VERSION_MAJOR >= 21
+  /* LLVM 21 removed the ORC accessor for a context created by ORC. */
+  context = LLVMContextCreate();
+  safe_context = LLVMOrcCreateNewThreadSafeContextFromLLVMContext(context);
+#else
   safe_context = LLVMOrcCreateNewThreadSafeContext();
   context = LLVMOrcThreadSafeContextGetContext(safe_context);
+#endif
   buffer = LLVMCreateMemoryBufferWithMemoryRangeCopy(
     ir->str, string_len(ir), "mudlle-module");
   if (LLVMParseIRInContext(context, buffer, &module, &parse_message))
@@ -572,8 +578,19 @@ static value llvm_call_closure(void *cbdata, struct closure *closure,
       return NULL;
     }
   GCPRO(closure, arguments);
-  int64_t result = data->entry((int64_t)(uintptr_t)closure, arguments->data,
-                               (int64_t)vector_len(arguments));
+  size_t nargs = vector_len(arguments);
+  value argv[nargs ? nargs : 1];
+  value *slots[nargs ? nargs : 1];
+  struct gcpro roots[nargs ? nargs : 1];
+  for (size_t i = 0; i < nargs; ++i)
+    {
+      argv[i] = arguments->data[i];
+      slots[i] = &argv[i];
+    }
+  struct gcpro *old_gcpro = llvm_gc_roots_enter(slots, nargs, roots);
+  int64_t result = data->entry((int64_t)(uintptr_t)closure, argv,
+                               (int64_t)nargs);
+  llvm_gc_roots_leave(old_gcpro);
   UNGCPRO();
   return (value)(uintptr_t)result;
 }

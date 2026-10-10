@@ -952,7 +952,10 @@ static struct closure *make_primitive_closure_internal(
   for (ulong i = 0; i < ncaptures; ++i)
     cl->variables[i + 1] = NULL;
   for (ulong i = 0; i < ncaptures; ++i)
-    cl->variables[i + 1] = alloc_variable(captures->data[i]);
+    {
+      struct variable *cell = alloc_variable(captures->data[i]);
+      cl->variables[i + 1] = cell;
+    }
   UNGCPROV(cl_root);
   UNGCPRO();
 

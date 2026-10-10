@@ -1223,18 +1223,18 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       else if (class == mc:i_memory)
         [
           | array, array_ptr, field_ptr, value_str, offset |
-          array = llvm_read_var(ins[mc:i_marray], w);
           tmp_seq = tmp_seq + 1;
           array_ptr = format("%%array_%d", tmp_seq);
           field_ptr = format("%%field_%d", tmp_seq);
           offset = 16 + 8 * ins[mc:i_mindex];
-          writer:format(w, "  %s = inttoptr i64 %s to ptr\n",
-                        array_ptr, array);
-          writer:format(w, "  %s = getelementptr inbounds i8, ptr %s, i64 %d\n",
-                        field_ptr, array_ptr, offset);
 
           if (ins[mc:i_mop] == mc:memory_read)
             [
+              array = llvm_read_var(ins[mc:i_marray], w);
+              writer:format(w, "  %s = inttoptr i64 %s to ptr\n",
+                            array_ptr, array);
+              writer:format(w, "  %s = getelementptr inbounds i8, ptr %s, i64 %d\n",
+                            field_ptr, array_ptr, offset);
               value_str = format("%%mem_%d", tmp_seq);
               writer:format(w, "  %s = load i64, ptr %s\n", value_str, field_ptr);
               llvm_write_var(ins[mc:i_mscalar], value_str, w);
@@ -1243,9 +1243,17 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                    || ins[mc:i_mop] == mc:memory_write_safe)
             [
               if (ins[mc:i_mop] == mc:memory_write_safe)
-                writer:format(w,
-                  "  call void @llvm_check_mutable(i64 %s)\n", array);
+                [
+                  array = llvm_read_var(ins[mc:i_marray], w);
+                  writer:format(w,
+                    "  call void @llvm_check_mutable(i64 %s)\n", array);
+                ];
               value_str = llvm_read_var(ins[mc:i_mscalar], w);
+              array = llvm_read_var(ins[mc:i_marray], w);
+              writer:format(w, "  %s = inttoptr i64 %s to ptr\n",
+                            array_ptr, array);
+              writer:format(w, "  %s = getelementptr inbounds i8, ptr %s, i64 %d\n",
+                            field_ptr, array_ptr, offset);
               writer:format(w, "  store i64 %s, ptr %s\n", value_str, field_ptr);
             ]
           else
