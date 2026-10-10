@@ -52,6 +52,9 @@ ARCH := $(shell uname -m)
 ifneq ($(filter x86-64 x86_64 x64,$(ARCH)),)
 override ARCH := amd64
 endif
+ifneq ($(filter aarch64,$(ARCH)),)
+override ARCH := arm64
+endif
 
 ifeq ($(shell uname -s),Darwin)
 DARWIN := t
@@ -59,26 +62,41 @@ else
 DARWIN :=
 endif
 
-ifeq ($(filter amd64 arm64,$(ARCH)),)
-$(error Unsupported ARCH=$(ARCH); expected amd64 or arm64)
+ifeq ($(filter amd64 arm64 riscv64,$(ARCH)),)
+$(error Unsupported ARCH=$(ARCH); expected amd64, arm64, or riscv64)
 endif
 
-ifeq ($(ARCH),amd64)
+HAS_LLVM := $(if $(shell command -v llc 2>/dev/null),yes,no)
+
+ifeq ($(USE_LLVM),yes)
+MUDARCH := llvm
+NOCOMPILER :=
+else ifeq ($(MUDARCH),llvm)
+NOCOMPILER :=
+else ifeq ($(ARCH),amd64)
 ARCHFLAG := -m64
 MUDARCH := x64
 ARCH_CFLAGS := -fpie
 ARCH_LDFLAGS := -fpie $(if $(DARWIN),-Xlinker) -pie
-endif
-
-ifeq ($(ARCH),arm64)
-NOCOMPILER := yes
+else
+ ifeq ($(HAS_LLVM),yes)
+  MUDARCH := llvm
+  NOCOMPILER :=
+ else
+  NOCOMPILER := yes
+ endif
 endif
 
 _:=$(shell [ -e compiler ] || ln -s $(srcdir) compiler)
 
 ifeq ($(NOCOMPILER),)
-BUILTINS := $(MUDARCH)builtins.$(OBJEXT)
-BUILTINDEPS := $(MUDARCH)consts.h
+ ifeq ($(ARCH),amd64)
+  BUILTINS := x64builtins.$(OBJEXT)
+  BUILTINDEPS := x64consts.h
+ else
+  BUILTINS :=
+  BUILTINDEPS :=
+ endif
 else
 endif
 
@@ -124,6 +142,19 @@ CPPFLAGS := $(ARCHFLAG)
 override CPPFLAGS += -I. -I$(srcdir)
 LDFLAGS := $(ARCHFLAG) $(ARCH_LDFLAGS)
 LIBS := -lm
+LLVM_CONFIG := $(shell command -v llvm-config 2>/dev/null)
+ifeq ($(MUDARCH),llvm)
+ifeq ($(LLVM_CONFIG),)
+$(error MUDARCH=llvm requires llvm-config with LLJIT support)
+else
+LLVM_INCLUDEDIR := $(shell $(LLVM_CONFIG) --includedir)
+LLVM_LIBDIR := $(shell $(LLVM_CONFIG) --libdir)
+override CPPFLAGS += -I$(LLVM_INCLUDEDIR)
+LDFLAGS += -L$(LLVM_LIBDIR)
+LIBS += $(shell $(LLVM_CONFIG) --libs orcjit native core)
+LIBS += $(shell $(LLVM_CONFIG) --system-libs)
+endif
+endif
 MAKEDEPEND = $(CC) -MM
 PERL := perl
 
@@ -138,6 +169,11 @@ override LDFLAGS += $(addprefix -L, \
 	$(wildcard /opt/local/lib $(HOMEBREW_PREFIX)/lib))
 LIBS += -liconv
 endif # DARWIN
+
+ifeq ($(DARWIN),)
+LDFLAGS += -rdynamic
+LIBS += -ldl
+endif
 
 export CC CFLAGS CPPFLAGS LDFLAGS MAKEDEPEND PERL
 
@@ -228,11 +264,11 @@ lexer.c: lexer.l
 	@echo "Generating $*.tab.[ch]"
 	$(Q)bison -dtv $<
 
-$(MUDARCH)builtins.$(OBJEXT): $(MUDARCH)builtins.S $(BUILTINDEPS) $(OBJDEP)
+x64builtins.$(OBJEXT): x64builtins.S x64consts.h $(OBJDEP)
 	@echo "Compiling $(patsubst $(srcdir)%,%,$<)"
 	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(MUDARCH)consts.h: genconst Makefile
+x64consts.h: genconst Makefile
 	@echo "Creating $@"
 	$(Q)./genconst > $@
 
@@ -268,11 +304,11 @@ dep depend: .depend
 
 ifeq ($(NOCOMPILER),)
 
-MUD_FILES := $(patsubst %, $(srcdir)%.mud, a$(MUDARCH) compile		\
-	compiler cxc dihash dlist flow gen$(MUDARCH) graph icxc		\
+MUD_FILES := $(patsubst %, $(srcdir)%.mud, $(sort a$(MUDARCH) asmwriter compile \
+	compiler cxc dihash dlist flow genllvm gen$(MUDARCH) graph icxc	\
 	inference ins3 interface ixc lib link misc m$(MUDARCH) noinf	\
 	optimise phase1 phase2 phase3 phase4 pxslow sequences vars	\
-	$(MUDARCH) xc)
+	$(MUDARCH) xc))
 
 # Currently 22 files, split into at most 8 groups for parallel builds
 GROUPS=0 1 2 3 4 5 6 7

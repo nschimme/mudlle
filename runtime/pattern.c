@@ -209,6 +209,31 @@ static bool recurse(value lhs, value rhs, struct seen_values *seen)
     }
 }
 
+bool mudlle_values_equal(value lhs, value rhs)
+{
+  struct seen_values seen = { .size = 0 };
+  bool result = recurse(lhs, rhs, &seen);
+
+  /* can be expensive */
+  expensive_operation(seen.used / 8);
+
+  /* restore modified data */
+  for (size_t i = 0; i < seen.used; ++i)
+    {
+      seen.seen[i].lhs->size = seen.seen[i].lhs_size;
+      seen.seen[i].lhs->flags &= ~OBJ_FLAG_0;
+      seen.seen[i].rhs->flags &= ~OBJ_FLAG_1;
+    }
+  free(seen.seen);
+
+  if (seen.hit_stack_limit)
+    runtime_error(error_recurse);
+
+  return result;
+}
+
+
+
 TYPEDOP(equalp, "equal?",
         "`x0 `x1 -> `b. Return true if `x0 is equal to `x1.\n\n"
         "Pairs, vectors, symbols, and tables are compared recursively.\n\n"
@@ -229,25 +254,7 @@ TYPEDOP(equalp, "equal?",
         OP_LEAF | OP_NOALLOC | OP_NOESCAPE | OP_STR_READONLY | OP_CONST,
         "xx.n")
 {
-  struct seen_values seen = { .size = 0 };
-  bool result = recurse(lhs, rhs, &seen);
-
-  /* can be expensive */
-  expensive_operation(seen.used / 8);
-
-  /* restore modified data */
-  for (size_t i = 0; i < seen.used; ++i)
-    {
-      seen.seen[i].lhs->size = seen.seen[i].lhs_size;
-      seen.seen[i].lhs->flags &= ~OBJ_FLAG_0;
-      seen.seen[i].rhs->flags &= ~OBJ_FLAG_1;
-    }
-  free(seen.seen);
-
-  if (seen.hit_stack_limit)
-    runtime_error(error_recurse);
-
-  return makebool(result);
+  return makebool(mudlle_values_equal(lhs, rhs));
 }
 
 void pattern_init(void)

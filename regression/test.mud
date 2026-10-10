@@ -11,10 +11,15 @@ reval = fn (s)
       quit(1);
     ];
 
+regression_failures = 0;
 regress = fn (name, x, expected)
-  dformat("%s: got %s, expected %s: %s\n",
-          name, x, expected,
-          if (equal?(x, expected)) "passed" else "FAILED");
+  [
+    | ok |
+    ok = equal?(x, expected);
+    if (!ok) regression_failures = regression_failures + 1;
+    dformat("%s: got %s, expected %s: %s\n",
+            name, x, expected, if (ok) "passed" else "FAILED");
+  ];
 
 unparse = fn (x) format("%w", x);
 
@@ -31,17 +36,21 @@ regresseval = fn (name, x, expected)
     dformat("%sv1: got %s, expected %s: %s\n",
             name, resvar1, expected,
             if (equal?(resvar1, expected)) "passed" else "FAILED");
+    if (!equal?(resvar1, expected)) regression_failures = regression_failures + 1;
     dformat("%sv2: got %s, expected %s: %s\n",
             name, resvar2, expected,
             if (equal?(resvar2, expected)) "passed" else "FAILED");
+    if (!equal?(resvar2, expected)) regression_failures = regression_failures + 1;
     dformat("%sv3: got %s, expected %s: %s\n",
             name, resvar3, expected,
             if (equal?(resvar3, expected)) "passed" else "FAILED");
+    if (!equal?(resvar3, expected)) regression_failures = regression_failures + 1;
   ];
 
 regressfail = fn (name, failingfn)
   trap_error(fn () [ failingfn();
-                     dformat("%s FAILED to fail\n", name);
+                     [ regression_failures = regression_failures + 1;
+                       dformat("%s FAILED to fail\n", name) ];
                    ],
 	       fn (err) dformat("%s passed\n", name), call_trace_off, null);
 
@@ -49,7 +58,8 @@ regresspass = fn (name, failingfn)
   trap_error(fn () [ failingfn();
                      dformat("%s passed\n", name);
                    ],
-	       fn (err) dformat("%s FAILED\n", name), call_trace_off, null);
+	       fn (err) [ regression_failures = regression_failures + 1;
+                           dformat("%s FAILED\n", name) ], call_trace_off, null);
 
 regressqfail = fn (name, failstr)
   [

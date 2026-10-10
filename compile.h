@@ -42,6 +42,15 @@ struct closure *compile_code(struct mfile *f, seclev_t seclev);
 struct closure *make_primitive_closure(
   struct mcallback *cb, const char *funcname, struct string *help,
   const char *filename, int line);
+struct closure *make_primitive_closure_varargs(
+  struct mcallback *cb, const char *funcname, struct string *help,
+  const char *filename, int line);
+struct closure *make_primitive_closure_varargs_captured(
+  struct mcallback *cb, const char *funcname, struct string *help,
+  const char *filename, int line, struct vector *captures);
+struct closure *make_primitive_closure_varargs_captured_sec(
+  struct mcallback *cb, const char *funcname, struct string *help,
+  const char *filename, int line, struct vector *captures, seclev_t seclev);
 
 void compile_init(void);
 

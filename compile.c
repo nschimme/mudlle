@@ -876,12 +876,17 @@ static struct block *new_toplevel_codeblock(struct vlist *statics,
   return body;
 }
 
-/* returns a closure fn() that calls cb->f(cb) */
-struct closure *make_primitive_closure(
-  struct mcallback *cb, const char *funcname,
-  struct string *help,
-  const char *filename, int line)
+/* Builds an interpreter closure that calls its C callback.  The varargs
+   form passes all Mudlle arguments as a vector to op_c_callback. */
+static struct closure *make_primitive_closure_internal(
+  struct mcallback *cb, const char *funcname, struct string *help,
+  const char *filename, int line, bool varargs,
+  struct vector *captures, seclev_t seclev)
 {
+  struct variable *cbvar = NULL;
+  struct icode *icode = NULL;
+  GCPRO(cbvar, icode, captures);
+
   assert(funcname != NULL);
   assert(help->o.garbage_type == garbage_static_string);
 
@@ -893,9 +898,7 @@ struct closure *make_primitive_closure(
     }
   init_string_cache(scache);
 
-  struct variable *cbvar = alloc_variable(cb);
-  struct icode *icode = NULL;
-  GCPRO(cbvar, icode);
+  cbvar = alloc_variable(cb);
 
   const struct filename fname = {
     .filename = filename,
@@ -906,32 +909,87 @@ struct closure *make_primitive_closure(
     .line  = line,
     .col   = 0
   };
-  const unsigned nargs = 0;
-  const struct function_args fargs = { .nargs = nargs };
+  struct function_arg vararg = {
+    .typeset = TYPESET_ANY,
+    .is_optional = true,
+    .is_vararg = true
+  };
+  struct function_args fargs = { .nargs = 0 };
+  unsigned nlocals = 0;
+  if (varargs)
+    {
+      fargs.args = fargs.last_arg = &vararg;
+      fargs.nargs = fargs.noptargs = 1;
+      nlocals = 2;
+    }
 
   struct fncode *newfn = new_fncode(false, &loc);
-  ins1(op_args_fixed, nargs, newfn);
-  if (nargs > 0)
-    ins0(op_pop_args, newfn);
+  if (varargs)
+    {
+      ins_constant(makeint(0), newfn);
+      ins_constant(makeint(0), newfn);
+      ins0(op_args_vararg, newfn);
+    }
+  else
+    ins1(op_args_fixed, 0, newfn);
+  ins0(op_pop_args, newfn);
   ins_recall(vclass_closure, 0, newfn);
   ins0(op_c_callback, newfn);
   ins0(op_return, newfn);
-  /* we must have popped arguments and left one return value on the stack */
   assert(adjust_depth(0, newfn) == 1);
 
   icode = generate_fncode(
-    newfn, help, NULL, &loc,
-    make_arguments(&fargs), false, TYPESET_ANY, MAX_SECLEVEL);
-  icode->nb_locals = nargs;
+    newfn, help, NULL, &loc, make_arguments(&fargs), varargs, TYPESET_ANY,
+    seclev);
+  icode->nb_locals = nlocals;
 
-  struct closure *cl = alloc_closure_noinit(1);
+  ulong ncaptures = captures ? vector_len(captures) : 0;
+  struct closure *cl = alloc_closure_noinit(1 + ncaptures);
+  struct gcpro cl_root;
+  GCPROV(cl_root, cl);
   cl->code = &icode->code;
   cl->variables[0] = cbvar;
+  for (ulong i = 0; i < ncaptures; ++i)
+    cl->variables[i + 1] = NULL;
+  for (ulong i = 0; i < ncaptures; ++i)
+    cl->variables[i + 1] = alloc_variable(captures->data[i]);
+  UNGCPROV(cl_root);
   UNGCPRO();
 
   free_string_cache();
-
   return cl;
+}
+
+struct closure *make_primitive_closure(
+  struct mcallback *cb, const char *funcname, struct string *help,
+  const char *filename, int line)
+{
+  return make_primitive_closure_internal(
+    cb, funcname, help, filename, line, false, NULL, MAX_SECLEVEL);
+}
+
+struct closure *make_primitive_closure_varargs(
+  struct mcallback *cb, const char *funcname, struct string *help,
+  const char *filename, int line)
+{
+  return make_primitive_closure_internal(
+    cb, funcname, help, filename, line, true, NULL, MAX_SECLEVEL);
+}
+
+struct closure *make_primitive_closure_varargs_captured(
+  struct mcallback *cb, const char *funcname, struct string *help,
+  const char *filename, int line, struct vector *captures)
+{
+  return make_primitive_closure_internal(
+    cb, funcname, help, filename, line, true, captures, MAX_SECLEVEL);
+}
+
+struct closure *make_primitive_closure_varargs_captured_sec(
+  struct mcallback *cb, const char *funcname, struct string *help,
+  const char *filename, int line, struct vector *captures, seclev_t seclev)
+{
+  return make_primitive_closure_internal(
+    cb, funcname, help, filename, line, true, captures, seclev);
 }
 
 struct closure *compile_code(struct mfile *f, seclev_t seclev)

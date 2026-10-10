@@ -22,6 +22,9 @@
 #ifndef RUNTIME_PATTERN_H
 #define RUNTIME_PATTERN_H
 
+#include "../types.h"
+
 void pattern_init(void);
+bool mudlle_values_equal(value lhs, value rhs);
 
 #endif /* RUNTIME_PATTERN_H */

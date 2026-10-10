@@ -72,6 +72,7 @@ protect_compiler_libs = fn ()
       [
         ,module_loaded    => module_set!(name, module_protected, 1);
         ,module_protected => null;
+        ,module_unloaded  => null;
       ]
   ], all_modules());
 

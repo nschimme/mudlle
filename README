@@ -1,16 +1,26 @@
 mudlle: MUD Language for Little Extensions
 ------------------------------------------
 
-This software is Copyright (C) 1993-2012 David Gay and Gustav Hållberg.
+This software is Copyright (C) 1993-2012 David Gay and Gustav HÃ¥llberg.
 Read the COPYRIGHT file for terms of use.
 
 
 Installation
 ------------
-To compile for 64-bit x86-64 on Linux or macOS, just type 'make".
+To compile on Linux or macOS:
 
-Makefile contains a number of USE_xxx variables that can be set to
-'yes' to enable that feature. They may require additional header files.
+  make
+  make compiler
+
+macOS Setup
+-----------
+On macOS (Homebrew), install the required toolchain dependencies including LLVM:
+
+  brew install llvm flex bison
+
+Ensure LLVM tools (`llc`, `llvm-as`, `opt`) are available in your PATH:
+
+  export PATH="$(brew --prefix llvm)/bin:$PATH"
 
 
 Quick Introduction
@@ -32,31 +42,62 @@ Once compiled, run mudlle and check that basic stuff works:
 
 EOF (Ctrl-D), or evaluating quit() will exit the interpreter.
 
-doc/mudlle-intro.doc and doc/mudlle-ref.doc contain a somewhat out of date
-language introduction and reference. However, everything described in those
-documents should still work.
+doc/mudlle-intro.doc and doc/mudlle-ref.doc contain a language introduction
+and reference. doc/llvm-backend.md documents the LLVM backend.
 
-A compiler is available for x86-64. To load it, type:
+LLVM Compiler Demo (Apple Silicon)
+----------------------------------
+Install LLVM and make its tools visible before building:
+
+  brew install llvm
+  export PATH="$(brew --prefix llvm)/bin:$PATH"
+  make
+
+On ARM64 and RISC-V, `load("xc.mud")` selects the LLVM backend. At the prompt,
+compile a function to IR and then ask LLVM to produce host assembly:
 
   load("xc.mud")
+  source = "fn (a, b) a + b";
+  tree = mudlle_parse(source, null, false);
+  ir = mc:compile_llvm(tree, 1, mc:source_code(source));
+  w = writer:new_file("module.ll");
+  writer:write(w, ir);
+  writer:close(w);
+  asm_tree = mudlle_parse(source, null, false);
+  mc:compile_llvm_asm(asm_tree, "module.s");
 
-at the 'mudlle>' prompt.
+Validate the IR with `llvm-as module.ll -o module.bc`. The LLVM backend leaves
+the target triple and data layout open so LLVM uses the host architecture. On
+x86-64, `load("xc.mud")` keeps the legacy compiler; load `llvmc.mud` to select
+LLVM explicitly. Start a fresh Mudlle process with each loader when comparing
+the backends.
 
-To compile a file:
+Without LLVM installed, the interpreter remains available. Native x86-64
+compilation continues to use the existing backend.
 
-  fcompile("<filename.mud>")
+Validation and Compatibility
+----------------------------
+On an Apple Silicon Mac with Homebrew LLVM, `make` succeeds and
+`./mudlle -e regression/llvm.mud` passes. The regression covers IR generation
+for arithmetic, branches, and loops, then asks `llc` to emit ARM64 assembly.
+A separate native harness calling the emitted addition function with tagged
+inputs 3 and 5 returned the expected tagged result 7.
 
-This produces <filename.obj>.
+`mc:compile` follows the standard compile/prelink API, and the regression
+exercises `mc:linkrun`, generated closures, optional and variadic arguments,
+IR generation, and assembly output on ARM64. Full x64 parity remains in
+progress; several primitive and floating-point operations still need coverage.
 
-To load a compiled file:
+Use the complete regression suite's runtime to compare backend speed. Compare
+the same tests and build configuration, and use timings only after confirming
+that both backends pass the suite.
 
-  fload("<filename.obj>");
-
-Remember, the source code is the documentation.
+LLVM arithmetic dispatches float and bigint operations through Mudlle
+primitives. Broader primitive/runtime coverage and matched x86-64 measurements
+on amd64 remain outstanding.
 
 
 Contact Information
 -------------------
 
-You can contact me at dgay@acm.org. My response time varies from 3 minutes
-to 3 months...
+You can contact me at dgay@acm.org.

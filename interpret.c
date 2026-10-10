@@ -24,6 +24,7 @@
 #include "global.h"
 #include "ins.h"
 #include "interpret.h"
+#include "call.h"
 #include "profile.h"
 #include "stack.h"
 
@@ -508,7 +509,7 @@ void do_interpret(struct closure *fn, int my_nargs)
         {
           struct mcallback *cb = FAST_POP();
           SAVE_OFFSET();
-          c_result = call_mcallback(cb);
+          c_result = call_mcallback(cb, me.fn, me.locals);
           goto c_end_call;
         }
 

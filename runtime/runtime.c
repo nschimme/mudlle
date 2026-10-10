@@ -45,6 +45,7 @@
 #include "debug.h"
 #include "files.h"
 #include "io.h"
+#include "llvm.h"
 #include "list.h"
 #include "mudlle-float.h"
 #include "mudlle-string.h"
@@ -658,6 +659,7 @@ void runtime_init(void)
   support_init();
   bitset_init();
   files_init();
+  llvm_init();
   float_init();
   bigint_init();
   pattern_init();

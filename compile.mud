@@ -20,9 +20,10 @@
  */
 
 library compile // call actual compiler
-requires compiler, flow, ins3, link, phase1, phase2, phase3, phase4, sequences,
-  vars
-defines mc:compile
+requires compiler, flow, genllvm, ins3, link, phase1, phase2, phase3, phase4,
+  sequences, vars
+defines mc:compile, mc:compile_llvm, mc:compile_llvm_to_asm
+reads mc:compile_llvm_asm
 writes mc:verbose, mc:erred, mc:this_module, mc:disassemble
 [
   mc:verbose = 2; // default verbosity level
@@ -94,6 +95,80 @@ writes mc:verbose, mc:erred, mc:this_module, mc:disassemble
       | result |
       result = trap_error(
         fn () do_compile(mod, protect, seclev, global_syms),
+        fn (n) false,
+        call_trace_on, null);
+
+      mc:handle_messages(null);
+
+      mc:reset_var_cache();
+
+      result
+    ];
+
+  mc:compile_llvm_to_asm = fn (vector mod, int seclev, function get_source,
+                               string asm_filename)
+    [
+      if (!callable?(get_source, 1))
+        error(error_bad_value);
+
+      mc:reset_closure_count();
+      mc:reset_ins_count();
+      mc:reset_var_count();
+
+      mc:erred = false;
+      mc:this_module = mod;
+
+      mc:handle_messages(get_source);
+
+      | result |
+      result = trap_error(
+        fn () [
+          mc:phase1(mod, seclev, null);
+          if (mc:erred) exit<function> false;
+          mc:phase2(mod);
+          if (mc:erred) exit<function> false;
+          | fns |
+          fns = mc:all_functions(mod[mc:m_body]);
+          mc:phase3(fns);
+          mc:compile_llvm_asm(mod, asm_filename)
+        ],
+        fn (n) false,
+        call_trace_on, null);
+
+      mc:handle_messages(null);
+
+      mc:reset_var_cache();
+
+      result
+    ];
+
+  mc:compile_llvm = fn (vector mod, int seclev, function get_source,
+                        {vector,null} w = null)
+    [
+      if (!callable?(get_source, 1))
+        error(error_bad_value);
+
+      mc:reset_closure_count();
+      mc:reset_ins_count();
+      mc:reset_var_count();
+
+      mc:erred = false;
+      mc:this_module = mod;
+
+      mc:handle_messages(get_source);
+
+      | result |
+      result = trap_error(
+        fn () [
+          mc:phase1(mod, seclev, null);
+          if (mc:erred) exit<function> false;
+          mc:phase2(mod);
+          if (mc:erred) exit<function> false;
+          | fns |
+          fns = mc:all_functions(mod[mc:m_body]);
+          mc:phase3(fns);
+          mc:gen_llvm_ir(mod, w)
+        ],
         fn (n) false,
         call_trace_on, null);
 

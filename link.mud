@@ -21,8 +21,8 @@
 
 library link // A linker.
 requires compiler, misc, sequences, vars
-defines mc:prelink, mc:display_as, mc:prelinked_requires, mc:prelinked_name
-reads mc:describe_seclev, mc:compiler_mcode_version
+defines mc:prelink, mc:prelink_llvm, mc:display_as, mc:prelinked_requires, mc:prelinked_name
+reads mc:describe_seclev, mc:compiler_mcode_version, mc:llvm_constants
 writes mc:this_filenames, mc:this_module, mc:erred, mc:linkrun
 
 [
@@ -569,6 +569,19 @@ writes mc:this_filenames, mc:this_module, mc:erred, mc:linkrun
       found = prelinked_fn . false;
       seen_code = found . seen_code;
 
+      // LLVM prelinked functions store [IR, entry symbol, arity, constants]
+      // instead of architecture-specific machine code.
+      if (vector?(prelinked_fn[pfn_code]))
+        [
+          | native, closure |
+          native = prelinked_fn[pfn_code];
+          if (vlength(native) != 4) error(error_bad_value);
+          closure = llvm_load_ir_closure(
+            native[0], native[1], native[2], seclev, native[3]);
+          set_cdr!(found, closure . closure_code(closure));
+          exit<function> closure
+        ];
+
       | csts, code_csts |
 
       // make code for all sub-functions
@@ -665,6 +678,40 @@ writes mc:this_filenames, mc:this_module, mc:erred, mc:linkrun
         lmap(fn (v) v[mc:mv_name], mod[mc:m_reads]),
         lmap(fn (v) v[mc:mv_name], mod[mc:m_writes]),
         prelink(mod[mc:m_body]),
+        mc:arch | (my:mcode_version << 8))
+    ];
+
+  mc:prelink_llvm = fn (vector mod, string ir, protect)
+    // Build the same serializable pmodule envelope as mc:prelink, with an
+    // LLVM entry descriptor in the top-level function code slot.
+    [
+      | top, llvm_body |
+      top = mod[mc:m_body];
+      llvm_body = sequence(
+        vector(ir, format("entry_%d", top[mc:c_fnumber]),
+               llength(top[mc:c_ffullargs]),
+               my:ltov(mc:llvm_constants())),
+        top[mc:c_fhelp],
+        if (top[mc:c_fvar]) top[mc:c_fvar][mc:v_name] else null,
+        top[mc:c_fnicename],
+        top[mc:c_loc],
+        null, null, null, null, null, null, null, null, null, null,
+        top[mc:c_freturn_typeset],
+        0,
+        null,
+        mc:function_closure_args(top),
+        false,
+        0,
+        top[mc:c_ffilename]);
+      sequence(
+        mod[mc:m_class],
+        !!protect,
+        mod[mc:m_name],
+        dependencies(mod[mc:m_requires]),
+        lmap(fn (v) v[mc:mv_name], mod[mc:m_defines]),
+        lmap(fn (v) v[mc:mv_name], mod[mc:m_reads]),
+        lmap(fn (v) v[mc:mv_name], mod[mc:m_writes]),
+        llvm_body,
         mc:arch | (my:mcode_version << 8))
     ];
 

@@ -26,7 +26,7 @@ wrong-file:
 runtime/bigint.$(OBJEXT): CFLAGS:=-Wno-invalid-source-encoding $(CFLAGS)
 
 RTSRC:=$(addprefix runtime/, arith.c basic.c bigint.c bitset.c bool.c	\
-        debug.c files.c io.c list.c mudlle-float.c mudlle-string.c	\
+        debug.c files.c io.c list.c llvm.c mudlle-float.c mudlle-string.c\
         mudlle-xml.c mudllecst.c pattern.c runtime.c support.c		\
         symbol.c vector.c)
 
