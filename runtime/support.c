@@ -1310,17 +1310,24 @@ static void support_define_consts(void)
 
   system_define("mc:max_local_vars", makeint(MAX_LOCAL_VARS));
 
-#ifdef __x86_64__
-  #define ARCHNAME "x64"
+#if defined __x86_64__
   #define ARCH 0x64
 #elif defined __aarch64__
-  #define ARCHNAME "arm64"
   #define ARCH 0x41
 #elif defined __riscv && __riscv_xlen == 64
-  #define ARCHNAME "riscv64"
   #define ARCH 0x52
 #else
   #error Fix me
+#endif
+
+#ifdef MUDLLE_USE_LLVM
+  #define ARCHNAME "llvm"
+#elif defined __x86_64__
+  #define ARCHNAME "x64"
+#elif defined __aarch64__
+  #define ARCHNAME "arm64"
+#elif defined __riscv && __riscv_xlen == 64
+  #define ARCHNAME "riscv64"
 #endif
 
   system_define("mc:typeset_flag_return", makeint(TYPESET_FLAG_RETURN));

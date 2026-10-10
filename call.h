@@ -216,6 +216,9 @@ struct mcallback;
 
 typedef value (*mcallback_varargs_fn)(void *cbdata, struct closure *fn,
                                       struct vector *args);
+bool mcallback_varargs_matches(struct closure *fn,
+                               mcallback_varargs_fn callback,
+                               void **cbdata);
 value call_mcallback(struct mcallback *cb, struct closure *fn,
                      struct vector *locals);
 

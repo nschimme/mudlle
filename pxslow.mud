@@ -49,7 +49,7 @@ trap_error(fn() [
   mfiles = vmap(fn (f) [ f += ".mud"; f . file_stat(srcdir + f)[fs_size] ], '[
     ,("a" + mc:archname)
     "asmwriter"
-    "compile"
+    ,(if (string_equal?(mc:archname, "llvm")) "llvmcompile" else "compile")
     "compiler"
     "dihash"
     "dlist"

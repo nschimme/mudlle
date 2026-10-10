@@ -1,0 +1,30 @@
+# Build products
+*.o
+*.i
+*.obj
+mudlle
+genconst
+compiler
+build0/
+build1/
+build2/
+
+# Generated parser, lexer, and compiler headers
+lexer.c
+tokens.h
+parser.tab.c
+parser.tab.h
+parser.output
+genconstdefs.h
+x64consts.h
+mudlle-macro-n.h
+runtime/mudllecst.c
+
+# Generated dependency and architecture state
+.depend
+runtime/.depend
+.mudlle-arch
+
+# Temporary regression outputs
+test_asmwriter_tmp.txt
+test_llvm_reg.s

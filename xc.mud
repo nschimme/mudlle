@@ -27,7 +27,7 @@ srcdir = dirname(loading_file()) + "/";
 garbage_collect(700000);
 load(srcdir + "lib.mud") &&
 load(srcdir + "noinf.mud");
-if (mc:archname == "x64")
+if (string_equal?(mc:archname, "x64"))
   [ load(srcdir + "x64.mud") && load(srcdir + "compile.mud") ]
 else
   [ load(srcdir + "llvm.mud") && load(srcdir + "llvmcompile.mud") ];

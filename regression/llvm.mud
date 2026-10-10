@@ -69,13 +69,23 @@ test_genllvm = fn (string code_str)
   ];
 
 [
+  | ir |
   test_genllvm("fn (a, b) a + b");
   display("genllvm test 1 passed\n");
 
   test_genllvm("fn (a, b) [ if (a < b) a * b else a - b ]");
   display("genllvm test 2 passed\n");
 
-  test_genllvm("fn (x) [ | sum, i | sum = 0; i = 0; while (i < x) [ sum = sum + i; i = i + 1; ]; sum ]");
+  ir = test_genllvm("fn (x) [ | sum, i | sum = 0; i = 0; while (i < x) [ sum = sum + i; i = i + 1; ]; sum ]");
+  assert(string_search(ir, "load atomic volatile i64, ptr @internal_xcount") >= 0);
+  assert(string_search(ir, "store atomic volatile i64") >= 0);
+  assert(string_search(ir, "icmp sgt i64 %loop_count_new_") >= 0);
+  assert(string_search(ir, "call void @llvm_check_type") >= 0);
+  assert(string_search(ir, "call void @llvm_loop_slow_path()") >= 0);
+  assert(string_search(ir, "call void @llvm_loop_check()") >= 0);
+  assert(string_search(ir, "store i64 %env, ptr %env_slot_") >= 0);
+  assert(string_search(ir, "= call ptr @llvm_gc_roots_enter(ptr %root_slots_data_") >= 0);
+  assert(string_search(ir, "alloca [4 x ptr]") >= 0);
   display("genllvm test 3 passed\n");
 ];
 
@@ -102,8 +112,40 @@ display("Testing LLVM mc:compile pipeline...\n");
   fn_value = car(result);
   call_result = fn_value(3, 5);
   display(format("LLVM closure result: %s\n", call_result));
+  assert(readonly?(fn_value) && !immutable?(fn_value));
+  assert(compiler_stable_closure?(fn_value));
   assert(call_result == 8);
+  garbage_collect(0);
+  garbage_collect(0);
+  assert(fn_value(3, 5) == 8);
   display("LLVM generated closure call test passed\n");
+];
+
+[
+  | source, tree, prelinked, result, fn_value |
+  source = "fn (a, b) iadd(a, b)";
+  tree = mudlle_parse(source, "test-iadd.mud", false);
+  prelinked = mc:compile(tree, false, 1, mc:source_code(source));
+  assert(vector?(prelinked));
+  result = mc:linkrun(prelinked, 1, true);
+  fn_value = car(result);
+  assert(fn_value(3, 5) == 8);
+  display("LLVM checked integer-add helper test passed\n");
+];
+
+[
+  | source, tree, ir, fn_start, entry_start, fn_ir |
+  source = "fn (n) [ | sum, i | sum = 0; i = 0; while (i < n) [ sum = iadd(sum, i); i = iadd(i, 1); ]; sum ]";
+  tree = mudlle_parse(source, "test-scalar-roots.mud", false);
+  ir = mc:compile_llvm(tree, 1, mc:source_code(source));
+  assert(string?(ir));
+  fn_start = string_search(ir, "define i64 @fn_1(");
+  entry_start = string_search_offset(ir, fn_start, "define i64 @entry_1(");
+  assert(fn_start >= 0 && entry_start > fn_start);
+  fn_ir = substring(ir, fn_start, entry_start - fn_start);
+  assert(string_search(fn_ir, "llvm_gc_roots_enter") < 0);
+  assert(string_search(fn_ir, "mudlle_check_integer_pair") >= 0);
+  display("LLVM scalar loop root-elision IR test passed\n");
 ];
 
 [
@@ -122,7 +164,8 @@ display("Testing LLVM mc:compile pipeline...\n");
 ];
 
 [
-  | source, tree, prelinked, result, fn_value, rest |
+  | source, tree, prelinked, result, fn_value, rest, ir,
+    fn_start, entry_start, fn_ir |
   source = "fn (a, rest...) rest";
   tree = mudlle_parse(source, "test-varargs.mud", false);
   prelinked = mc:compile(tree, false, 1, mc:source_code(source));
@@ -131,6 +174,14 @@ display("Testing LLVM mc:compile pipeline...\n");
   fn_value = car(result);
   rest = fn_value(10, 20, 30);
   assert(vlength(rest) == 2 && rest[0] == 20 && rest[1] == 30);
+  source = "fn (a, rest...) a";
+  tree = mudlle_parse(source, "test-varargs-roots.mud", false);
+  ir = mc:compile_llvm(tree, 1, mc:source_code(source));
+  fn_start = string_search(ir, "define i64 @fn_1(");
+  entry_start = string_search_offset(ir, fn_start, "define i64 @entry_1(");
+  assert(fn_start >= 0 && entry_start > fn_start);
+  fn_ir = substring(ir, fn_start, entry_start - fn_start);
+  assert(string_search(fn_ir, "llvm_gc_roots_enter") >= 0);
   display("LLVM variadic argument test passed\n");
 ];
 
@@ -262,6 +313,20 @@ display("Testing LLVM mc:compile pipeline...\n");
 ];
 
 [
+  | source, tree, prelinked, result, outer, inner, captured |
+  source = "fn () [ | x | x = vector(7); fn () [ garbage_collect(0); garbage_collect(0); x ] ]";
+  tree = mudlle_parse(source, "test-moving-env.mud", false);
+  prelinked = mc:compile(tree, false, 1, mc:source_code(source));
+  assert(vector?(prelinked));
+  result = mc:linkrun(prelinked, 1, true);
+  outer = car(result);
+  inner = outer();
+  captured = inner();
+  assert(vector?(captured) && captured[0] == 7);
+  display("LLVM moving closure environment test passed\n");
+];
+
+[
   | source, tree, ir, prelinked, result, outer, closures, getter, setter |
   source = "fn () [ | x | x = 0; vector(fn () x, fn (v) [x = v; x]) ]";
   tree = mudlle_parse(source, "test-shared-capture.mud", false);
@@ -327,23 +392,6 @@ display("Testing LLVM mc:compile pipeline...\n");
   result = remainder(11, 3);
   assert(integer?(result) && result - 2 == 0);
   display("LLVM integer remainder error test passed\n");
-];
-
-display("Testing LLVM -> Native Assembly compilation...\n");
-
-[
-  | tree, ok, f, asm_text |
-  tree = mudlle_parse("fn (a, b) a + b", "test.mud", false);
-  ok = mc:compile_llvm_asm(tree, "test_llvm_reg.s");
-  assert(ok == true);
-
-  f = file_open("test_llvm_reg.s", "r");
-  asm_text = file_read(f);
-  file_close(f);
-  remove("test_llvm_reg.s");
-
-  assert(string?(asm_text) && slength(asm_text) > 0);
-  display("LLVM assembly compilation test passed\n");
 ];
 
 display("ALL LLVM & ASMWRITER TESTS PASSED SUCCESSFULLY\n");

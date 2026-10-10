@@ -1,21 +1,21 @@
 # Mudlle LLVM Backend & Assembly Writer Documentation
 
-This document describes the LLVM backend (`genllvm.mud`, `llvm.mud`, `allvm.mud`, `mllvm.mud`) and Assembly Writer abstraction (`asmwriter.mud`) added to the Mudlle compiler.
+This document describes the LLVM backend (`genllvm.mud`, `llvm.mud`, `allvm.mud`, `mllvm.mud`) and Assembly Writer abstraction (`asmwriter.mud`) used by the Mudlle compiler.
 
 ---
 
 ## 1. Overview
 
-The LLVM backend emits LLVM IR (`.ll`) for Mudlle functions. `llvm-as` can validate the IR and `llc` can lower it to host assembly. The standard `mc:compile` API creates an LLVM prelink descriptor that `mc:linkrun` loads through the LLVM runtime.
+The LLVM backend emits LLVM IR for Mudlle functions. ORC LLJIT compiles and loads that IR in process. Optional LLVM command-line tools can validate or inspect emitted IR, but normal execution does not invoke them.
 
 The IR leaves the target triple and data layout unspecified. This lets LLVM select its host target, including 64-bit ARM and RISC-V targets when LLVM provides them. This is code generation coverage, not proof of runtime compatibility or production readiness.
 
 ### Native parity contract
 
 LLVM is a native compiler backend only when it can replace the x64 backend in
-the normal `mc:compile` → `mc:prelink` → `mc:linkrun` path. Returning IR text,
-emitting a standalone assembly file, or calling a function through the
-experimental C ABI bridge does not satisfy this contract.
+the normal `mc:compile` → `mc:prelink` → `mc:linkrun` path. Returning IR text or
+calling a function through the experimental C ABI bridge does not satisfy this
+contract.
 
 The backend must preserve the x64 backend's observable language and runtime
 behavior, including:
@@ -107,8 +107,6 @@ by `mc:linkrun`.
 - `mc:gen_llvm_ir(vector mod, {writer,null} w = null)`
   Generates LLVM IR for an entire Mudlle module `mod`. If `w` is omitted or null, returns the generated LLVM IR as a string.
 
-- `mc:compile_llvm_asm(vector mod, string asm_filename)`
-  Generates LLVM IR for `mod`, writes it to a temporary `.ll` file, invokes `llc` to compile it to native target assembly (`asm_filename`), and removes the temporary IR file.
 
 ---
 
@@ -143,21 +141,4 @@ load("xc.mud");
 tree = mudlle_parse("fn (a, b) a + b", "test.mud", false);
 ir = mc:gen_llvm_ir(tree);
 display(ir);
-```
-
-### Example 3: Compile Mudlle module to native assembly file (`.s`)
-
-```mudlle
-load("xc.mud");
-
-| tree |
-tree = mudlle_parse("fn (n) [ if (n <= 1) n else fib(n - 1) + fib(n - 2) ]", "test.mud", false);
-mc:compile_llvm_asm(tree, "fib.s");
-```
-
-To compile `fib.s` to an object file or executable:
-```bash
-llc -filetype=obj fib.s -o fib.o
-gcc -O2 test_harness.c fib.o -o fib_runner
-./fib_runner
 ```

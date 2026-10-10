@@ -66,7 +66,7 @@ ifeq ($(filter amd64 arm64 riscv64,$(ARCH)),)
 $(error Unsupported ARCH=$(ARCH); expected amd64, arm64, or riscv64)
 endif
 
-HAS_LLVM := $(if $(shell command -v llc 2>/dev/null),yes,no)
+HAS_LLVM := $(if $(shell command -v llvm-config 2>/dev/null),yes,no)
 
 ifeq ($(USE_LLVM),yes)
 MUDARCH := llvm
@@ -103,9 +103,10 @@ endif
 CPP_INDENT ?= | indent
 
 ARCHDEP:=.mudlle-arch
+BUILD_ARCH:=$(ARCH)-$(MUDARCH)
 
 OLD_ARCH:=$(shell [ -f $(ARCHDEP) ] && cat $(ARCHDEP))
-ifneq ($(OLD_ARCH),$(ARCH))
+ifneq ($(OLD_ARCH),$(BUILD_ARCH))
  ifneq ($(OLD_ARCH),)
   $(info Architecture changed. Recompiling.)
  endif
@@ -113,7 +114,7 @@ ifneq ($(OLD_ARCH),$(ARCH))
 endif
 
 $(ARCHDEP):
-	@echo "$(ARCH)" > $@
+	@echo "$(BUILD_ARCH)" > $@
 
 OBJDEP:=$(ARCHDEP) mudlle-macro-n.h
 
@@ -143,9 +144,9 @@ override CPPFLAGS += -I. -I$(srcdir)
 LDFLAGS := $(ARCHFLAG) $(ARCH_LDFLAGS)
 LIBS := -lm
 LLVM_CONFIG := $(shell command -v llvm-config 2>/dev/null)
-ifeq ($(MUDARCH),llvm)
+ifneq (,$(filter amd64 llvm,$(ARCH) $(MUDARCH)))
 ifeq ($(LLVM_CONFIG),)
-$(error MUDARCH=llvm requires llvm-config with LLJIT support)
+$(error x64 and LLVM backends require llvm-config with LLJIT support)
 else
 LLVM_INCLUDEDIR := $(shell $(LLVM_CONFIG) --includedir)
 LLVM_LIBDIR := $(shell $(LLVM_CONFIG) --libdir)
@@ -153,6 +154,9 @@ override CPPFLAGS += -I$(LLVM_INCLUDEDIR)
 LDFLAGS += -L$(LLVM_LIBDIR)
 LIBS += $(shell $(LLVM_CONFIG) --libs orcjit native core)
 LIBS += $(shell $(LLVM_CONFIG) --system-libs)
+ifeq ($(MUDARCH),llvm)
+override CPPFLAGS += -DMUDLLE_USE_LLVM
+endif
 endif
 endif
 MAKEDEPEND = $(CC) -MM
@@ -304,7 +308,8 @@ dep depend: .depend
 
 ifeq ($(NOCOMPILER),)
 
-MUD_FILES := $(patsubst %, $(srcdir)%.mud, $(sort a$(MUDARCH) asmwriter compile \
+COMPILER_API := $(if $(filter llvm,$(MUDARCH)),llvmcompile,compile)
+MUD_FILES := $(patsubst %, $(srcdir)%.mud, $(sort a$(MUDARCH) asmwriter $(COMPILER_API) \
 	compiler cxc dihash dlist flow genllvm gen$(MUDARCH) graph icxc	\
 	inference ins3 interface ixc lib link misc m$(MUDARCH) noinf	\
 	optimise phase1 phase2 phase3 phase4 pxslow sequences vars	\

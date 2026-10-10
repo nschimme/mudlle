@@ -21,8 +21,9 @@
 
 library link // A linker.
 requires compiler, misc, sequences, vars
-defines mc:prelink, mc:prelink_llvm, mc:display_as, mc:prelinked_requires, mc:prelinked_name
-reads mc:describe_seclev, mc:compiler_mcode_version, mc:llvm_constants
+defines mc:prelink, mc:prelink_llvm, mc:display_as, mc:prelinked_requires,
+  mc:prelinked_name
+reads mc:describe_seclev, mc:compiler_mcode_version
 writes mc:this_filenames, mc:this_module, mc:erred, mc:linkrun
 
 [
@@ -569,15 +570,16 @@ writes mc:this_filenames, mc:this_module, mc:erred, mc:linkrun
       found = prelinked_fn . false;
       seen_code = found . seen_code;
 
-      // LLVM prelinked functions store [IR, entry symbol, arity, constants]
-      // instead of architecture-specific machine code.
+      // LLVM prelinked functions store [IR, entry symbol, arity, constants,
+      // global relocations] instead of architecture-specific machine code.
       if (vector?(prelinked_fn[pfn_code]))
         [
           | native, closure |
           native = prelinked_fn[pfn_code];
-          if (vlength(native) != 4) error(error_bad_value);
+          if (vlength(native) != 5) error(error_bad_value);
           closure = llvm_load_ir_closure(
-            native[0], native[1], native[2], seclev, native[3]);
+            native[0], native[1], native[2], seclev,
+            vector(native[3], native[4]));
           set_cdr!(found, closure . closure_code(closure));
           exit<function> closure
         ];
@@ -681,7 +683,8 @@ writes mc:this_filenames, mc:this_module, mc:erred, mc:linkrun
         mc:arch | (my:mcode_version << 8))
     ];
 
-  mc:prelink_llvm = fn (vector mod, string ir, protect)
+  mc:prelink_llvm = fn (vector mod, string ir, protect,
+                        vector llvm_constants, vector global_relocations)
     // Build the same serializable pmodule envelope as mc:prelink, with an
     // LLVM entry descriptor in the top-level function code slot.
     [
@@ -690,7 +693,7 @@ writes mc:this_filenames, mc:this_module, mc:erred, mc:linkrun
       llvm_body = sequence(
         vector(ir, format("entry_%d", top[mc:c_fnumber]),
                llength(top[mc:c_ffullargs]),
-               my:ltov(mc:llvm_constants())),
+               llvm_constants, global_relocations),
         top[mc:c_fhelp],
         if (top[mc:c_fvar]) top[mc:c_fvar][mc:v_name] else null,
         top[mc:c_fnicename],
@@ -851,7 +854,8 @@ writes mc:this_filenames, mc:this_module, mc:erred, mc:linkrun
       val = global_value(v[mc:v_goffset]);
       type = typeof(val);
 
-      immutable_flag = if (immutable?(val)) depend_immutable else 0;
+      immutable_flag = if (immutable?(val) || compiler_stable_closure?(val))
+        depend_immutable else 0;
 
       if (type == type_primitive || type == type_varargs
           || type == type_secure)
@@ -909,7 +913,8 @@ writes mc:this_filenames, mc:this_module, mc:erred, mc:linkrun
       val = global_value(n);
       dtype = d[1] & ~depend_immutable;
 
-      if ((d[1] & depend_immutable) && !immutable?(val))
+      if ((d[1] & depend_immutable)
+          && !(immutable?(val) || compiler_stable_closure?(val)))
 	my:mc:error("%s is not immutable anymore", my:mc:markup_var(name))
       else if (dtype == depend_primitive)
 	[

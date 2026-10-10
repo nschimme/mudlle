@@ -31,7 +31,7 @@
 #include "types.h"
 
 /* increase this as compiled mudlle suffers a backwards-incompatible change */
-#define MCODE_VERSION 40
+#define MCODE_VERSION 42
 
 /* Objects are either null, integers or pointers to more complex things (like
    variables). Null is represented by NULL. Integers have the lowest bit set.

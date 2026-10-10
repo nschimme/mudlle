@@ -3,7 +3,7 @@
  */
 
 library llvmcompile // LLVM IR compiler
-requires compiler, genllvm, ins3, link, phase1, phase2, phase3, vars
+requires compiler, genllvm, ins3, link, misc, phase1, phase2, phase3, vars
 defines mc:compile, mc:compile_llvm
 writes mc:erred, mc:this_module
 [
@@ -119,7 +119,9 @@ writes mc:erred, mc:this_module
       else if (global_syms != null)
         false
       else
-        mc:prelink_llvm(mod, ir, protect)
+        mc:prelink_llvm(mod, ir, protect,
+                        list_to_vector(mc:llvm_constants()),
+                        list_to_vector(mc:llvm_global_relocations()))
     ];
 
   // Explicit IR inspection API; normal compilation uses mc:compile above.

@@ -19,17 +19,73 @@
 #include "mudlle-float.h"
 #include "mudlle-string.h"
 #include "pattern.h"
+#include "profile.h"
 #include "prims.h"
+#include "../strbuf.h"
 
 #include <llvm-c/Core.h>
 #include <llvm-c/Error.h>
 #include <llvm-c/IRReader.h>
 #include <llvm-c/LLJIT.h>
 #include <llvm-c/Orc.h>
+#include <llvm-c/Support.h>
 #include <llvm-c/Target.h>
+#include <llvm-c/TargetMachine.h>
+#include <llvm-c/Transforms/PassBuilder.h>
+#include <llvm/Config/llvm-config.h>
 
 static LLVMOrcLLJITRef llvm_orc_jit;
+static LLVMTargetMachineRef llvm_orc_target_machine;
 static size_t llvm_orc_module_sequence;
+
+static const char *llvm_optimization_pipeline(void)
+{
+  const char *level = getenv("MUDLLE_LLVM_OPT");
+  static char pipeline[32];
+  if (level == NULL || strcmp(level, "2") == 0)
+    level = "O2";
+  else if (strcmp(level, "none") == 0 || strcmp(level, "0") == 0)
+    return NULL;
+  else if (strcmp(level, "1") == 0)
+    level = "O1";
+  else if (strcmp(level, "3") == 0)
+    level = "O3";
+  else if (strcmp(level, "O0") != 0 && strcmp(level, "O1") != 0
+           && strcmp(level, "O2") != 0 && strcmp(level, "O3") != 0)
+    {
+      fprintf(stderr, "MUDLLE_LLVM_OPT must be none, O0, O1, O2, or O3\n");
+      runtime_error(error_bad_value);
+    }
+  snprintf(pipeline, sizeof pipeline, "default<%s>", level);
+  return pipeline;
+}
+
+static void llvm_orc_create_target_machine(void)
+{
+  const char *triple = LLVMOrcLLJITGetTripleString(llvm_orc_jit);
+  LLVMTargetRef target;
+  char *error_message = NULL;
+  if (LLVMGetTargetFromTriple(triple, &target, &error_message))
+    {
+      if (error_message != NULL)
+        fprintf(stderr, "LLVM target lookup error: %s\n", error_message);
+      if (error_message != NULL)
+        LLVMDisposeMessage(error_message);
+      runtime_error(error_bad_value);
+    }
+
+  char *cpu = LLVMGetHostCPUName();
+  char *features = LLVMGetHostCPUFeatures();
+  llvm_orc_target_machine = LLVMCreateTargetMachine(
+    target, triple, cpu != NULL ? cpu : "", features != NULL ? features : "",
+    LLVMCodeGenLevelDefault, LLVMRelocDefault, LLVMCodeModelJITDefault);
+  if (cpu != NULL)
+    LLVMDisposeMessage(cpu);
+  if (features != NULL)
+    LLVMDisposeMessage(features);
+  if (llvm_orc_target_machine == NULL)
+    runtime_error(error_bad_value);
+}
 
 static void llvm_orc_check_error(LLVMErrorRef error)
 {
@@ -46,10 +102,17 @@ static void llvm_orc_initialize(void)
 {
   if (llvm_orc_jit != NULL)
     return;
+#if LLVM_VERSION_MAJOR < 15
+  /* LLVM 14 still defaults to typed pointers when parsing textual IR. */
+  const char *opaque_pointer_args[] = { "mudlle", "-opaque-pointers" };
+  LLVMParseCommandLineOptions(2, opaque_pointer_args, NULL);
+#endif
   if (LLVMInitializeNativeTarget() || LLVMInitializeNativeAsmPrinter())
     runtime_error(error_bad_value);
 
+  /* A default LLJIT compiles on the calling thread; no worker pool is used. */
   llvm_orc_check_error(LLVMOrcCreateLLJIT(&llvm_orc_jit, NULL));
+  llvm_orc_create_target_machine();
   LLVMOrcDefinitionGeneratorRef generator;
   llvm_orc_check_error(LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
     &generator, LLVMOrcLLJITGetGlobalPrefix(llvm_orc_jit), NULL, NULL));
@@ -71,23 +134,43 @@ static void *llvm_orc_compile_ir(struct string *ir, struct string *symbol)
 
   llvm_orc_initialize();
   sequence = llvm_orc_module_sequence++;
-  context = LLVMContextCreate();
+  safe_context = LLVMOrcCreateNewThreadSafeContext();
+  context = LLVMOrcThreadSafeContextGetContext(safe_context);
   buffer = LLVMCreateMemoryBufferWithMemoryRangeCopy(
     ir->str, string_len(ir), "mudlle-module");
-  if (LLVMParseIRInContext2(context, buffer, &module, &parse_message))
+  if (LLVMParseIRInContext(context, buffer, &module, &parse_message))
     {
       if (parse_message != NULL)
         fprintf(stderr, "LLVM IR parse error: %s\n", parse_message);
-      LLVMDisposeMemoryBuffer(buffer);
       if (parse_message != NULL)
         LLVMDisposeMessage(parse_message);
-      LLVMContextDispose(context);
+      LLVMOrcDisposeThreadSafeContext(safe_context);
       runtime_error(error_bad_value);
     }
-  LLVMDisposeMemoryBuffer(buffer);
   if (parse_message != NULL)
     LLVMDisposeMessage(parse_message);
-  safe_context = LLVMOrcCreateNewThreadSafeContextFromLLVMContext(context);
+
+  const char *pipeline = llvm_optimization_pipeline();
+  if (pipeline != NULL)
+    {
+      LLVMPassBuilderOptionsRef options = LLVMCreatePassBuilderOptions();
+      LLVMSetTarget(module, LLVMOrcLLJITGetTripleString(llvm_orc_jit));
+      LLVMSetDataLayout(module, LLVMOrcLLJITGetDataLayoutStr(llvm_orc_jit));
+      LLVMPassBuilderOptionsSetVerifyEach(options, 1);
+      LLVMPassBuilderOptionsSetLoopInterleaving(options, 1);
+      LLVMPassBuilderOptionsSetLoopVectorization(options, 1);
+      LLVMPassBuilderOptionsSetSLPVectorization(options, 1);
+      LLVMErrorRef error = LLVMRunPasses(module, pipeline,
+                                         llvm_orc_target_machine, options);
+      LLVMDisposePassBuilderOptions(options);
+      if (error != NULL)
+        {
+          LLVMDisposeModule(module);
+          LLVMOrcDisposeThreadSafeContext(safe_context);
+          llvm_orc_check_error(error);
+        }
+    }
+
   for (LLVMValueRef function = LLVMGetFirstFunction(module); function != NULL;
        function = LLVMGetNextFunction(function))
     if (LLVMCountBasicBlocks(function) != 0)
@@ -164,11 +247,26 @@ static void llvm_check_stack(void);
 /* Account for one generated loop back edge and enforce the active limit. */
 void llvm_loop_check(void)
 {
+  if (internal_xcount & XCOUNT_PROFILE_FLAG)
+    profile_tick();
   ulong count = get_xcount();
   set_xcount(count - 1);
   if (count <= 1)
     runtime_error(error_loop);
   llvm_check_stack();
+}
+
+/* The generated fast path decrements the shared counter directly.  A
+   nonpositive result means either the budget expired or a profiling signal
+   set the sign-bit flag.  Match x64 by servicing the flag and continuing. */
+void llvm_loop_slow_path(void)
+{
+  if (internal_xcount & XCOUNT_PROFILE_FLAG)
+    {
+      profile_tick();
+      return;
+    }
+  runtime_error(error_loop);
 }
 
 static void llvm_check_stack(void)
@@ -274,6 +372,16 @@ void llvm_check_type(int64_t raw_value, int64_t raw_type)
   enum mudlle_type type = (enum mudlle_type)raw_type;
   if (!is_typeset(v, type_typeset(type)))
     bad_type_error(v, type, -1);
+}
+
+void llvm_check_integer_pair(int64_t raw_first, int64_t raw_second)
+{
+  value first = (value)(uintptr_t)raw_first;
+  value second = (value)(uintptr_t)raw_second;
+  if (!integerp(first))
+    bad_type_error(first, type_integer, -1);
+  if (!integerp(second))
+    bad_type_error(second, type_integer, -1);
 }
 
 void llvm_check_typeset(int64_t raw_value, int64_t raw_typeset,
@@ -451,6 +559,7 @@ struct llvm_callback_data
   llvm_native_entry entry;
   size_t nargs;
   bool check_arity;
+  bool stable;
 };
 
 static value llvm_call_closure(void *cbdata, struct closure *closure,
@@ -469,6 +578,18 @@ static value llvm_call_closure(void *cbdata, struct closure *closure,
   return (value)(uintptr_t)result;
 }
 
+bool llvm_stable_closure(value fn)
+{
+  if (!TYPE(fn, closure) || !readonlyp(fn))
+    return false;
+  void *cbdata = NULL;
+  if (!mcallback_varargs_matches((struct closure *)fn, llvm_call_closure,
+                                 &cbdata))
+    return false;
+  struct llvm_callback_data *data = cbdata;
+  return data->stable;
+}
+
 static void llvm_free_callback(void *cbdata)
 {
   free(cbdata);
@@ -477,12 +598,24 @@ static void llvm_free_callback(void *cbdata)
 /* JIT-generated calls run as Mudlle code even though the caller is C here.
    Keep the language security check, without applying the C-entry restriction
    in function_callable(). */
-static void llvm_check_callable(value function, long nargs)
+static seclev_t llvm_caller_seclevel(value caller)
+{
+  if (!TYPE(caller, closure) || ((struct closure *)caller)->code == NULL)
+    {
+      runtime_error(error_bad_value);
+      return DEFAULT_SECLEVEL;
+    }
+  return ((struct closure *)caller)->code->seclevel;
+}
+
+static void llvm_check_callable(value function, long nargs,
+                                seclev_t caller_seclevel)
 {
   if (TYPE(function, secure))
     {
       const struct prim_op *op = ((struct primitive *)function)->op;
-      if (in_mudlle_session() && c_maxseclevel() < op->seclevel)
+      if (caller_seclevel < op->seclevel
+          || (in_mudlle_session() && c_maxseclevel() < op->seclevel))
         runtime_error_message(error_security_violation, "maxseclevel too low");
       if (!callablep(function, nargs))
         runtime_error(error_wrong_parameters);
@@ -494,22 +627,33 @@ static void llvm_check_callable(value function, long nargs)
 
 value llvm_global_read(int64_t offset)
 {
-  if (offset < 0 || (ulong)offset >= nglobals())
+  if (offset < 0 || (ulong)offset >= vector_len(global_names))
     {
       runtime_error(error_bad_value);
       return NULL;
     }
-  check_global_read((ulong)offset);
   return GVAR((ulong)offset);
+}
+
+void llvm_check_global_read(int64_t offset)
+{
+  if (offset < 0 || (ulong)offset >= vector_len(global_names))
+    runtime_error(error_bad_value);
+  check_global_read((ulong)offset);
 }
 
 void llvm_global_write(int64_t offset, int64_t raw_value)
 {
-  if (offset < 0 || (ulong)offset >= nglobals())
+  if (offset < 0 || (ulong)offset >= vector_len(global_names))
     runtime_error(error_bad_value);
-  value v = (value)(uintptr_t)raw_value;
-  check_global_write((ulong)offset, v);
-  GVAR((ulong)offset) = v;
+  GVAR((ulong)offset) = (value)(uintptr_t)raw_value;
+}
+
+void llvm_check_global_write(int64_t offset, int64_t raw_value)
+{
+  if (offset < 0 || (ulong)offset >= vector_len(global_names))
+    runtime_error(error_bad_value);
+  check_global_write((ulong)offset, (value)(uintptr_t)raw_value);
 }
 
 /* Register values stored in an LLVM frame as ordinary Mudlle GC roots. */
@@ -536,8 +680,8 @@ void llvm_gc_roots_leave(struct gcpro *old_gcpro)
 }
 
 /* Entry point used by generated LLVM code for calls through Mudlle values. */
-value llvm_call_value(value function, value *arguments, size_t nargs,
-                      int64_t secure_call)
+value llvm_call_value(value caller, value function, value *arguments,
+                      size_t nargs, int64_t secure_call)
 {
   if (nargs > MAX_FUNCTION_ARGS)
     {
@@ -545,6 +689,7 @@ value llvm_call_value(value function, value *arguments, size_t nargs,
       return NULL;
     }
 
+  seclev_t caller_seclevel = llvm_caller_seclevel(caller);
   struct gcpro *old_gcpro = gcpro;
   struct gcpro function_root;
   GCPROV(function_root, function);
@@ -562,23 +707,30 @@ value llvm_call_value(value function, value *arguments, size_t nargs,
   if (nargs != 0)
     gcpro = &argument_roots[nargs - 1];
 
+  seclev_t old_seclevel = internal_seclevel;
+  bool old_seclevel_valid = seclevel_valid;
+  set_seclevel(caller_seclevel);
   struct vector *argv = alloc_vector(nargs);
   struct gcpro argv_root;
   GCPROV(argv_root, argv);
   for (size_t i = 0; i < nargs; ++i)
     argv->data[i] = rooted_args[i];
-
   if (secure_call)
-    llvm_check_callable(function, (long)nargs);
+    llvm_check_callable(function, (long)nargs, caller_seclevel);
   else
     callable(function, (long)nargs);
   value result = callv(function, argv);
+  set_seclevel(old_seclevel);
+  seclevel_valid = old_seclevel_valid;
   gcpro = old_gcpro;
   return result;
 }
 
-int64_t llvm_call_global(int64_t raw_name, value *arguments, int64_t nargs)
+int64_t llvm_call_global(int64_t raw_caller, int64_t raw_name,
+                         value *arguments, int64_t nargs)
 {
+  seclev_t caller_seclevel = llvm_caller_seclevel(
+    (value)(uintptr_t)raw_caller);
   value name = (value)(uintptr_t)raw_name;
   if (!TYPE(name, string) || nargs < 0 || nargs > MAX_FUNCTION_ARGS
       || (nargs != 0 && arguments == NULL))
@@ -603,6 +755,9 @@ int64_t llvm_call_global(int64_t raw_name, value *arguments, int64_t nargs)
     }
   if (nargs != 0) gcpro = &argument_roots[nargs - 1];
 
+  seclev_t old_seclevel = internal_seclevel;
+  bool old_seclevel_valid = seclevel_valid;
+  set_seclevel(caller_seclevel);
   const char *name_text = ((struct string *)(uintptr_t)name)->str;
   const char *resolved_name = name_text;
   bool compare = false;
@@ -641,8 +796,10 @@ int64_t llvm_call_global(int64_t raw_name, value *arguments, int64_t nargs)
   struct gcpro argv_root;
   GCPROV(argv_root, argv);
   for (int64_t i = 0; i < nargs; ++i) argv->data[i] = rooted_args[i];
-  llvm_check_callable(function, (long)nargs);
+  llvm_check_callable(function, (long)nargs, caller_seclevel);
   value result = callv(function, argv);
+  set_seclevel(old_seclevel);
+  seclevel_valid = old_seclevel_valid;
   if (compare)
     {
       long relation = intval(result);
@@ -661,7 +818,9 @@ STATIC_STRING(llvm_function_closure_help,
 /* Create a generated function closure with its lexical environment. */
 value llvm_make_function_closure(int64_t address, int64_t nargs,
                                  value *captures, int64_t ncaptures,
-                                 int64_t self_capture, int64_t parent_env)
+                                 int64_t self_capture, int64_t parent_env,
+                                 int64_t raw_arguments,
+                                 int64_t return_typeset)
 {
   if (address == 0 || nargs < 0 || nargs > MAX_FUNCTION_ARGS
       || ncaptures < 0 || ncaptures > MAX_FUNCTION_ARGS
@@ -677,6 +836,7 @@ value llvm_make_function_closure(int64_t address, int64_t nargs,
       runtime_error(error_bad_value);
       return NULL;
     }
+  seclev_t parent_seclevel = parent->code->seclevel;
   size_t parent_nvars = (parent->o.size - offsetof(struct closure, variables))
     / sizeof parent->variables[0];
   if (parent_nvars < 2)
@@ -688,6 +848,12 @@ value llvm_make_function_closure(int64_t address, int64_t nargs,
   if (!TYPE(constants, vector))
     {
       runtime_error(error_bad_value);
+      return NULL;
+    }
+  value arguments_metadata = (value)(uintptr_t)raw_arguments;
+  if (!TYPE(arguments_metadata, vector))
+    {
+      runtime_error(error_bad_type);
       return NULL;
     }
 
@@ -707,6 +873,8 @@ value llvm_make_function_closure(int64_t address, int64_t nargs,
     gcpro = &roots[ncaptures - 1];
   struct gcpro constants_root;
   GCPROV(constants_root, constants);
+  struct gcpro arguments_root;
+  GCPROV(arguments_root, arguments_metadata);
 
   struct vector *env = alloc_vector((size_t)ncaptures + 1);
   struct gcpro env_root;
@@ -714,7 +882,6 @@ value llvm_make_function_closure(int64_t address, int64_t nargs,
   env->data[0] = constants;
   for (int64_t i = 0; i < ncaptures; ++i)
     env->data[i + 1] = rooted_captures[i];
-
   struct llvm_callback_data *data = malloc(sizeof *data);
   if (data == NULL)
     {
@@ -725,14 +892,20 @@ value llvm_make_function_closure(int64_t address, int64_t nargs,
   data->entry = (llvm_native_entry)(uintptr_t)address;
   data->nargs = (size_t)nargs;
   data->check_arity = false;
+  data->stable = ncaptures == 0;
   struct closure *closure = make_mcallback_varargs_captured_sec(
     llvm_call_closure, llvm_free_callback, data, env,
     "llvm_function_closure", GET_STATIC_STRING(llvm_function_closure_help),
-    __FILE__, __LINE__, c_maxseclevel());
+    __FILE__, __LINE__, parent_seclevel);
+  closure->code->arguments = (struct vector *)arguments_metadata;
+  closure->code->return_typeset = (typeset_t)return_typeset;
   struct gcpro closure_root;
   GCPROV(closure_root, closure);
   if (self_capture >= 0)
     closure->variables[self_capture + 2]->vvalue = (value)closure;
+  /* A closure with no native captures has no user-mutable lexical state. */
+  if (ncaptures == 0)
+    closure->o.flags |= OBJ_READONLY;
   gcpro = old_gcpro;
   return closure;
 }
@@ -804,19 +977,131 @@ void llvm_variable_set(int64_t raw_variable, int64_t raw_value)
 }
 
 TYPEDOP(llvm_load_ir_closure, "llvm_load_ir_closure",
-        "`s `s `n `n `v -> `f. Compile LLVM IR, load the shared module, and wrap its entry point.",
+        "`s `s `n `n `v `v -> `f. Compile LLVM IR, relocate globals, and wrap its entry point.",
         (struct string *ir, struct string *symbol, value mnargs,
-         value mseclev, struct vector *mconstants), OP_TRACE, "ssnnv.f")
+         value mseclev, struct vector *runtime_data), OP_TRACE, "ssnnv.f")
 {
   long nargs, seclev;
   CHECK_TYPES(ir, string,
               symbol, string,
               mnargs, CT_RANGE(nargs, 0, MAX_FUNCTION_ARGS),
               mseclev, CT_RANGE(seclev, 0, MAX_SECLEVEL),
-              mconstants, vector);
-  GCPRO(ir, symbol, mconstants);
+              runtime_data, vector);
+  if (vector_len(runtime_data) != 2
+      || !TYPE(runtime_data->data[0], vector)
+      || !TYPE(runtime_data->data[1], vector))
+    RUNTIME_ERROR(error_bad_value, "invalid LLVM closure data");
+  struct vector *mconstants = (struct vector *)runtime_data->data[0];
+  struct vector *global_relocations = (struct vector *)runtime_data->data[1];
+  GCPRO(ir, symbol, mconstants, global_relocations);
 
-  void *address = llvm_orc_compile_ir(ir, symbol);
+  struct string *relocated_ir;
+  if (vector_len(global_relocations) == 0)
+    relocated_ir = ir;
+  else
+    {
+      struct llvm_global_relocation {
+        long old_offset;
+        long new_offset;
+      } *relocations;
+      size_t nrelocations = vector_len(global_relocations);
+      relocations = malloc(nrelocations * sizeof *relocations);
+      if (relocations == NULL)
+        RUNTIME_ERROR(error_bad_value, "out of memory");
+      for (size_t i = 0; i < nrelocations; ++i)
+        {
+          value entry = global_relocations->data[i];
+          if (!TYPE(entry, vector) || vector_len((struct vector *)entry) != 2
+              || !integerp(((struct vector *)entry)->data[0])
+              || !TYPE(((struct vector *)entry)->data[1], string))
+            {
+              free(relocations);
+              RUNTIME_ERROR(error_bad_value, "invalid LLVM global relocation");
+            }
+          struct vector *relocation = (struct vector *)entry;
+          relocations[i].old_offset = intval(relocation->data[0]);
+          value name = relocation->data[1];
+          struct gcpro name_root;
+          GCPROV(name_root, name);
+          relocations[i].new_offset = mglobal_lookup(name);
+          UNGCPROV(name_root);
+        }
+
+      static const char *patterns[] = {
+        "@llvm_global_read(i64 ",
+        "@llvm_check_global_read(i64 ",
+        "@llvm_global_write(i64 ",
+        "@llvm_check_global_write(i64 "
+      };
+      struct strbuf output;
+      sb_init(&output);
+      const char *cursor = ir->str;
+      while (*cursor != '\0')
+        {
+          const char *match = NULL;
+          size_t pattern_length = 0;
+          for (size_t i = 0; i < sizeof patterns / sizeof patterns[0]; ++i)
+            {
+              const char *candidate = strstr(cursor, patterns[i]);
+              if (candidate != NULL && (match == NULL || candidate < match))
+                {
+                  match = candidate;
+                  pattern_length = strlen(patterns[i]);
+                }
+            }
+          if (match == NULL)
+            {
+              sb_addstr(&output, cursor);
+              break;
+            }
+          const char *digits = match + pattern_length;
+          char *end;
+          long long old_offset = strtoll(digits, &end, 10);
+          if (end == digits)
+            {
+              sb_addmem(&output, cursor, (size_t)(digits - cursor));
+              cursor = digits;
+              continue;
+            }
+          sb_addmem(&output, cursor, (size_t)(digits - cursor));
+          bool found = false;
+          for (size_t i = 0; i < nrelocations; ++i)
+            if (relocations[i].old_offset == old_offset)
+              {
+                sb_addint(&output, relocations[i].new_offset);
+                found = true;
+                break;
+              }
+          if (!found)
+            sb_addmem(&output, digits, (size_t)(end - digits));
+          cursor = end;
+        }
+      free(relocations);
+      relocated_ir = alloc_string(sb_str(&output));
+      sb_free(&output);
+      struct gcpro relocated_ir_root;
+      GCPROV(relocated_ir_root, relocated_ir);
+      void *address = llvm_orc_compile_ir(relocated_ir, symbol);
+      struct llvm_callback_data *data = malloc(sizeof *data);
+      if (data == NULL)
+        RUNTIME_ERROR(error_bad_value, "out of memory");
+      data->entry = (llvm_native_entry)(uintptr_t)address;
+      data->nargs = (size_t)nargs;
+      data->check_arity = true;
+      data->stable = false;
+      struct vector *captures = alloc_vector(1);
+      struct gcpro captures_root;
+      GCPROV(captures_root, captures);
+      captures->data[0] = mconstants;
+      struct closure *closure = make_mcallback_varargs_captured_sec(
+        llvm_call_closure, llvm_free_callback, data, captures,
+        "llvm_load_ir_closure", GET_STATIC_STRING(llvm_function_closure_help),
+        __FILE__, __LINE__, (seclev_t)seclev);
+      UNGCPRO();
+      return closure;
+    }
+
+  void *address = llvm_orc_compile_ir(relocated_ir, symbol);
 
   struct llvm_callback_data *data = malloc(sizeof *data);
   if (data == NULL)
@@ -824,6 +1109,7 @@ TYPEDOP(llvm_load_ir_closure, "llvm_load_ir_closure",
   data->entry = (llvm_native_entry)(uintptr_t)address;
   data->nargs = (size_t)nargs;
   data->check_arity = true;
+  data->stable = false;
   struct vector *captures = alloc_vector(1);
   struct gcpro captures_root;
   GCPROV(captures_root, captures);
@@ -854,6 +1140,7 @@ TYPEDOP(llvm_function_closure, "llvm_function_closure",
   data->entry = (llvm_native_entry)(uintptr_t)address;
   data->nargs = (size_t)nargs;
   data->check_arity = true;
+  data->stable = false;
   struct vector *constants = alloc_vector(0);
   struct gcpro constants_root;
   GCPROV(constants_root, constants);

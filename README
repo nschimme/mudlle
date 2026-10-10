@@ -12,13 +12,58 @@ To compile on Linux or macOS:
   make
   make compiler
 
+Linux Setup and Backend Validation
+----------------------------------
+On Debian or Ubuntu, install the build tools and LLVM development files:
+
+  sudo apt install build-essential flex bison libgmp-dev libreadline-dev llvm llvm-dev
+
+The build detects LLVM through `llvm-config`; normal JIT execution does not
+need the LLVM command-line tools. Keep the LLVM headers, C API library, and
+`llvm-config` from the same installation:
+
+  llvm-config --version
+
+Build each x86-64 backend from a clean tree. The clean step matters because
+the generated compiler objects are backend-specific:
+
+  make clean
+  make
+  make compiler
+
+  make clean
+  make USE_LLVM=yes
+
+Run the same regression suite in each build:
+
+  ./mudlle -e xc.mud -e regression/all.mud
+
+The suite should print `SUCCESS`. It includes the LLVM-specific checks when
+the LLVM backend is selected. Run `make compiler USE_LLVM=yes` to check the
+multi-stage compiler bootstrap as well; that bootstrap is not yet passing on
+x86-64 (details in the evidence below).
+
+To compare execution after compilation, run the compiled-kernel benchmark:
+
+  ./mudlle -e xc.mud -e regression/benchmark.mud
+
+The benchmark compiles and links one function before starting its timer, checks
+the result, then runs a compiled integer reduction loop 2,000 times at 50,000
+iterations per call. Its `cpu_ms` value measures Mudlle process CPU time, not
+compiler/JIT startup. LLVM runs the `default<O2>` optimization pipeline by
+default. Set `MUDLLE_LLVM_OPT=none`, `O0`, `O1`, `O2`, or `O3` to compare
+optimization levels. Run each backend from a clean build, repeat the command
+several times, and compare the median. `regression/all.mud` is a correctness
+suite; timing that whole command also includes loading the compiler, compiling
+test snippets, and JIT setup.
+
 macOS Setup
 -----------
 On macOS (Homebrew), install the required toolchain dependencies including LLVM:
 
   brew install llvm flex bison
 
-Ensure LLVM tools (`llc`, `llvm-as`, `opt`) are available in your PATH:
+Ensure `llvm-config` for Homebrew LLVM is available to the build:
 
   export PATH="$(brew --prefix llvm)/bin:$PATH"
 
@@ -54,7 +99,7 @@ Install LLVM and make its tools visible before building:
   make
 
 On ARM64 and RISC-V, `load("xc.mud")` selects the LLVM backend. At the prompt,
-compile a function to IR and then ask LLVM to produce host assembly:
+compile a function to LLVM IR text:
 
   load("xc.mud")
   source = "fn (a, b) a + b";
@@ -63,11 +108,9 @@ compile a function to IR and then ask LLVM to produce host assembly:
   w = writer:new_file("module.ll");
   writer:write(w, ir);
   writer:close(w);
-  asm_tree = mudlle_parse(source, null, false);
-  mc:compile_llvm_asm(asm_tree, "module.s");
 
-Validate the IR with `llvm-as module.ll -o module.bc`. The LLVM backend leaves
-the target triple and data layout open so LLVM uses the host architecture. On
+The IR can be inspected or validated with optional LLVM command-line tools.
+ORC LLJIT sets the target triple and data layout from the host at runtime. On
 x86-64, `load("xc.mud")` keeps the legacy compiler; load `llvmc.mud` to select
 LLVM explicitly. Start a fresh Mudlle process with each loader when comparing
 the backends.
@@ -77,24 +120,140 @@ compilation continues to use the existing backend.
 
 Validation and Compatibility
 ----------------------------
-On an Apple Silicon Mac with Homebrew LLVM, `make` succeeds and
-`./mudlle -e regression/llvm.mud` passes. The regression covers IR generation
-for arithmetic, branches, and loops, then asks `llc` to emit ARM64 assembly.
-A separate native harness calling the emitted addition function with tagged
-inputs 3 and 5 returned the expected tagged result 7.
+Linux x86-64 validation (Debian 14.2.0-19 GCC, LLVM 14.0.6 and 19.1.7, 2026-10-10):
 
-`mc:compile` follows the standard compile/prelink API, and the regression
-exercises `mc:linkrun`, generated closures, optional and variadic arguments,
-IR generation, and assembly output on ARM64. Full x64 parity remains in
-progress; several primitive and floating-point operations still need coverage.
+* `make` and `make USE_LLVM=yes` both build the runtime. The LLVM JIT uses the
+  host triple, CPU, and features for its optimization target. LLVM 14 opaque
+  pointer parsing is enabled at runtime. LLVM detection and normal JIT
+  execution do not need command-line LLVM tools.
+* `./mudlle -e xc.mud -e regression/all.mud` prints `SUCCESS` on both x64 and
+  LLVM 19.1.7. The LLVM-specific checks also pass on LLVM 19.1.7.
+* `make compiler` succeeds with the x64 backend. `make compiler USE_LLVM=yes`
+  still fails while compiling build1 slice 0: `gc_load` requests a major GC
+  before it reads the incoming compiler object, and that collection finds an
+  invalid pointer in the first element of a live six-element Mudlle vector.
+  This locates the bad reference in the already-live heap; the vector's
+  allocation site is not yet proven. The same failure occurs with
+  `MUDLLE_LLVM_OPT=none`, so LLVM's optimization pipeline is not required to
+  reproduce it. Temporary tracing also reproduced it with a larger GC area,
+  with the failing vector size changing; the corrupt value appears to point
+  inside another allocation, but its writer has not yet been identified.
+  This is a correctness blocker for self-hosting bootstrap and production
+  readiness. The x64 backend's clean compiler bootstrap passes.
+* `llvm_function_may_allocate?` now keeps roots for variadic functions because
+  their entry path allocates the rest-argument vector. The LLVM regression
+  checks this root publication in generated IR. This fixes a real root-elision
+  hole, but the build1 GC failure still reproduces and its bad vector has not
+  been identified as that varargs vector.
+* For the compiled integer reduction benchmark (2,000 calls × 50,000 loop
+  iterations), a clean LLVM 19.1.7 build measured 38, 43, and 41 ms of process
+  CPU time (median 41 ms). A clean x64 build measured 83, 87, and 96 ms
+  (median 87 ms). LLVM used about 53% less CPU time, or ran about 2.1 times as
+  fast, on this workload. This demonstrates a win for this scalar integer loop;
+  it is not yet broad backend parity evidence.
+* The x64 backend checks `b_iadd` operands and loop comparison types inline.
+  LLVM now emits module-local LLVM IR tag guards whose C error helpers are
+  reachable only for invalid values. The `default<O2>` optimized IR confirms
+  the guards inline and the normal loop has no C runtime calls. To regenerate
+  the IR, run:
 
-Use the complete regression suite's runtime to compare backend speed. Compare
-the same tests and build configuration, and use timings only after confirming
-that both backends pass the suite.
+      ./mudlle -e xc.mud -e regression/llvm-benchmark-ir.mud
+      opt -passes='default<O2>' -S /tmp/mudlle-benchmark.ll \
+        -o /tmp/mudlle-benchmark.opt.ll
 
-LLVM arithmetic dispatches float and bigint operations through Mudlle
-primitives. Broader primitive/runtime coverage and matched x86-64 measurements
-on amd64 remain outstanding.
+  The optimized loop carries `sum` and `i` as SSA values and has this shape:
+
+      %sum = phi i64 [ %next_sum, %loop ], [ 1, %entry ]
+      %i = phi i64 [ %next_i, %loop ], [ 1, %entry ]
+      %next_sum = add i64 %sum, %i
+      %next_i = add i64 %i, 2
+      %count = load atomic volatile i64, ptr @internal_xcount monotonic
+      %next_count = add i64 %count, -1
+      store atomic volatile i64 %next_count, ptr @internal_xcount monotonic
+      %in_budget = icmp sgt i64 %next_count, 0
+      br i1 %in_budget, label %loop, label %slow_path
+
+  The error-helper calls remain only on invalid-value paths. The earlier inline
+  guard implementation crashed during repeated calls; the current module-local
+  helpers pass the full LLVM regression suite. Dynamic `b_add` still uses the
+  runtime numeric path.
+* LLVM's loop counter path now uses monotonic atomic load/store operations,
+  inline subtraction, and a signed-positive branch. Its C slow path services
+  the profiling flag or raises the loop-limit error. This replaces the slower
+  per-iteration atomic read/modify/write operation and keeps the shared counter
+  compatible with the signal handler. As on x64, Mudlle execution is
+  single-threaded. Earlier `opt` remarks on this loop reported that calls
+  blocked vectorization and LLVM could not determine the loop trip count.
+* The generator now omits GC root publication in functions whose generated
+  operations cannot reach a collecting helper. LLVM promotes the integer
+  reduction's local slots to SSA `phi` values, as shown in optimized IR.
+  Functions that may allocate retain the conservative roots, including the
+  closure environment. Variadic entry setup is also treated as allocating
+  because it builds the rest-argument vector. Root entries are deduplicated;
+  the reduction kernel no longer publishes its environment and three scalar
+  locals (formerly 15 entries), and the repeated-call benchmark no longer
+  segfaults.
+* Functions that can allocate include their closure environment in the GC-root
+  set and reload it before constant and capture accesses. The LLVM regression
+  forces two collections before reading a captured vector and passes.
+* Older full-suite timings took 26.2 s wall for LLVM O2 and 4.64 s wall / 4.61
+  s user for x64; an earlier LLVM run without the optimization pipeline took
+  15.65 s wall / 15.36 s user. Those timings include loading and compiling test
+  snippets, so they do not isolate generated-code execution.
+
+The ORC runtime runs a configurable LLVM IR optimization pipeline before
+adding modules to LLJIT. The integer reduction result applies to one scalar
+workload. Vectorizable loops, branches, calls, and allocation-heavy code need
+separate benchmarks before drawing broad performance conclusions.
+
+The LLVM regression covers IR generation for arithmetic, branches, and loops,
+`mc:compile`/`mc:linkrun`, generated closures, optional and variadic arguments,
+primitive fallback, floating-point and bigint cases. LLVM float and bigint
+arithmetic currently dispatches through Mudlle primitives. The x86-64 suite
+skips LLVM-only tests when the x64 backend is selected. An earlier Apple
+Silicon/Homebrew validation also passed `regression/llvm.mud`; ARM64 and
+RISC-V runtime compatibility still need direct validation.
+
+LLVM bootstrap GC debugging handoff
+------------------------------------
+
+The failure is reproducible with `make compiler USE_LLVM=yes` on Linux x86-64
+at `build1/.comp-0`. `gc_load()` calls `gc_reserve()` before `_gc_load()` reads
+the incoming object, so the failing major collection finds an invalid
+reference in the existing live heap. GCQDEBUG reports the bad value in
+`data[0]` of a six-element `type_vector` (size 64 bytes). The pointer appears
+to land inside another allocation. Reproduction with
+`MUDLLE_LLVM_OPT=none` rules out the LLVM optimization pipeline as a necessary
+cause. A larger GC area changes the failing vector size and moves the failure
+earlier, so address-only logs do not establish the vector's allocator; track
+its identity across GC moves.
+
+GDB could not attach in the original sandbox because `ptrace` is denied. On a
+Linux machine where GDB can trace child processes, rebuild with debug symbols
+and no C optimization, then stop at the assertion:
+
+    make clean
+    make USE_LLVM=yes NO_OPT=yes
+    make compiler USE_LLVM=yes NO_OPT=yes
+    gdb --args ./mudlle -c 'silent = true' \
+      -c 'garbage_collect(1024*1024)' \
+      -c 'objdir = "build0/"' -c 'dstdir = "build1/"' \
+      -c "build_slice = '(0 . 8)" -e ./icxc.mud -e ./pxslow.mud
+
+At the GDB prompt, run:
+
+    (gdb) break __assert_fail
+    (gdb) run
+    (gdb) bt full
+    (gdb) up
+    (gdb) info locals
+
+The expected stack passes through `gccheck_qdebug`, `major_forward`, `scan`,
+`major_scan2`, `garbage_collect`, and `gc_load`. Inspect the containing `obj`,
+the current record slot (`o`), and the value at that slot. Then identify the
+vector's creator and the last write to `data[0]`; follow the GC movement of
+that same object rather than relying on its address, which changes during
+collection.
 
 
 Contact Information

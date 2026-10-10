@@ -787,6 +787,28 @@ struct mcallback
   void *cbdata;
 };
 
+bool mcallback_varargs_matches(struct closure *fn,
+                               mcallback_varargs_fn callback,
+                               void **cbdata)
+{
+  if (!TYPE(fn, closure))
+    return false;
+  size_t nvars = (fn->o.size - offsetof(struct closure, variables))
+    / sizeof fn->variables[0];
+  if (nvars == 0 || !TYPE(fn->variables[0], variable))
+    return false;
+  value callback_value = fn->variables[0]->vvalue;
+  if (!TYPE(callback_value, private))
+    return false;
+  struct mcallback *mcb = (struct mcallback *)callback_value;
+  if (mcb->p.ptype != makeint(PRIVATE_MCALLBACK)
+      || mcb->cb_varargs != callback)
+    return false;
+  if (cbdata != NULL)
+    *cbdata = mcb->cbdata;
+  return true;
+}
+
 value call_mcallback(struct mcallback *cb, struct closure *fn,
                      struct vector *locals)
 {
