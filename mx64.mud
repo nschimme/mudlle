@@ -20,7 +20,7 @@
  */
 
 library mx64 // mudlle assembler for x86-64
-requires compiler, dlist, misc, vars
+requires asmwriter, compiler, dlist, misc, vars
 defines x64:l_ins, x64:l_alias, x64:l_number, x64:il_label, x64:il_ins,
   x64:il_node, x64:il_number, x64:il_offset, x64:il_loc, x64:i_op,
   x64:i_arg1, x64:i_arg2, x64:lvar, x64:lreg, x64:lidx, x64:lridx, x64:limm,
@@ -568,9 +568,10 @@ int31? = fn (int n) n >= -0x40000000 && n <= 0x3fffffff;
 
   // code display
 
-  x64:ins_list = fn "x64code -> . Prints instruction list" (fcode)
+  x64:ins_list = fn "x64code -> . Prints instruction list" (fcode, {vector,null} w = null)
     [
       | scan, ilist |
+      if (w == null) w = writer:new();
       ilist = fcode[x64:vcode_ilpos];
       scan = ilist;
       loop
@@ -579,15 +580,15 @@ int31? = fn (int n) n >= -0x40000000 && n <= 0x3fffffff;
 
           il = dget(scan);
           if (il[x64:il_label])
-            dformat("%s:", slabel(il[x64:il_label]));
+            writer:format(w, "%s:", slabel(il[x64:il_label]));
           | loc |
           loc = il[x64:il_loc];
-          dformat("\t%d:%d\t(%s) ", mc:loc_line(loc), mc:loc_column(loc),
+          writer:format(w, "\t%d:%d\t(%s) ", mc:loc_line(loc), mc:loc_column(loc),
                   il[x64:il_number]);
 
-          x64:print_ins(il[x64:il_ins]);
+          x64:print_ins(il[x64:il_ins], w);
 
-          newline();
+          writer:newline(w);
           scan = dnext(scan);
           if (scan == ilist) exit 0
         ];
@@ -750,8 +751,9 @@ int31? = fn (int n) n >= -0x40000000 && n <= 0x3fffffff;
   slabel = fn (label)
     itoa(x64:skip_label_alias(label)[x64:l_number]);
 
-  x64:print_ins = fn (ins)
+  x64:print_ins = fn (ins, {vector,null} w = null)
     [
+      if (w == null) w = writer:new();
       | op, a1, a2 |
 
       op = ins[x64:i_op];
@@ -759,19 +761,19 @@ int31? = fn (int n) n >= -0x40000000 && n <= 0x3fffffff;
       a2 = ins[x64:i_arg2];
 
       if (op == x64:op_jmp || op == x64:op_jmp32)
-        dformat("%s %s", opname[op], slabel(a1))
+        writer:format(w, "%s %s", opname[op], slabel(a1))
       else if (op == x64:op_jcc)
-        dformat("j%s %s", cnames[a2], slabel(a1))
+        writer:format(w, "j%s %s", cnames[a2], slabel(a1))
       else if (op == x64:op_jcc32)
-        dformat("j%s32 %s", cnames[a2], slabel(a1))
+        writer:format(w, "j%s32 %s", cnames[a2], slabel(a1))
       else if (op == x64:op_setcc)
-        dformat("set%s %s", cnames[cdr(a1)], eastr(a2, rnames8))
+        writer:format(w, "set%s %s", cnames[cdr(a1)], eastr(a2, rnames8))
       else if (op == x64:op_cmovcc || op == x64:op_cmovcc32)
         [
           | r2, cc, rnames |
           @(,x64:lidx . (r2 . cc)) = a2;
           rnames = if (op == x64:op_cmovcc) rnames64 else rnames32;
-          dformat("cmov%s %s,%s", cnames[cc], eastr(a1, rnames), rnames[r2])
+          writer:format(w, "cmov%s %s,%s", cnames[cc], eastr(a1, rnames), rnames[r2])
         ]
       else if (op == x64:op_mov)
         [
@@ -801,38 +803,38 @@ int31? = fn (int n) n >= -0x40000000 && n <= 0x3fffffff;
               ];
               _ => rnames64;
             ];
-          dformat("%s %s,%s", opname[op],
+          writer:format(w, "%s %s,%s", opname[op],
                   eastr(a1, rnames64), eastr(a2, rn2));
         ]
       else if (op == x64:op_movbyte || op == x64:op_orbyte
                || op == x64:op_xorbyte)
-        dformat("%s %s,%s", opname[op], eastr(a1, rnames8),
+        writer:format(w, "%s %s,%s", opname[op], eastr(a1, rnames8),
                 eastr(a2, rnames8))
       else if (op == x64:op_movzxbyte)
-        dformat("%s %s,%s", opname[op], eastr(a1, rnames8),
+        writer:format(w, "%s %s,%s", opname[op], eastr(a1, rnames8),
                 eastr(a2, rnames32))
       else if (op == x64:op_movzxword)
-        dformat("%s %s,%s", opname[op], eastr(a1, rnames16),
+        writer:format(w, "%s %s,%s", opname[op], eastr(a1, rnames16),
                 eastr(a2, rnames32))
       else if (op == x64:op_movzx32)
-        dformat("%s %s,%s", opname[op], eastr(a1, rnames32),
+        writer:format(w, "%s %s,%s", opname[op], eastr(a1, rnames32),
                 eastr(a2, rnames32))
       else if (op == x64:op_imul)
         [
           | imm2, r2 |
           @(,x64:lidx . (r2 . imm2)) = a2;
-          dformat("%s %d,%s,%s", opname[op], imm2, eastr(a1, rnames64),
+          writer:format(w, "%s %d,%s,%s", opname[op], imm2, eastr(a1, rnames64),
                   rnames64[r2]);
         ]
       else if (op == x64:op_lea32 || op == x64:op_add32)
-        dformat("%s %s,%s", opname[op],
+        writer:format(w, "%s %s,%s", opname[op],
                 eastr(a1, rnames64), eastr(a2, rnames32))
       else if (a1 == null)
-        dformat("%s", opname[op])
+        writer:format(w, "%s", opname[op])
       else if (a2 == null || op == x64:op_call)
-        dformat("%s %s", opname[op], eastr(a1, rnames64))
+        writer:format(w, "%s %s", opname[op], eastr(a1, rnames64))
       else
-        dformat("%s %s,%s", opname[op],
+        writer:format(w, "%s %s,%s", opname[op],
                 eastr(a1, rnames64), eastr(a2, rnames64));
     ];
 

@@ -268,8 +268,8 @@ dep depend: .depend
 
 ifeq ($(NOCOMPILER),)
 
-MUD_FILES := $(patsubst %, $(srcdir)%.mud, a$(MUDARCH) compile		\
-	compiler cxc dihash dlist flow gen$(MUDARCH) graph icxc		\
+MUD_FILES := $(patsubst %, $(srcdir)%.mud, a$(MUDARCH) asmwriter compile \
+	compiler cxc dihash dlist flow genllvm gen$(MUDARCH) graph icxc	\
 	inference ins3 interface ixc lib link misc m$(MUDARCH) noinf	\
 	optimise phase1 phase2 phase3 phase4 pxslow sequences vars	\
 	$(MUDARCH) xc)

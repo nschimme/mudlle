@@ -9,7 +9,8 @@ if (load("regression/test.mud")
     && load("regression/s1.mud")
     && load("regression/s2.mud")
     && load("regression/s3.mud")
-    && load("regression/types.mud"))
+    && load("regression/types.mud")
+    && load("regression/llvm.mud"))
   display("SUCCESS\n")
 else
   display("FAILURE\n");
