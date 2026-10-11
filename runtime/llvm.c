@@ -22,6 +22,7 @@
 /* Runtime support for the LLVM native backend. */
 #include "../mudlle-config.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -189,6 +190,7 @@ static void llvm_orc_register_absolute_symbols(LLVMOrcJITDylibRef dylib)
     LLVM_SYMBOL_ENTRY(llvm_pair_cdr),
     LLVM_SYMBOL_ENTRY(llvm_cons),
     LLVM_SYMBOL_ENTRY(llvm_float_binop),
+    LLVM_SYMBOL_ENTRY(llvm_float_unop),
     LLVM_SYMBOL_ENTRY(llvm_equal),
     LLVM_SYMBOL_ENTRY(llvm_build_vector),
     LLVM_SYMBOL_ENTRY(llvm_concat_strings),
@@ -687,6 +689,43 @@ int64_t llvm_float_binop(int64_t op, int64_t raw_a, int64_t raw_b)
     case 1: r = x - y; break;
     case 2: r = x * y; break;
     case 3: r = x / y; break;
+    case 4: r = fmod(x, y); break;
+    case 5:
+      /* fcmp: NaN is an error, left to the generic call */
+      if (isunordered(x, y)) return 0;
+      return (int64_t)(uintptr_t)makeint(isless(x, y) ? -1 : isgreater(x, y));
+    default: return 0;
+    }
+  return (int64_t)(uintptr_t)alloc_float(r);
+}
+
+/* Unary float functions on floats and fixnums; 0 means use the generic call. */
+int64_t llvm_float_unop(int64_t op, int64_t raw_a);
+
+int64_t llvm_float_unop(int64_t op, int64_t raw_a)
+{
+  value a = (value)(uintptr_t)raw_a;
+  double x, r;
+  if (TYPE(a, float)) x = ((struct mudlle_float *)a)->d;
+  else if (integerp(a)) x = intval(a);
+  else return 0;
+  switch (op)
+    {
+    case 0: r = -x; break;
+    case 1: r = fabs(x); break;
+    case 2: r = sqrt(x); break;
+    case 3: r = exp(x); break;
+    case 4: r = log(x); break;
+    case 5: r = sin(x); break;
+    case 6: r = cos(x); break;
+    case 7: r = tan(x); break;
+    case 8: r = atan(x); break;
+    case 9: r = asin(x); break;
+    case 10: r = acos(x); break;
+    case 11: r = ceil(x); break;
+    case 12: r = floor(x); break;
+    case 13: r = round(x); break;
+    case 14: r = trunc(x); break;
     default: return 0;
     }
   return (int64_t)(uintptr_t)alloc_float(r);

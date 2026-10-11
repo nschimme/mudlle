@@ -50,6 +50,7 @@ LLVM_HELPER int32_t llvm_vector_find(int64_t needle, int64_t haystack);
 LLVM_HELPER int64_t llvm_pair_car(int64_t pair);
 LLVM_HELPER int64_t llvm_cons(int64_t car, int64_t cdr, int64_t readonly);
 LLVM_HELPER int64_t llvm_float_binop(int64_t op, int64_t a, int64_t b);
+LLVM_HELPER int64_t llvm_float_unop(int64_t op, int64_t a);
 LLVM_HELPER int64_t llvm_pair_cdr(int64_t pair);
 LLVM_HELPER int32_t llvm_equal(int64_t lhs, int64_t rhs);
 LLVM_HELPER value llvm_build_vector(value *arguments, int64_t nargs, int64_t readonly,
