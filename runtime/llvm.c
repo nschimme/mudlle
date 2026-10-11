@@ -171,6 +171,9 @@ static void llvm_unresolved_symbol_stub(void)
 static void llvm_orc_register_absolute_symbols(LLVMOrcJITDylibRef dylib)
 {
   LLVMOrcCSymbolMapPair symbols[] = {
+    { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "internal_xcount"),
+      { (LLVMOrcExecutorAddress)(uintptr_t)&internal_xcount,
+        { LLVMJITSymbolGenericFlagsExported, 0 } } },
     LLVM_SYMBOL_ENTRY(llvm_raise_error),
     LLVM_SYMBOL_ENTRY(llvm_loop_check),
     LLVM_SYMBOL_ENTRY(llvm_loop_slow_path),

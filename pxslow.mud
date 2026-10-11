@@ -38,11 +38,12 @@ trap_error(fn() [
   start = ctime();
 
   safecomp = fn (s)
-    if (!pcompile(s))
-      [
-        display("Failed!\n");
-        quit(1)
-      ];
+    with_unlimited_execution(fn ()
+      if (!pcompile(s))
+        [
+          display("Failed!\n");
+          quit(1)
+        ]);
 
   | mfiles |
   // sort by size
