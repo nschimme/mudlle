@@ -18,12 +18,15 @@ def mudlle_script(body):
     return 'load("xc.mud");\n' + body
 
 
-def run(binary, script, cache, optimization=None, *, trace=True):
+def run(binary, script, cache, optimization=None, *, trace=True, verify_each=None):
     env = os.environ.copy()
     env["MUDLLE_LLVM_CACHE"] = str(cache) if cache is not None else ""
     env.pop("MUDLLE_LLVM_OPT", None)
     if optimization is not None:
         env["MUDLLE_LLVM_OPT"] = optimization
+    env.pop("MUDLLE_LLVM_VERIFY_EACH", None)
+    if verify_each is not None:
+        env["MUDLLE_LLVM_VERIFY_EACH"] = verify_each
     if trace:
         env["MUDLLE_LLVM_CACHE_TRACE"] = "1"
     else:
@@ -70,6 +73,23 @@ def simple_script(sentinel=SUCCESS):
   function = car(linked);
   if (function(2) != 42) error(error_bad_value);
   display("{sentinel}");
+];
+'''
+
+
+def invalid_ir_script():
+    return f'''[
+  | ir, error |
+  ir = "define i64 @verify_bad(i64 %env, ptr %args, i64 %nargs) {{\\n"
+       + "entry: br i1 true, label %left, label %right\\n"
+       + "left: %v = add i64 1, 2\\n"
+       + "br label %right\\n"
+       + "right: ret i64 %v\\n}}\\n";
+  error = trap_error(
+    fn () llvm_load_ir_closure(ir, "verify_bad", 0, 1, vector(vector(), vector())),
+    fn (n) n, call_trace_off, null);
+  assert(error == error_bad_value);
+  display("{SUCCESS}");
 ];
 '''
 
@@ -201,7 +221,19 @@ def main():
         expect_trace("O2 cold", run(binary, simple_script(), cache, "O2"), ["miss"])
         expect_trace("none cold", run(binary, simple_script(), cache, "none"), ["miss"])
         expect_trace("none warm", run(binary, simple_script(), cache, "none"), ["hit"])
+        expect_trace("fast cold", run(binary, simple_script(), cache, "fast"), ["miss"])
+        expect_trace("fast warm", run(binary, simple_script(), cache, "fast"), ["hit"])
         expect_trace("O2 warm", run(binary, simple_script(), cache, "O2"), ["hit"])
+
+        # Invalid but parseable IR is rejected by the unconditional verifier
+        # before optimization, and the runtime error remains catchable.
+        for optimization in ("none", "O2"):
+            _, invalid_ir = run(binary, invalid_ir_script(), None,
+                                optimization, verify_each="0")
+            if "LLVM IR verification error:" not in invalid_ir.stderr:
+                raise AssertionError(
+                    f"{optimization} did not report LLVM IR verification failure\n"
+                    f"stdout:\n{invalid_ir.stdout}\nstderr:\n{invalid_ir.stderr}")
 
         # A truncated object and a checksum-corrupted object are both ignored
         # and regenerated while execution still reaches its sentinel.

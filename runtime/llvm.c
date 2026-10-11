@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include "llvm-cache-abi.h"
@@ -27,6 +28,7 @@
 #include "../strbuf.h"
 
 #include <llvm-c/Core.h>
+#include <llvm-c/Analysis.h>
 #include <llvm-c/Error.h>
 #include <llvm-c/IRReader.h>
 #include <llvm-c/LLJIT.h>
@@ -41,10 +43,20 @@ static LLVMOrcLLJITRef llvm_orc_jit;
 static LLVMTargetMachineRef llvm_orc_target_machine;
 static size_t llvm_orc_module_sequence;
 
+/* Optional wall-clock diagnostics; all compilation stays on the caller. */
+static double llvm_compile_time(void)
+{
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return now.tv_sec + now.tv_nsec * 1e-9;
+}
+
 static const char *llvm_optimization_pipeline(void)
 {
   const char *level = getenv("MUDLLE_LLVM_OPT");
   static char pipeline[32];
+  if (level != NULL && strcmp(level, "fast") == 0)
+    return "function(sroa,early-cse,instcombine,simplifycfg)";
   if (level == NULL || strcmp(level, "2") == 0)
     level = "O2";
   else if (strcmp(level, "none") == 0 || strcmp(level, "0") == 0)
@@ -56,7 +68,7 @@ static const char *llvm_optimization_pipeline(void)
   else if (strcmp(level, "O0") != 0 && strcmp(level, "O1") != 0
            && strcmp(level, "O2") != 0 && strcmp(level, "O3") != 0)
     {
-      fprintf(stderr, "MUDLLE_LLVM_OPT must be none, O0, O1, O2, or O3\n");
+      fprintf(stderr, "MUDLLE_LLVM_OPT must be none, O0, O1, O2, O3, or fast\n");
       runtime_error(error_bad_value);
     }
   snprintf(pipeline, sizeof pipeline, "default<%s>", level);
@@ -97,6 +109,25 @@ static void llvm_orc_check_error(LLVMErrorRef error)
       char *message = LLVMGetErrorMessage(error);
       fprintf(stderr, "LLVM JIT error: %s\n", message);
       LLVMDisposeErrorMessage(message);
+      runtime_error(error_bad_value);
+    }
+}
+
+static void llvm_verify_module(LLVMModuleRef module,
+                               LLVMOrcThreadSafeContextRef context,
+                               char *cache_path, struct strbuf *key)
+{
+  char *message = NULL;
+  int invalid = LLVMVerifyModule(module, LLVMReturnStatusAction, &message);
+  if (invalid)
+    fprintf(stderr, "LLVM IR verification error: %s\n", message ? message : "invalid module");
+  if (message != NULL) LLVMDisposeMessage(message);
+  if (invalid)
+    {
+      LLVMDisposeModule(module);
+      LLVMOrcDisposeThreadSafeContext(context);
+      free(cache_path);
+      sb_free(key);
       runtime_error(error_bad_value);
     }
 }
@@ -304,6 +335,7 @@ static LLVMErrorRef llvm_cache_capture_object(void *opaque,
 
 static void *llvm_orc_compile_ir(struct string *ir, struct string *symbol)
 {
+  double started = llvm_compile_time(), parsed, optimized;
   char *parse_message = NULL;
   LLVMOrcThreadSafeContextRef safe_context;
   LLVMContextRef context;
@@ -356,13 +388,18 @@ static void *llvm_orc_compile_ir(struct string *ir, struct string *symbol)
   if (parse_message != NULL)
     LLVMDisposeMessage(parse_message);
 
+  llvm_verify_module(module, safe_context, cache_path, &key);
+  parsed = llvm_compile_time();
+
   const char *pipeline = llvm_optimization_pipeline();
   if (pipeline != NULL)
     {
       LLVMPassBuilderOptionsRef options = LLVMCreatePassBuilderOptions();
       LLVMSetTarget(module, LLVMOrcLLJITGetTripleString(llvm_orc_jit));
       LLVMSetDataLayout(module, LLVMOrcLLJITGetDataLayoutStr(llvm_orc_jit));
-      LLVMPassBuilderOptionsSetVerifyEach(options, 1);
+      const char *verify = getenv("MUDLLE_LLVM_VERIFY_EACH");
+      LLVMPassBuilderOptionsSetVerifyEach(options,
+                                         verify != NULL && strcmp(verify, "1") == 0);
       LLVMPassBuilderOptionsSetLoopInterleaving(options, 1);
       LLVMPassBuilderOptionsSetLoopVectorization(options, 1);
       LLVMPassBuilderOptionsSetSLPVectorization(options, 1);
@@ -377,6 +414,10 @@ static void *llvm_orc_compile_ir(struct string *ir, struct string *symbol)
           llvm_orc_check_error(error);
         }
     }
+
+  if (pipeline != NULL)
+    llvm_verify_module(module, safe_context, cache_path, &key);
+  optimized = llvm_compile_time();
 
 #if LLVM_VERSION_MAJOR < 19
   for (LLVMValueRef function = LLVMGetFirstFunction(module); function != NULL;
@@ -419,6 +460,10 @@ static void *llvm_orc_compile_ir(struct string *ir, struct string *symbol)
   LLVMOrcObjectTransformLayerSetTransform(layer, llvm_cache_capture_object, &capture);
   llvm_orc_check_error(LLVMOrcLLJITAddLLVMIRModule(llvm_orc_jit, dylib, safe_module));
   void *address = llvm_orc_lookup(dylib, symbol->str, sequence);
+  if (getenv("MUDLLE_LLVM_TIMING") != NULL)
+    fprintf(stderr, "LLVM timing bytes=%zu prepare_parse=%.6f optimize=%.6f codegen_link=%.6f\n",
+            (size_t)string_len(ir), parsed - started, optimized - parsed,
+            llvm_compile_time() - optimized);
   LLVMOrcObjectTransformLayerSetTransform(layer, llvm_cache_capture_object, NULL);
   free(capture.path);
   sb_free(&key);

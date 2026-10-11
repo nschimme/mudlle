@@ -8,6 +8,20 @@ This document describes the LLVM backend (`genllvm.mud`, `llvm.mud`, `allvm.mud`
 
 The LLVM backend emits LLVM IR for Mudlle functions. ORC LLJIT compiles and loads that IR in process. Optional LLVM command-line tools can validate or inspect emitted IR, but normal execution does not invoke them.
 
+IR verification runs at the input and output of optimization, rather than
+after every pass. `MUDLLE_LLVM_VERIFY_EACH=1` enables per-pass verification for
+debugging. `MUDLLE_LLVM_TIMING=1` reports compilation stages on object-cache
+misses. `MUDLLE_LLVM_OPT=fast` selects an experimental small scalar pipeline;
+O2 remains the default. The selected pipeline already participates in native
+object cache keys. Verification and timing settings do not change the code
+generation pipeline or require separate cache keys.
+
+Mudlle's generated code still uses its existing explicit GC root frames.
+LLVM's `gcroot`/shadow-stack or statepoint support would require runtime
+integration; it is not a switch for reducing compiler latency. The current
+timing diagnostics do not separately measure frontend IR generation or
+separate ORC machine-code generation from linking.
+
 The IR leaves the target triple and data layout unspecified. This lets LLVM select its host target, including 64-bit ARM and RISC-V targets when LLVM provides them. This is code generation coverage, not proof of runtime compatibility or production readiness.
 
 ### Persistent native object cache

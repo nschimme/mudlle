@@ -132,6 +132,67 @@ The LLVM source compiler also passes with optimization disabled. LLVM 14.0.6
 builds and passes `regression/llvm.mud` and the focused cache tests; its full
 suite/bootstrap and ARM64/RISC-V cache behavior still need direct validation.
 
+LLVM Compilation Diagnostics
+----------------------------
+LLVM verifies each module before optimization and again after optimization.
+Per-pass verification is disabled by default; set `MUDLLE_LLVM_VERIFY_EACH=1`
+to restore that expensive debugging check. O2 remains the default optimization
+pipeline. `MUDLLE_LLVM_OPT` also accepts `none`, `O0`, `O1`, `O2`, `O3`, and
+experimental `fast` (SROA, early CSE, instruction combining and CFG cleanup).
+The small `fast` pipeline can sacrifice substantial generated-code speed.
+
+Set `MUDLLE_LLVM_TIMING=1` to report each cache miss's IR bytes and wall time
+for preparation/parsing/input verification, optimization/output verification,
+and native code generation/linking. These timings exclude frontend source
+compilation and IR generation; the native stage combines code generation and
+linking because ORC performs both during symbol lookup. Cache hits bypass
+these stages. All compilation remains on the calling thread.
+
+Reproduce the serial pipeline comparison (fresh processes, cache disabled):
+
+    make USE_LLVM=yes
+    python3 regression/benchmark-llvm-pipelines.py --llvm . --runs 3 \
+      --timing --output /tmp/mudlle-llvm-pipelines.json
+
+The runner checks compiler-load evaluation and the 100-million-iteration
+kernel result. Timing diagnostics run separately from benchmark samples.
+
+Three serial samples on the same LLVM build, with native caching disabled:
+
+| Pipeline | Compiler startup median (s) | Kernel CPU median (ms) |
+|----------|-----------------------------|------------------------|
+| O2, verify every pass | 57.188005 | 42 |
+| O2, verify boundaries (new default) | 8.386301 | 42 |
+| O1, verify boundaries | 7.421044 | 39 |
+| fast, verify boundaries | 6.332871 | 372 |
+| none, verify input | 5.934399 | 392 |
+
+Removing per-pass verification improves this startup workload by about 6.8x
+while retaining O2 and boundary verification. The unchanged kernel median is
+one-workload evidence, not proof of general execution performance. These new
+measurements are not directly comparable to the earlier x64/cache report's
+absolute times. Samples and build fingerprints are recorded in
+`doc/benchmarks/2026-10-11-llvm-pipelines.json`.
+
+Separate stage diagnostics cover 22 modules and 20,055,462 bytes of IR.
+Median O2 optimization time falls from 50.932117 s with per-pass verification
+to 2.513848 s with boundary verification; native code generation/linking stays
+at about 4.85 s. Preparation/parsing/input verification takes about 0.31 s.
+These measurements do not isolate frontend IR generation.
+
+After verifier-error resource cleanup, three samples on the final executable
+confirm default O2 startup at 8.341119 s and kernel execution at 38 ms median.
+That final build's fingerprints and samples are saved separately in the same
+report, alongside one diagnostic run measuring the remaining process time.
+
+Final LLVM 19 validation passes `regression/all.mud` with both `xc.mud` and
+`icxc.mud`, on cold and warm caches. Source runs record 4,405 misses then 4,405
+hits; compiled runs record 4,426 misses then 4,426 hits, with zero misses on
+both warm runs. The cache ABI tests and native cache integration tests pass,
+including malformed IR rejection with per-pass verification disabled and
+separate `fast` cache entries. This change does not revalidate LLVM 14 or
+ARM64/RISC-V execution.
+
 Persistent LLVM Object Cache
 ----------------------------
 LLVM saves ORC's relocatable native objects in `.mudlle-llvm-cache` and reuses
@@ -151,6 +212,7 @@ global offsets safely miss. LLVM 19+ isolates stable object symbols in separate
 ORC namespaces; older LLVM includes sequence-prefixed symbols in the key.
 `doc/llvm-backend.md` describes the implementation and compatibility rules.
 
+The following measurements predate the per-pass verification change.
 Three sequential samples per configuration, fresh processes, warm filesystem
 cache, no CPU pinning. Compiler startup loads `icxc.mud` and checks an evaluation
 of `iadd(20,22)`. The kernel performs 100 million integer-reduction iterations;
