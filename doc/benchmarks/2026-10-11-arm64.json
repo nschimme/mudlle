@@ -1,0 +1,170 @@
+{
+  "runs": 3,
+  "kernel_iterations": 100000000,
+  "workloads": [
+    "kernel"
+  ],
+  "cache_state": "fresh processes; OS filesystem cache not flushed",
+  "host": {
+    "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+    "machine": "arm64"
+  },
+  "builds": {
+    "arm64": {
+      "path": "/private/tmp/mudlle-arm64-latest",
+      "mudlle_arch": "arm64-llvm",
+      "mudlle_sha256": "62962fe706a5982a56c5454c5567a70992873b3ec27df6ebbf6f6cf88f87ebb7",
+      "llvm_cache_abi": "20161b8dbe14d5ec169bfedca71f66d3a52771d8e1b6f9e5336e675fe40c0dae"
+    }
+  },
+  "results": {
+    "llvm_O2": {
+      "kernel": {
+        "samples": [
+          {
+            "wall_s": 0.707522,
+            "user_s": 0.118671,
+            "system_s": 0.042799,
+            "backend": "llvm",
+            "kernel_cpu_ms": 72
+          },
+          {
+            "wall_s": 0.320531,
+            "user_s": 0.113138,
+            "system_s": 0.015724,
+            "backend": "llvm",
+            "kernel_cpu_ms": 70
+          },
+          {
+            "wall_s": 0.437528,
+            "user_s": 0.115979,
+            "system_s": 0.018898,
+            "backend": "llvm",
+            "kernel_cpu_ms": 73
+          }
+        ],
+        "medians": {
+          "wall_s": 0.437528,
+          "user_s": 0.115979,
+          "system_s": 0.018898,
+          "kernel_cpu_ms": 72
+        }
+      }
+    },
+    "llvm_none": {
+      "kernel": {
+        "samples": [
+          {
+            "wall_s": 0.756722,
+            "user_s": 0.36535,
+            "system_s": 0.018532,
+            "backend": "llvm",
+            "kernel_cpu_ms": 332
+          },
+          {
+            "wall_s": 0.576632,
+            "user_s": 0.352641,
+            "system_s": 0.01606,
+            "backend": "llvm",
+            "kernel_cpu_ms": 319
+          },
+          {
+            "wall_s": 0.48526,
+            "user_s": 0.343262,
+            "system_s": 0.013544,
+            "backend": "llvm",
+            "kernel_cpu_ms": 307
+          }
+        ],
+        "medians": {
+          "wall_s": 0.576632,
+          "user_s": 0.352641,
+          "system_s": 0.01606,
+          "kernel_cpu_ms": 319
+        }
+      }
+    },
+    "llvm_O2_cache_miss": {
+      "kernel": {
+        "samples": [
+          {
+            "wall_s": 0.304716,
+            "user_s": 0.110495,
+            "system_s": 0.0163,
+            "cache_hits": 0,
+            "cache_misses": 1,
+            "backend": "llvm",
+            "kernel_cpu_ms": 70
+          },
+          {
+            "wall_s": 0.410031,
+            "user_s": 0.115127,
+            "system_s": 0.017487,
+            "cache_hits": 0,
+            "cache_misses": 1,
+            "backend": "llvm",
+            "kernel_cpu_ms": 74
+          },
+          {
+            "wall_s": 0.494405,
+            "user_s": 0.112143,
+            "system_s": 0.022008,
+            "cache_hits": 0,
+            "cache_misses": 1,
+            "backend": "llvm",
+            "kernel_cpu_ms": 68
+          }
+        ],
+        "medians": {
+          "wall_s": 0.410031,
+          "user_s": 0.112143,
+          "system_s": 0.017487,
+          "cache_hits": 0,
+          "cache_misses": 1,
+          "kernel_cpu_ms": 70
+        }
+      }
+    },
+    "llvm_O2_cache_hit": {
+      "kernel": {
+        "samples": [
+          {
+            "wall_s": 0.216335,
+            "user_s": 0.102407,
+            "system_s": 0.011432,
+            "cache_hits": 1,
+            "cache_misses": 0,
+            "backend": "llvm",
+            "kernel_cpu_ms": 69
+          },
+          {
+            "wall_s": 0.326006,
+            "user_s": 0.101722,
+            "system_s": 0.014065,
+            "cache_hits": 1,
+            "cache_misses": 0,
+            "backend": "llvm",
+            "kernel_cpu_ms": 69
+          },
+          {
+            "wall_s": 0.269063,
+            "user_s": 0.101566,
+            "system_s": 0.013039,
+            "cache_hits": 1,
+            "cache_misses": 0,
+            "backend": "llvm",
+            "kernel_cpu_ms": 69
+          }
+        ],
+        "medians": {
+          "wall_s": 0.269063,
+          "user_s": 0.101722,
+          "system_s": 0.013039,
+          "cache_hits": 1,
+          "cache_misses": 0,
+          "kernel_cpu_ms": 69
+        }
+      }
+    }
+  }
+}

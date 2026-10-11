@@ -94,29 +94,42 @@ def measure(directory, optimization, workload, cache_directory=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--x64", type=Path, required=True)
-    parser.add_argument("--llvm", type=Path, required=True)
+    targets = parser.add_mutually_exclusive_group(required=True)
+    targets.add_argument("--x64", type=Path)
+    targets.add_argument("--llvm", type=Path)
+    targets.add_argument("--arm64", type=Path,
+                         help="measure the ARM64 LLVM backend only")
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--kernel-only", action="store_true",
+                        help="skip compiler-load timing (for unbootstrapped trees)")
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")
-    x64_directory = args.x64.resolve()
-    llvm_directory = args.llvm.resolve()
+    arm64 = args.arm64 is not None
+    x64_directory = args.x64.resolve() if args.x64 else None
+    llvm_directory = (args.llvm or args.arm64).resolve()
+    workloads_to_run = ("kernel",) if args.kernel_only else (
+        "kernel", "compiler_load")
     report = {"runs": args.runs, "kernel_iterations": 100_000_000,
-              "compiler_load": "icxc.mud followed by checked eval(iadd(20,22))",
+              "workloads": list(workloads_to_run),
               "cache_state": "fresh processes; OS filesystem cache not flushed",
               "host": {"platform": platform.platform(),
                        "machine": platform.machine()},
-              "builds": {"x64": build_provenance(x64_directory),
-                         "llvm": build_provenance(llvm_directory)},
+              "builds": ({"arm64": build_provenance(llvm_directory)} if arm64 else
+                         {"x64": build_provenance(x64_directory),
+                          "llvm": build_provenance(llvm_directory)}),
               "results": {}}
-    for label, directory, optimization in [
+    configurations = ([
+        ("llvm_O2", llvm_directory, "O2"),
+        ("llvm_none", llvm_directory, "none"),
+    ] if arm64 else [
         ("x64", x64_directory, None),
         ("llvm_O2", llvm_directory, "O2"),
         ("llvm_none", llvm_directory, "none"),
-    ]:
+    ])
+    for label, directory, optimization in configurations:
         workloads = {}
-        for workload in ("kernel", "compiler_load"):
+        for workload in workloads_to_run:
             samples = []
             for run in range(args.runs):
                 sample = measure(directory, optimization, workload)
@@ -139,7 +152,7 @@ def main():
     # Pair each cold-cache sample with a warm-cache measurement in its own
     # temporary cache, so runs cannot inherit entries from earlier samples.
     cached_workloads = {}
-    for workload in ("kernel", "compiler_load"):
+    for workload in workloads_to_run:
         miss_samples = []
         hit_samples = []
         for run in range(args.runs):
