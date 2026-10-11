@@ -447,4 +447,37 @@ display("Testing LLVM mc:compile pipeline...\n");
   display("LLVM integer remainder error test passed\n");
 ];
 
+[
+  | gtab |
+  gtab = global_table();
+  assert(gtab["system_cmd"] == null);
+  assert(gtab["llvm_load_function"] == null);
+  assert(gtab["llvm_call_function"] == null);
+  assert(gtab["llvm_function_closure"] == null);
+  display("LLVM removed primitives undefined test passed\n");
+];
+
+[
+  | ir, err |
+  ir = "define i64 @test_sec(i64 %env, ptr %args, i64 %nargs) {\nentry:\n  ret i64 42\n}\n";
+  err = with_maxseclevel(0, fn () [
+    trap_error(
+      fn () llvm_load_ir_closure(ir, "test_sec", 0, 0, vector(vector(), vector())),
+      fn (n) n, call_trace_off, null)
+  ]);
+  assert(err == error_security_violation);
+  display("LLVM low-seclevel llvm_load_ir_closure security test passed\n");
+];
+
+[
+  | ir, f, err |
+  ir = "declare i32 @system(ptr)\ndefine i64 @test_sys(i64 %env, ptr %args, i64 %nargs) {\nentry:\n  %r = call i32 @system(ptr null)\n  ret i64 0\n}\n";
+  f = llvm_load_ir_closure(ir, "test_sys", 0, 1, vector(vector(), vector()));
+  err = trap_error(
+    fn () f(),
+    fn (n) n, call_trace_off, null);
+  assert(err == error_bad_value);
+  display("LLVM restricted symbol resolution test passed\n");
+];
+
 display("ALL LLVM & ASMWRITER TESTS PASSED SUCCESSFULLY\n");
