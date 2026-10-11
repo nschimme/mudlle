@@ -1,0 +1,241 @@
+{
+  "builds": {
+    "baseline": {
+      "benchmark_mud_sha256": "b276d30a77b573aa4666d371cce73bda5f5746044d2803cf276d7ef839a70eb3",
+      "genllvm_mud_sha256": "d97cecba5ae517bb41bcab10727d25b010827ea51d0b0837dd03a942a0eff8e8",
+      "mudlle_arch": "amd64-llvm",
+      "mudlle_sha256": "6105ab65d99896ca5222b7cf96dc342ebd232c021b631a7b7226b7f6a2dc9ce8",
+      "path": "/tmp/mudlle-gc-baseline"
+    },
+    "llvm": {
+      "benchmark_mud_sha256": "b276d30a77b573aa4666d371cce73bda5f5746044d2803cf276d7ef839a70eb3",
+      "genllvm_mud_sha256": "7322ee715157f49e8bc2de18889256acc1de38e65211d8bfb2257907abc8361f",
+      "mudlle_arch": "amd64-llvm",
+      "mudlle_sha256": "6105ab65d99896ca5222b7cf96dc342ebd232c021b631a7b7226b7f6a2dc9ce8",
+      "path": "/home/nschimme/gitprojects/mudlle"
+    },
+    "x64": {
+      "benchmark_mud_sha256": "b276d30a77b573aa4666d371cce73bda5f5746044d2803cf276d7ef839a70eb3",
+      "genllvm_mud_sha256": "d97cecba5ae517bb41bcab10727d25b010827ea51d0b0837dd03a942a0eff8e8",
+      "mudlle_arch": "amd64-x64",
+      "mudlle_sha256": "2f2dd73e632897474caaacaeded7c16d0df66b403b65d0485ee9c4781c5bec44",
+      "path": "/tmp/mudlle-gc-x64"
+    }
+  },
+  "cache_state": "fresh serial processes; LLVM object cache disabled; OS filesystem cache not flushed",
+  "host": {
+    "machine": "x86_64",
+    "platform": "Linux-7.0.14-22-pve-x86_64"
+  },
+  "results": {
+    "baseline": {
+      "medians": {
+        "scalar-alloc_cpu_ms": 239,
+        "vector-find-absent_cpu_ms": 106,
+        "vector-find-early-hit_cpu_ms": 10,
+        "vector-find-late-hit_cpu_ms": 110,
+        "vector-walk_cpu_ms": 198,
+        "wall_s": 0.762503
+      },
+      "samples": [
+        {
+          "backend": "llvm",
+          "cpu_ms": {
+            "scalar-alloc": "240",
+            "vector-find-absent": "107",
+            "vector-find-early-hit": "9",
+            "vector-find-late-hit": "112",
+            "vector-walk": "198"
+          },
+          "wall_s": 0.752015
+        },
+        {
+          "backend": "llvm",
+          "cpu_ms": {
+            "scalar-alloc": "233",
+            "vector-find-absent": "104",
+            "vector-find-early-hit": "10",
+            "vector-find-late-hit": "110",
+            "vector-walk": "236"
+          },
+          "wall_s": 0.769018
+        },
+        {
+          "backend": "llvm",
+          "cpu_ms": {
+            "scalar-alloc": "231",
+            "vector-find-absent": "106",
+            "vector-find-early-hit": "10",
+            "vector-find-late-hit": "110",
+            "vector-walk": "204"
+          },
+          "wall_s": 0.748662
+        },
+        {
+          "backend": "llvm",
+          "cpu_ms": {
+            "scalar-alloc": "253",
+            "vector-find-absent": "104",
+            "vector-find-early-hit": "9",
+            "vector-find-late-hit": "106",
+            "vector-walk": "187"
+          },
+          "wall_s": 0.762503
+        },
+        {
+          "backend": "llvm",
+          "cpu_ms": {
+            "scalar-alloc": "239",
+            "vector-find-absent": "120",
+            "vector-find-early-hit": "13",
+            "vector-find-late-hit": "120",
+            "vector-walk": "194"
+          },
+          "wall_s": 0.76588
+        }
+      ]
+    },
+    "llvm": {
+      "medians": {
+        "scalar-alloc_cpu_ms": 26,
+        "vector-find-absent_cpu_ms": 42,
+        "vector-find-early-hit_cpu_ms": 9,
+        "vector-find-late-hit_cpu_ms": 40,
+        "vector-walk_cpu_ms": 5,
+        "wall_s": 0.213861
+      },
+      "samples": [
+        {
+          "backend": "llvm",
+          "cpu_ms": {
+            "scalar-alloc": "23",
+            "vector-find-absent": "41",
+            "vector-find-early-hit": "9",
+            "vector-find-late-hit": "40",
+            "vector-walk": "4"
+          },
+          "wall_s": 0.213861
+        },
+        {
+          "backend": "llvm",
+          "cpu_ms": {
+            "scalar-alloc": "26",
+            "vector-find-absent": "43",
+            "vector-find-early-hit": "10",
+            "vector-find-late-hit": "40",
+            "vector-walk": "5"
+          },
+          "wall_s": 0.214473
+        },
+        {
+          "backend": "llvm",
+          "cpu_ms": {
+            "scalar-alloc": "25",
+            "vector-find-absent": "40",
+            "vector-find-early-hit": "9",
+            "vector-find-late-hit": "38",
+            "vector-walk": "4"
+          },
+          "wall_s": 0.212176
+        },
+        {
+          "backend": "llvm",
+          "cpu_ms": {
+            "scalar-alloc": "27",
+            "vector-find-absent": "42",
+            "vector-find-early-hit": "11",
+            "vector-find-late-hit": "41",
+            "vector-walk": "8"
+          },
+          "wall_s": 0.217207
+        },
+        {
+          "backend": "llvm",
+          "cpu_ms": {
+            "scalar-alloc": "28",
+            "vector-find-absent": "42",
+            "vector-find-early-hit": "9",
+            "vector-find-late-hit": "44",
+            "vector-walk": "5"
+          },
+          "wall_s": 0.207995
+        }
+      ]
+    },
+    "x64": {
+      "medians": {
+        "scalar-alloc_cpu_ms": 12,
+        "vector-find-absent_cpu_ms": 213,
+        "vector-find-early-hit_cpu_ms": 4,
+        "vector-find-late-hit_cpu_ms": 218,
+        "vector-walk_cpu_ms": 5,
+        "wall_s": 0.50652
+      },
+      "samples": [
+        {
+          "backend": "x64",
+          "cpu_ms": {
+            "scalar-alloc": "13",
+            "vector-find-absent": "213",
+            "vector-find-early-hit": "5",
+            "vector-find-late-hit": "202",
+            "vector-walk": "5"
+          },
+          "wall_s": 0.50652
+        },
+        {
+          "backend": "x64",
+          "cpu_ms": {
+            "scalar-alloc": "12",
+            "vector-find-absent": "222",
+            "vector-find-early-hit": "3",
+            "vector-find-late-hit": "218",
+            "vector-walk": "6"
+          },
+          "wall_s": 0.511668
+        },
+        {
+          "backend": "x64",
+          "cpu_ms": {
+            "scalar-alloc": "12",
+            "vector-find-absent": "193",
+            "vector-find-early-hit": "4",
+            "vector-find-late-hit": "219",
+            "vector-walk": "5"
+          },
+          "wall_s": 0.489988
+        },
+        {
+          "backend": "x64",
+          "cpu_ms": {
+            "scalar-alloc": "11",
+            "vector-find-absent": "226",
+            "vector-find-early-hit": "4",
+            "vector-find-late-hit": "222",
+            "vector-walk": "5"
+          },
+          "wall_s": 0.515081
+        },
+        {
+          "backend": "x64",
+          "cpu_ms": {
+            "scalar-alloc": "11",
+            "vector-find-absent": "200",
+            "vector-find-early-hit": "4",
+            "vector-find-late-hit": "206",
+            "vector-walk": "5"
+          },
+          "wall_s": 0.482097
+        }
+      ]
+    }
+  },
+  "runs": 5,
+  "workloads": [
+    "scalar-alloc",
+    "vector-walk",
+    "vector-find-absent",
+    "vector-find-late-hit",
+    "vector-find-early-hit"
+  ]
+}

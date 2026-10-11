@@ -274,6 +274,60 @@ native x64 backend, while unoptimized LLVM is about 4.7x slower. This is one
 tight integer loop, a best case for compiled code rather than a general speed
 estimate.
 
+LLVM GC, vector traversal, and guarded fast paths
+-------------------------------------------------
+
+Five serial, cache-disabled runs on the same x86_64 host (Linux
+7.0.14-22-pve) compared baseline commit
+`b0b1b2beb5aa66d2d02acfae08db1af8c0e2f5d8`, the updated LLVM build, and x64.
+The source-loader kernels compile and link before their `cpu_ms` timers start.
+Medians are milliseconds:
+
+| Workload | Baseline LLVM | Updated LLVM O2 | x64 |
+|----------|---------------|-----------------|-----|
+| Scalar arithmetic with allocations | 239 | 26 | 12 |
+| Vector element traversal | 198 | 5 | 5 |
+| Membership, absent | 106 | 42 | 213 |
+| Membership, late hit | 110 | 40 | 218 |
+| Membership, early hit | 10 | 9 | 4 |
+
+Whole-process wall medians were 0.763 s, 0.214 s, and 0.507 s respectively.
+These include runtime and module startup, compilation and linking, and timed
+kernel calls; they are not startup-only measurements. LLVM O2 still trails x64
+on allocation-heavy work and early membership hits, while it reduces full
+membership scans substantially. The stage-one report isolated root-liveness
+and SIMD membership changes: they improved scans but did not improve the
+allocation workload. The final path adds guarded arithmetic, vector-reference,
+and vector-length fast paths, and avoids rooting copied argument slots. These
+results are workload-specific and do not establish general backend parity.
+
+The five-run samples and provenance are in
+`doc/benchmarks/2026-10-11-llvm-gc-simd.json`. Reproduce with separate baseline,
+new LLVM, and x64 build directories from the repository root. Build the
+baseline with `make USE_LLVM=yes`, the current checkout with the same command,
+and a baseline x64 checkout with `make`. Copy the current
+`regression/benchmark-llvm-gc.mud` into both baseline directories first:
+
+    perl regression/benchmark-llvm-gc.pl \
+      --baseline /tmp/mudlle-gc-baseline \
+      --llvm . \
+      --x64 /tmp/mudlle-gc-x64 \
+      --runs 5 \
+      --output doc/benchmarks/2026-10-11-llvm-gc-simd.json
+
+Inspect generated IR, vectorizer remarks, and the actual cached native object:
+
+    regression/inspect-llvm-simd.sh /tmp/mudlle-simd-inspect
+
+On this host the native membership chunk uses AVX-512 integer comparisons.
+Other CPUs use LLVM's host-selected instructions; no fixed ISA is required.
+
+Validation for this change: the three-stage compiler bootstrap completed with
+`MUDLLE_LLVM_OPT=none`; `regression/all.mud` reached `SUCCESS` through both
+`xc.mud` and `icxc.mud` under O2 with `MUDLLE_LLVM_VERIFY_EACH=1`. The focused
+LLVM and fast-path tests also passed with optimization disabled, both cache
+test scripts passed, and a clean x64 build passed the full regression suite.
+
 Reproduce kernel/cache measurements on Apple Silicon after building with
 Homebrew Bison, Flex, and LLVM:
 

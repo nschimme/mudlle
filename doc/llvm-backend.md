@@ -16,10 +16,63 @@ O2 remains the default. The selected pipeline already participates in native
 object cache keys. Verification and timing settings do not change the code
 generation pipeline or require separate cache keys.
 
-Mudlle's generated code still uses its existing explicit GC root frames.
-LLVM's `gcroot`/shadow-stack or statepoint support would require runtime
-integration; it is not a switch for reducing compiler latency. The current
-timing diagnostics do not separately measure frontend IR generation or
+Mudlle's generated code uses explicit GC root frames. Before flattening the
+control-flow graph, the backend computes variables live at potentially
+collecting instructions. It conservatively recognizes integer/null-only
+locals from all their definitions; incoming arguments and indirect cells
+remain potentially heap-valued. A physical slot is published only when its
+values need protection. GC-visible and private slots use separate coloring
+classes, so nonoverlapping heap/scalar lifetimes cannot accidentally make a
+private scalar slot escape. Entry allocation (varargs or boxing) keeps the
+conservative full frame; unknown/uncolored temporaries stay rooted.
+
+The safepoint classifier is shared with whole-function root elision. This
+remains a manual shadow stack: registered slots must still be reloaded after
+collecting calls. No LLVM statepoints, native stack crawler, or new threads
+are introduced. Statepoints would additionally require representing tagged
+values as managed references, registering ORC stack maps, relocating live
+references, and preserving error unwinding across C/native frames.
+
+### SIMD and automatic vectorization
+
+The runtime already enables loop vectorization, loop interleaving and SLP
+with the default O2 pipeline. A scalar tagged `i64` is not by itself an
+obstacle to packing independent integer operations. The main obstacles in
+ordinary language loops are opaque runtime/builtin calls, type-check failure
+paths, dynamic indexing and the volatile atomic loop-budget update on every
+back edge. Removing that update or adding `noalias` without proof would change
+language semantics. Floating-point reassociation likewise requires an
+explicit numerical contract rather than globally enabling fast math.
+
+Vector membership branches use a lazily emitted internal LLVM helper. It
+checks the vector type/length with the existing runtime helper, then compares
+32 contiguous tagged words in a call-free OR reduction. LLVM can unroll and
+pack that reduction through SLP; the emitted IR contains no fixed SIMD ISA or
+lane width. Search stops after a matching chunk, and the final 0-31 words use
+scalar early exits. This retains pointer-identity comparison for heap objects,
+never reads beyond vector length, and does not allocate or poll for GC. It is
+a runtime primitive implementation, so it does not change language-loop
+budget accounting. The runtime vector-find symbol remains available.
+
+Generic integer arithmetic now has tagged-integer guards and visible LLVM
+operations, with the runtime fallback retaining other types and errors.
+Vector indexing similarly exposes checked loads, including negative indices;
+`vlength` uses the existing checked length helper. Temporary argument buffers
+for vector construction and builtin dispatch need no extra root frame when
+argument evaluation cannot collect: these runtime helpers copy and root the
+arguments before allocating. Concatenation retains its caller roots because
+its runtime implementation reads that buffer after allocation.
+
+General loop SIMD still requires proving integer element types and bounds
+across iterations, exposing stores, and forming
+counted call-free regions while preserving allocation, aliasing, error and
+budget semantics. Compiler latency is a separate performance target; root
+selection and a faster search primitive do not remove cold ORC compilation.
+
+See LLVM's [GC integration](https://llvm.org/docs/GarbageCollection.html),
+[statepoints](https://llvm.org/docs/Statepoints.html), and
+[vectorizers](https://llvm.org/docs/Vectorizers.html) documentation.
+The timing diagnostics do not separately measure frontend IR generation or
 separate ORC machine-code generation from linking.
 
 The IR leaves the target triple and data layout unspecified. This lets LLVM select its host target, including 64-bit ARM and RISC-V targets when LLVM provides them. This is code generation coverage, not proof of runtime compatibility or production readiness.

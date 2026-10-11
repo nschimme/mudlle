@@ -202,6 +202,22 @@ display("Testing LLVM mc:compile pipeline...\n");
 ];
 
 [
+  | source, tree, ir, prelinked, linked, kernel |
+  source = "fn (n) [ | i, sum, scratch | i=0; sum=0; while(i<n) [ scratch=vector(i); garbage_collect(0); sum=iadd(sum,scratch[0]); i=iadd(i,1); ]; sum ]";
+  tree = mudlle_parse(source, "test-live-roots.mud", false);
+  ir = mc:compile_llvm(tree, 1, mc:source_code(source));
+  // Environment, incoming n, and the slot shared by scratch/temporaries.
+  // The integer-only induction and sum slots must not escape to the collector.
+  assert(string_search(ir, "%root_slots_1 = alloca [3 x ptr]") >= 0);
+  tree = mudlle_parse(source, "test-live-roots.mud", false);
+  prelinked = mc:compile(tree, false, 1, mc:source_code(source));
+  linked = mc:linkrun(prelinked, 1, true);
+  kernel = car(linked);
+  assert(kernel(100) == 4950);
+  display("LLVM live heap roots and private scalar slots test passed\n");
+];
+
+[
   | source, tree, prelinked, result, fn_value, opt_default, opt_provided |
   source = "fn (a, b = 7) a + b";
   tree = mudlle_parse(source, "test-optional.mud", false);
@@ -338,16 +354,69 @@ display("Testing LLVM mc:compile pipeline...\n");
 ];
 
 [
-  | source, tree, prelinked, result, fn_value, haystack |
+  | source, tree, prelinked, result, fn_value, neg_source, neg_tree,
+    neg_prelinked, neg_result, neg_fn, bad_haystack_error, haystack,
+    check_length, identity_vector, identity_pair, identity_string, i |
   source = "fn (needle, haystack) if (vfind?(needle, haystack)) 1 else 0";
   tree = mudlle_parse(source, "test-branch-vfind.mud", false);
   prelinked = mc:compile(tree, false, 1, mc:source_code(source));
   assert(vector?(prelinked));
   result = mc:linkrun(prelinked, 1, true);
   fn_value = car(result);
+  neg_source = "fn (needle, haystack) if (!vfind?(needle, haystack)) 1 else 0";
+  neg_tree = mudlle_parse(neg_source, "test-branch-vnfind.mud", false);
+  neg_prelinked = mc:compile(neg_tree, false, 1, mc:source_code(neg_source));
+  assert(vector?(neg_prelinked));
+  neg_result = mc:linkrun(neg_prelinked, 1, true);
+  neg_fn = car(neg_result);
   haystack = vector(1, 2, 3);
   assert(fn_value(2, haystack));
   assert(!fn_value(9, haystack));
+  assert(neg_fn(9, haystack));
+  assert(!neg_fn(2, haystack));
+  bad_haystack_error = trap_error(fn () fn_value(0, 17), fn (n) n,
+                                  call_trace_off, null);
+  assert(bad_haystack_error == error_bad_type);
+
+  check_length = fn (n) [ | values, i |
+    values = make_vector(n);
+    i = 0;
+    while (i < n) [ values[i] = i; i = i + 1; ];
+    i = 0;
+    while (i < n) [ assert(fn_value(i, values)); i = i + 1; ];
+    assert(!fn_value(-1, values));
+  ];
+  check_length(0);
+  check_length(31);
+  check_length(32);
+  check_length(33);
+  check_length(63);
+  check_length(64);
+  check_length(65);
+
+  identity_vector = vector(9, 10);
+  identity_pair = cons(1, cons(2, null));
+  identity_string = "needle";
+  haystack = make_vector(65);
+  i = 0;
+  while (i < vlength(haystack)) [ haystack[i] = null; i = i + 1; ];
+  haystack[0] = 17;
+  haystack[31] = identity_string;
+  haystack[32] = identity_pair;
+  haystack[33] = identity_vector;
+  haystack[63] = 23;
+  haystack[64] = 29;
+  assert(fn_value(null, haystack));
+  assert(fn_value(17, haystack));
+  assert(fn_value(identity_string, haystack));
+  assert(fn_value(identity_pair, haystack));
+  assert(fn_value(identity_vector, haystack));
+  assert(fn_value(23, haystack));
+  assert(fn_value(29, haystack));
+  assert(!fn_value(cons(1, cons(2, null)), haystack));
+  assert(!fn_value(vector(9, 10), haystack));
+  assert(neg_fn(-1, haystack));
+  assert(!neg_fn(identity_pair, haystack));
   display("LLVM vector-find branch test passed\n");
 ];
 
