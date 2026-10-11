@@ -517,14 +517,14 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
             "  %s = getelementptr inbounds [%d x i64], ptr %s, i64 0, i64 0\n",
             captures_ptr, ncaptures, captures_array);
         ];
-      entry_address = format("%%closure_entry_%d", tmp);
-      writer:format(w, "  %s = ptrtoint ptr @entry_%d to i64\n",
-                    entry_address, ifn[mc:c_fnumber]);
       args_index = llvm_constant_index(mc:function_closure_args(ifn));
       args_metadata = format("%%closure_args_%d", tmp);
       writer:format(w,
         "  %s = call i64 @llvm_constant_get(i64 %s, i64 %d)\n",
         args_metadata, llvm_read_env(w), args_index);
+      entry_address = format("%%closure_entry_%d", tmp);
+      writer:format(w, "  %s = ptrtoint ptr @entry_%d to i64\n",
+                    entry_address, ifn[mc:c_fnumber]);
       writer:format(w,
         "  %s = call i64 @llvm_make_function_closure(i64 %s, i64 %d, ptr %s, i64 %d, i64 %d, i64 %s, i64 %s, i64 %d)\n",
         res, entry_address, llength(ifn[mc:c_ffullargs]), captures_ptr,
