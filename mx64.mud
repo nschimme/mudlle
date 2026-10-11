@@ -568,7 +568,8 @@ int31? = fn (int n) n >= -0x40000000 && n <= 0x3fffffff;
 
   // code display
 
-  x64:ins_list = fn "x64code -> . Prints instruction list" (fcode, {vector,null} w = null)
+  x64:ins_list = fn "x64code -> . Prints instruction list"
+    (fcode, {vector,null} w = null)
     [
       | scan, ilist |
       if (w == null) w = writer:new();
@@ -583,8 +584,8 @@ int31? = fn (int n) n >= -0x40000000 && n <= 0x3fffffff;
             writer:format(w, "%s:", slabel(il[x64:il_label]));
           | loc |
           loc = il[x64:il_loc];
-          writer:format(w, "\t%d:%d\t(%s) ", mc:loc_line(loc), mc:loc_column(loc),
-                  il[x64:il_number]);
+          writer:format(w, "\t%d:%d\t(%s) ", mc:loc_line(loc),
+                        mc:loc_column(loc), il[x64:il_number]);
 
           x64:print_ins(il[x64:il_ins], w);
 
@@ -773,7 +774,8 @@ int31? = fn (int n) n >= -0x40000000 && n <= 0x3fffffff;
           | r2, cc, rnames |
           @(,x64:lidx . (r2 . cc)) = a2;
           rnames = if (op == x64:op_cmovcc) rnames64 else rnames32;
-          writer:format(w, "cmov%s %s,%s", cnames[cc], eastr(a1, rnames), rnames[r2])
+          writer:format(w, "cmov%s %s,%s", cnames[cc], eastr(a1, rnames),
+                        rnames[r2])
         ]
       else if (op == x64:op_mov)
         [
@@ -804,38 +806,38 @@ int31? = fn (int n) n >= -0x40000000 && n <= 0x3fffffff;
               _ => rnames64;
             ];
           writer:format(w, "%s %s,%s", opname[op],
-                  eastr(a1, rnames64), eastr(a2, rn2));
+                        eastr(a1, rnames64), eastr(a2, rn2));
         ]
       else if (op == x64:op_movbyte || op == x64:op_orbyte
                || op == x64:op_xorbyte)
         writer:format(w, "%s %s,%s", opname[op], eastr(a1, rnames8),
-                eastr(a2, rnames8))
+                      eastr(a2, rnames8))
       else if (op == x64:op_movzxbyte)
         writer:format(w, "%s %s,%s", opname[op], eastr(a1, rnames8),
-                eastr(a2, rnames32))
+                      eastr(a2, rnames32))
       else if (op == x64:op_movzxword)
         writer:format(w, "%s %s,%s", opname[op], eastr(a1, rnames16),
-                eastr(a2, rnames32))
+                      eastr(a2, rnames32))
       else if (op == x64:op_movzx32)
         writer:format(w, "%s %s,%s", opname[op], eastr(a1, rnames32),
-                eastr(a2, rnames32))
+                      eastr(a2, rnames32))
       else if (op == x64:op_imul)
         [
           | imm2, r2 |
           @(,x64:lidx . (r2 . imm2)) = a2;
-          writer:format(w, "%s %d,%s,%s", opname[op], imm2, eastr(a1, rnames64),
-                  rnames64[r2]);
+          writer:format(w, "%s %d,%s,%s", opname[op], imm2,
+                        eastr(a1, rnames64), rnames64[r2]);
         ]
       else if (op == x64:op_lea32 || op == x64:op_add32)
         writer:format(w, "%s %s,%s", opname[op],
-                eastr(a1, rnames64), eastr(a2, rnames32))
+                      eastr(a1, rnames64), eastr(a2, rnames32))
       else if (a1 == null)
         writer:format(w, "%s", opname[op])
       else if (a2 == null || op == x64:op_call)
         writer:format(w, "%s %s", opname[op], eastr(a1, rnames64))
       else
         writer:format(w, "%s %s,%s", opname[op],
-                eastr(a1, rnames64), eastr(a2, rnames64));
+                      eastr(a1, rnames64), eastr(a2, rnames64));
     ];
 
 ];

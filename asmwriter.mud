@@ -7,16 +7,16 @@
  * provided that the above copyright notice and the following two paragraphs
  * appear in all copies of this software.
  *
- * IN NO EVENT SHALL NILS SCHIMMELMANN BE LIABLE TO ANY PARTY FOR DIRECT, INDIRECT,
- * SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OF
- * THIS SOFTWARE AND ITS DOCUMENTATION, EVEN IF NILS SCHIMMELMANN HAS BEEN ADVISED OF
- * THE POSSIBILITY OF SUCH DAMAGE.
+ * IN NO EVENT SHALL NILS SCHIMMELMANN BE LIABLE TO ANY PARTY FOR DIRECT,
+ * INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+ * USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN IF NILS SCHIMMELMANN HAS
+ * BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * NILS SCHIMMELMANN SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING, BUT NOT LIMITED
- * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS" BASIS, AND NILS
- * SCHIMMELMANN HAS NO OBLIGATION TO PROVIDE MAINTENANCE, SUPPORT, UPDATES,
- * ENHANCEMENTS, OR MODIFICATIONS.
+ * NILS SCHIMMELMANN SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+ * PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS"
+ * BASIS, AND NILS SCHIMMELMANN HAS NO OBLIGATION TO PROVIDE MAINTENANCE,
+ * SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
  */
 
 /*
@@ -36,25 +36,29 @@ defines
   w_port = 0;
   w_file = 1; // underlying file handle if any, or null
 
-  writer:new = fn "port -> writer. Creates a writer wrapping an output port" ({oport,null} p = null)
+  writer:new = fn "port -> writer. Creates a writer wrapping an output port"
+    ({oport,null} p = null)
     [
       if (p == null) p = stdout();
       vector(p, null)
     ];
 
-  writer:new_file = fn "filename -> writer. Creates a writer outputting to a file" (string filename)
+  writer:new_file = fn "filename -> writer. Creates a writer to a file"
+    (string filename)
     [
       | f |
       f = file_open(filename, "w");
       vector(file_oport(f), f)
     ];
 
-  writer:new_string = fn "-> writer. Creates a writer capturing output into a string" ()
+  writer:new_string = fn "-> writer. Creates a string-capturing writer"
+    ()
     [
       vector(make_string_port(), null)
     ];
 
-  writer:get_string = fn "writer -> string. Returns captured string from string writer" (vector w)
+  writer:get_string = fn "writer -> string. Returns captured string"
+    (vector w)
     [
       port_string(w[w_port])
     ];
@@ -64,18 +68,21 @@ defines
       w[w_port]
     ];
 
-  writer:write = fn "writer, string -> . Writes string to writer" (vector w, string s)
+  writer:write = fn "writer, string -> . Writes string to writer"
+    (vector w, string s)
     [
       pprint(w[w_port], s)
     ];
 
-  writer:write_line = fn "writer, string -> . Writes string followed by newline" (vector w, string s)
+  writer:write_line = fn "writer, string -> . Writes string followed by newline"
+    (vector w, string s)
     [
       pprint(w[w_port], s);
       pprint(w[w_port], "\n")
     ];
 
-  writer:format = fn "writer, fmt, args... -> . Formats and writes to writer" (vector w, string fmt, args...)
+  writer:format = fn "writer, fmt, args... -> . Formats and writes to writer"
+    (vector w, string fmt, args...)
     [
       apply(pformat, w[w_port], fmt, args)
     ];

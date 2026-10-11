@@ -26,12 +26,10 @@ srcdir = dirname(loading_file()) + "/";
 // Load interpreted compiler
 garbage_collect(700000);
 load(srcdir + "lib.mud") &&
-load(srcdir + "noinf.mud");
-if (string_equal?(mc:archname, "x64"))
-  [ load(srcdir + "x64.mud") && load(srcdir + "compile.mud") ]
-else
-  [ load(srcdir + "llvm.mud") && load(srcdir + "llvmcompile.mud") ];
-
+load(srcdir + "noinf.mud") &&
+load(srcdir + mc:archname + ".mud") &&
+load(srcdir + (if (string_equal?(mc:archname, "llvm"))
+                  "llvmcompile" else "compile") + ".mud") &&
 load(srcdir + "interface.mud") &&
 protect_compiler_libs();
 mc:verbose = 0;

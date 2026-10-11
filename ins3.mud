@@ -1067,7 +1067,7 @@ mc:const_itype = fn (v)
           | loc |
           loc = il[mc:il_loc];
 	  writer:format(w, "\t%d:%d\t(%s) ", mc:loc_line(loc), mc:loc_column(loc),
-                  il[mc:il_number]);
+                 il[mc:il_number]);
           | ins |
           ins = il[mc:il_ins];
           if (ins == null)
@@ -1121,11 +1121,11 @@ mc:const_itype = fn (v)
       else if (class == mc:i_memory)
 	if (ins[mc:i_mop] == mc:memory_read)
 	  writer:format(w, "%s := %s[%s]", mc:svar(ins[mc:i_mscalar]),
-                  mc:svar(ins[mc:i_marray]), ins[mc:i_mindex])
+                 mc:svar(ins[mc:i_marray]), ins[mc:i_mindex])
 	else
 	  writer:format(w, "%s[%s] := %s",
-                  mc:svar(ins[mc:i_marray]), ins[mc:i_mindex],
-                  mc:svar(ins[mc:i_mscalar]))
+                 mc:svar(ins[mc:i_marray]), ins[mc:i_mindex],
+                 mc:svar(ins[mc:i_mscalar]))
       else if (class == mc:i_closure)
 	[
 	  | ifn |
@@ -1133,14 +1133,14 @@ mc:const_itype = fn (v)
 	  ifn = ins[mc:i_ffunction];
 	  closures = ifn . closures;
 	  writer:format(w, "%s := newclosure %s(%s)", mc:svar(ins[mc:i_fdest]),
-                  ifn[mc:c_fnumber],
-                  concat_words(lmap(mc:svar, ifn[mc:c_fclosure]), ", "))
+                 ifn[mc:c_fnumber],
+                 concat_words(lmap(mc:svar, ifn[mc:c_fclosure]), ", "))
 	]
       else if (class == mc:i_call)
         [
           writer:format(w, "%s := call %s%s", mc:svar(ins[mc:i_cdest]),
-                  concat_words(lmap(mc:svar, ins[mc:i_cargs]), ", "),
-                  if (mc:call_escapes?(ins)) " [escape]" else "");
+                        concat_words(lmap(mc:svar, ins[mc:i_cargs]), ", "),
+                        if (mc:call_escapes?(ins)) " [escape]" else "");
           print_sz(ins[mc:i_csizeinfo]);
         ]
       else if (class == mc:i_trap)
@@ -1163,13 +1163,13 @@ mc:const_itype = fn (v)
                 writer:format(w, "%s ", type_names[v])
               else
                 writer:format(w, "{%s} ",
-                        concat_words(bits_reduce(fn (t, l) [
-                          if (t == ffs(typeset_false) - 1)
-                            t = stype_false
-                          else
-                            assert(t < mudlle_types);
-                          type_names[t] . l
-                        ], null, v), ","));
+                              concat_words(bits_reduce(fn (t, l) [
+                              if (t == ffs(typeset_false) - 1)
+                              t = stype_false
+                              else
+                              assert(t < mudlle_types);
+                              type_names[t] . l
+                              ], null, v), ","));
               writer:write(w, ret);
               if (argnum != null)
                 [
@@ -1185,7 +1185,7 @@ mc:const_itype = fn (v)
           writer:write(w, "trap");
           if (top != mc:trap_global_read && top != mc:trap_global_write)
             writer:format(w, " %s (%d)", error_messages[ins[mc:i_tdest]],
-                    ins[mc:i_tdest]);
+                          ins[mc:i_tdest]);
           | arg |
           arg = mc:trap_is_nomatch?(ins);
           if (arg)
@@ -1195,8 +1195,8 @@ mc:const_itype = fn (v)
 	writer:format(w, "return %s", mc:svar(ins[mc:i_rvalue]))
       else if (class == mc:i_maybe_sconcat)
         writer:format(w, "(maybe) %s := sconcat %s",
-                mc:svar(ins[mc:i_scdest]),
-                concat_words(lmap(mc:svar, ins[mc:i_scargs]), ", "))
+                      mc:svar(ins[mc:i_scdest]),
+                      concat_words(lmap(mc:svar, ins[mc:i_scargs]), ", "))
       else if (class == mc:i_nop)
         writer:write(w, "nop")
       else
