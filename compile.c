@@ -942,6 +942,7 @@ static struct closure *make_primitive_closure_internal(
   icode = generate_fncode(
     newfn, help, NULL, &loc, make_arguments(&fargs), varargs, TYPESET_ANY,
     seclev);
+  delete_fncode(newfn);
   icode->nb_locals = nlocals;
 
   ulong ncaptures = captures ? vector_len(captures) : 0;
