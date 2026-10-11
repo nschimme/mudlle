@@ -770,14 +770,12 @@ value llvm_build_vector(value *arguments, int64_t nargs, int64_t readonly,
   if (nargs < 0 || nargs > MAX_FUNCTION_ARGS)
     runtime_error(error_bad_value);
 
-  /* Mudlle is single threaded: no collection can intervene between this
-     reservation check, allocation and complete initialization. Use the same
-     aligned size as gc_allocate; never read the caller buffer after a GC. */
-  ulong bytes = MUDLLE_ALIGN(record_size((ulong)nargs), sizeof(value));
-  if (!alloc_available(bytes))
-    return llvm_build_vector_collecting(arguments, nargs, readonly, immutable);
-  struct vector *vector = ALLOC_RECORD_NOINIT(vector, (size_t)nargs);
-  return llvm_finish_vector(vector, arguments, nargs, readonly, immutable);
+  /* Single-threaded, fully initialized construction; failure does not GC. */
+  struct vector *vector = try_alloc_vector(arguments, (size_t)nargs,
+                                           readonly != 0, immutable != 0);
+  if (vector != NULL)
+    return vector;
+  return llvm_build_vector_collecting(arguments, nargs, readonly, immutable);
 }
 
 value llvm_concat_strings(value *arguments, int64_t nargs);
@@ -1470,7 +1468,18 @@ UNSAFEOP(llvm_load_ir_closure, "llvm_load_ir_closure",
   return closure;
 }
 
+/* genllvm reads the type byte at offset 9 before vector indexing. Supported
+   64-bit little-endian hosts share this layout, including GCDEBUG headers. */
+_Static_assert(sizeof(value) == 8 && offsetof(struct obj, flags) == 10,
+               "LLVM vector guards require the 64-bit Mudlle object header");
+
 void llvm_init(void)
 {
+  const struct obj vector_header = { .type = type_vector };
+  if (((const unsigned char *)&vector_header)[9] != type_vector)
+    {
+      fprintf(stderr, "Unsupported LLVM object type-byte layout\n");
+      runtime_error(error_bad_value);
+    }
   DEFINE(llvm_load_ir_closure);
 }

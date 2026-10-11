@@ -1,0 +1,41 @@
+{
+  "date": "2026-10-11",
+  "patches": {
+    "doc/benchmarks/2026-10-11-llvm-vector-guards.patch": {
+      "sha256": "58163df6952620bab0ea03792c3484786a8c0d74ddd0b1958cdfb78f8021a41d",
+      "from": "/tmp/mudlle-guards-baseline/genllvm.mud",
+      "to": "/tmp/mudlle-guards-only/genllvm.mud",
+      "inputs": {
+        "baseline_genllvm.mud_sha256": "7322ee715157f49e8bc2de18889256acc1de38e65211d8bfb2257907abc8361f",
+        "guards_only_genllvm.mud_sha256": "a110e9701eace725072d99f495605b17645cf2d7800c84647b378a9e4da2ecd6"
+      }
+    },
+    "doc/benchmarks/2026-10-11-llvm-vector-construction.patch": {
+      "sha256": "dbf349f36af6519d2708d5502c1ffe4fcfe58f728df20fe367ff3af243e44a63",
+      "from": "/tmp/mudlle-guards-only",
+      "to": "/tmp/mudlle-construction-only",
+      "files": {
+        "alloc.c": {
+          "guards_only_sha256": "29bc504325df32e73ad23939062c87a7f74dec228b35204e2a5c5616aed6f077",
+          "construction_only_sha256": "a387d4da1b64cf870f7d07973f68b4080f91454ff510dac816e7a3cb169d6035"
+        },
+        "alloc.h": {
+          "guards_only_sha256": "7f567b4ad32a851abe7c34d89890a7dfa57470d8ed29240055cf0114b8d09c31",
+          "construction_only_sha256": "aaf191531329bc4d5de8b75dd02a8170509d61a83e881b979c5065efee0572d3"
+        },
+        "runtime/llvm.c": {
+          "guards_only_sha256": "a2ca9c5abdab271c9be9a7438ed1a74f7d3ab3b42b911a9ec15bc34deffaea18",
+          "construction_only_sha256": "429143199a3029c715f7e2c7215a63f58aa51307c07dde3c209f418d41b88bbe"
+        },
+        "genllvm.mud": {
+          "guards_only_sha256": "a110e9701eace725072d99f495605b17645cf2d7800c84647b378a9e4da2ecd6",
+          "construction_only_sha256": "c37efad7b18e822fdced58796e49aef9c8cbd35ab05a3b0d1c42f6b1764f3fb3"
+        },
+        "regression/llvm-fast-paths.mud": {
+          "guards_only_sha256": "44635adc3967f1bf5587a5fede4bc477b7df36c83bd3d244da43ec4e00e9b05b",
+          "construction_only_sha256": "aff49f237f9ee4f45e2b66c5c9744a8c3ef44832e63b85418e56ba4b6ac1e276"
+        }
+      }
+    }
+  }
+}

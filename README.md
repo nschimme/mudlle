@@ -546,6 +546,219 @@ moving-child/collection/error-unwinding regression. The runtime remains single
 threaded. This profiling-only change does not repeat compiler bootstrap,
 compiled-loader suites, LLVM 14, ARM64, or RISC-V validation.
 
+LLVM vector guards and noncollecting construction (f56e8c4)
+-----------------------------------------------------------
+
+This continuation keeps explicit shadow roots and the single-threaded runtime.
+Vector reference guards now check the tagged pointer before loading its type
+byte in generated IR. Vector type traps use the same inline predicate and call
+`llvm_check_type` on failure, preserving the diagnostic value and type. String
+indexing, negative indices, bounds failures and other reference types still use
+the existing builtin fallback. Runtime initialization checks the supported
+64-bit object header layout used by the guard.
+
+The construction change is measured separately. `try_alloc_vector` reserves
+only already available nursery space, reuses the free list, initializes the
+header through the allocator's shared initializer, and copies all elements
+before returning. It retains GC checks, allocation statistics and actual-child
+immutability checks. A failed reservation returns without collecting or
+reading caller arguments; the existing collecting helper copies and roots
+arguments before allocating. Root registration, cache loading, diagnostic
+helpers, exceptional unwinding and language-loop accounting retain their
+existing paths. No worker threads or statepoints were added.
+
+Fresh `f56e8c4` LLVM/x64 builds, the guard-only stage, and construction atop
+that stage were measured separately with five serial, cache-disabled processes
+per backend on Linux x86_64 / GCC 14.2.0 / LLVM 19.1.7. The unchanged roots
+benchmark makes ten timed calls of one million iterations per kernel; each
+allocating case creates and consumes a four-integer vector every iteration.
+Compilation and linking finish before the CPU timer starts. CPU medians in ms:
+
+| Incoming heap references | f56e8c4 LLVM | Guards only | Guards + construction | f56e8c4 x64, construction batch |
+|--------------------------|-------------|-------------|-----------------------|---------------------------------|
+| 0 | 225 | 154 | 105 | 123 |
+| 1 | 243 | 160 | 116 | 135 |
+| 4 | 293 | 190 | 143 | 216 |
+| 16 | 619 | 307 | 258 | 482 |
+
+The construction stage reduces allocation CPU time by another 16-32% after
+inline guards. These are workload results, not a claim that LLVM beats x64 for
+all programs. No CPU affinity or filesystem cache flush was used; individual
+samples vary, particularly in the zero-reference case. The reports record all
+samples, checksums, workload sizes, source/binary hashes and host details:
+
+- `doc/benchmarks/2026-10-11-llvm-vector-guards-baseline.json`
+- `doc/benchmarks/2026-10-11-llvm-vector-guards.json`
+- `doc/benchmarks/2026-10-11-llvm-vector-construction.json`
+
+A final comparison rebuilds x64 with the same shared allocator changes,
+protecting the comparison from any effect of the initializer extraction on
+x64. CPU medians for LLVM/x64 are 112/118, 114/144, 159/213 and 240/509 ms for
+0/1/4/16 references. The zero-reference margin is small and its samples
+overlap; stronger wins are in the reference-heavy cases. This batch is in
+`doc/benchmarks/2026-10-11-llvm-vector-final.json`.
+
+The separate GC/traversal/membership benchmark reports LLVM/x64 CPU medians
+of 11/11 ms for scalar allocation, 4/5 for vector traversal, 45/114 for absent
+membership, 48/206 for a late hit and 11/3 for an early hit. These results
+retain the known early-hit deficit; this change does not claim a win on every
+vector operation. Individual samples and baseline LLVM results are in
+`doc/benchmarks/2026-10-11-llvm-vector-gc-final.json`.
+
+Reproduce the final comparison with fresh archives and the changed source
+files, keeping all measurement and validation commands serial:
+
+    mkdir -p /tmp/mudlle-vector-base /tmp/mudlle-vector-x64
+    git archive f56e8c4 | tar -x -C /tmp/mudlle-vector-base
+    git archive f56e8c4 | tar -x -C /tmp/mudlle-vector-x64
+    make -C /tmp/mudlle-vector-base USE_LLVM=yes -j4
+    cp alloc.c alloc.h genllvm.mud /tmp/mudlle-vector-x64/
+    cp runtime/llvm.c /tmp/mudlle-vector-x64/runtime/
+    cp regression/llvm-fast-paths.mud /tmp/mudlle-vector-x64/regression/
+    make -C /tmp/mudlle-vector-x64 -j4
+    make USE_LLVM=yes -j4
+    perl regression/benchmark-llvm-roots.pl \
+      --llvm . --x64 /tmp/mudlle-vector-x64 --runs 5 \
+      --output /tmp/mudlle-vector-final.json
+    perl regression/benchmark-llvm-gc.pl \
+      --baseline /tmp/mudlle-vector-base --llvm . \
+      --x64 /tmp/mudlle-vector-x64 --runs 5 \
+      --output /tmp/mudlle-vector-gc-final.json
+
+To reproduce the two independent optimization stages, apply the preserved
+patches to separate `f56e8c4` archives. The construction patch applies after
+the guard patch; hashes and exact stage inputs are in
+`doc/benchmarks/2026-10-11-llvm-vector-patch-provenance.json`:
+
+    mkdir -p /tmp/mudlle-vector-guards /tmp/mudlle-vector-construction
+    git archive f56e8c4 | tar -x -C /tmp/mudlle-vector-guards
+    git archive f56e8c4 | tar -x -C /tmp/mudlle-vector-construction
+    patch -d /tmp/mudlle-vector-guards -p1 \
+      < doc/benchmarks/2026-10-11-llvm-vector-guards.patch
+    patch -d /tmp/mudlle-vector-construction -p1 \
+      < doc/benchmarks/2026-10-11-llvm-vector-guards.patch
+    patch -d /tmp/mudlle-vector-construction -p1 \
+      < doc/benchmarks/2026-10-11-llvm-vector-construction.patch
+    make -C /tmp/mudlle-vector-guards USE_LLVM=yes -j4
+    make -C /tmp/mudlle-vector-construction USE_LLVM=yes -j4
+
+Run `benchmark-llvm-roots.pl` separately with each LLVM directory and the same
+x64 baseline, using five processes per backend. Neither stage changes the
+benchmark source. The second patch also contains formatting, rejected-type
+regressions and runtime header-layout checks; those are outside timed kernels.
+
+Validation of the final runtime/generator: source suites reach `SUCCESS` on
+LLVM O2, LLVM `none` and the updated x64 build. Both cache test scripts pass.
+The three-stage compiler bootstrap completes with LLVM optimization and native
+cache disabled. The rebuilt compiled compiler's full suite reaches `SUCCESS`
+with per-pass verification on both a fresh cold cache (4,437 misses, zero hits)
+and its warm repeat (4,437 hits, zero misses). Baseline and updated LLVM emit
+identical diagnostics for rejected vector operands and indexing failures, and
+the loop-accounting probe returns the same `[100 99 100]` result. This includes
+the shared movable-child/vector/collection/error-unwinding regression. Logs,
+commands, sentinels and hashes are recorded in
+`doc/benchmarks/2026-10-11-llvm-vector-validation.json`. Execution remains single
+threaded. No new LLVM 14, ARM64 or RISC-V execution validation was performed.
+
+    MUDLLE_LLVM_CACHE= ./mudlle -c 'silent=true' -e xc.mud -e regression/all.mud
+    MUDLLE_LLVM_OPT=none MUDLLE_LLVM_CACHE= \
+      ./mudlle -c 'silent=true' -e xc.mud -e regression/all.mud
+    perl regression/test-llvm-cache-abi.pl
+    perl regression/test-llvm-cache.pl
+    MUDLLE_LLVM_OPT=none MUDLLE_LLVM_CACHE= make compiler USE_LLVM=yes
+    vector_cache_dir=$(mktemp -d /tmp/mudlle-vector-cache.XXXXXX)
+    MUDLLE_LLVM_CACHE="$vector_cache_dir" MUDLLE_LLVM_CACHE_TRACE=1 \
+      MUDLLE_LLVM_VERIFY_EACH=1 \
+      ./mudlle -c 'silent=true' -e icxc.mud -e regression/all.mud
+
+Repeat the last command to exercise warm loading. Require the final `SUCCESS`
+line for each suite; an exit-zero interpreter process alone does not establish
+success. To repeat the diagnostic comparison, run
+`regression/llvm-vector-diagnostics.mud` with `xc.mud` on baseline and updated
+LLVM, comparing both stdout and stderr. The new rejected-type regression
+includes nulls, integers, pairs and strings, before any header load.
+
+Expanded numeric, conversion/mutation and table benchmarks
+----------------------------------------------------------
+
+The vector allocation win does not extend to every primitive. The expanded
+suite compiles and links each kernel before CPU timing, warms it up, then makes
+five timed calls per kernel in each of five fresh processes per backend.
+Backend order alternates between sampling rounds. It uses the same updated
+LLVM and x64 runtime sources as the final vector comparison and disables the
+native object cache. CPU medians in ms:
+
+| Workload | LLVM O2 | x64 |
+|----------|---------|-----|
+| Coupled floating-point recurrence | 587 | 144 |
+| Bigint modular recurrence | 95 | 68 |
+| Mixed bigint/float recurrence | 88 | 41 |
+| Library list/vector roundtrip + mutations, width 32 | 186 | 170 |
+| Native list/vector roundtrip + mutations, width 32 | 227 | 25 |
+| Native list/vector roundtrip + mutations, width 257 | 276 | 34 |
+| Tables, 32 keys | 25 | 10 |
+| Tables, 257 keys | 32 | 11 |
+
+Floating-point math performs 100,000 coupled recurrence steps per call, using
+three boxed float states, a vector snapshot, multiply/add/subtract/divide and
+rational feedback. Bigint math performs 20,000 steps with two modular states,
+a roughly 248-bit modulus and roughly 496-bit products. Mixed math performs
+20,000 bigint square/modulo steps, converts a bounded residue to float, and
+updates a floating-point accumulator through a vector snapshot. All use the
+explicit numeric primitives appropriate to their types. Separate interpreted
+implementations validate results outside timing: floats use relative/absolute
+tolerance `1e-10 * (1 + abs(reference))`; bigint states must match exactly.
+This checks backend semantics and rooting, not the arithmetic libraries'
+independent correctness or every numerical edge case.
+
+Conversion kernels run 10,000 width-32 or 2,000 width-257 roundtrips per call.
+They copy list/vector containers, mutate vector scalar slots, mutate a shared
+heap child, and mutate a list cell while checking the copied vector is
+unchanged. One case calls the existing interpreted library conversion closures;
+the native cases compile the same conversion loops locally. An explicit-GC
+stress call runs before timing. This distinction matters: library and native
+numbers measure different call paths and should not be pooled.
+
+Table kernels prepare keys and heap payloads before timing, then repeatedly
+insert, look up, replace twice, delete every third key, reinsert and iterate.
+Even-index keys use string APIs; odd-index keys use inserted symbols. Each
+payload retains the same shared mutable child. The cases use 32 keys for 256
+rounds and 257 keys for 32 rounds per call. Independent sums check the final
+contents and entry counts without depending on table iteration order.
+Explicit collection stress checks table, symbol and child identity before
+measurement. Sequence and table identity/content checks inside the kernels
+remain part of timed work; final aggregate checks are outside the timer.
+
+All eight workloads pass on both backends, with matching reported checksums,
+work sizes and call counts across every sample. These composite workloads
+include calls, primitive dispatch, shadow roots, allocation, mutations and
+checks; they do not isolate primitive arithmetic or table hashing alone.
+Native conversions expose a particularly large remaining LLVM deficit.
+`doc/benchmarks/2026-10-11-llvm-rich-backends.json` records individual samples,
+parameters, timer boundaries, source/binary hashes and host information. No CPU
+affinity or filesystem-cache flush was used. No universal LLVM speedup is
+claimed. String/symbol processing, closure/application overhead, bitwise math
+and transcendental functions would be useful separate follow-up workloads;
+I/O should remain separate from CPU backend comparisons.
+
+Reproduce after building the updated x64 directory as above, copying all four
+workload files into it so the harness verifies identical hashes:
+
+    cp regression/benchmark-numeric.mud regression/benchmark-sequences.mud \
+      regression/benchmark-tables.mud regression/benchmark-rich.mud \
+      /tmp/mudlle-vector-x64/regression/
+    perl regression/benchmark-rich-backends.pl \
+      --llvm . --x64 /tmp/mudlle-vector-x64 --runs 5 \
+      --output /tmp/mudlle-rich-backends.json
+
+Use `--suite numeric`, `--suite sequences` or `--suite tables` to run a subset.
+The default runs all three suites serially through `benchmark-rich.mud`.
+The harness requires all workload records and each suite's success marker,
+checks workload identity and sample/backend consistency, and rejects missing
+or duplicate results. Require those checks; interpreter exit zero alone is
+insufficient. Benchmark construction and mechanical validation used Luna;
+measurements ran separately from compiler/bootstrap/cache validation.
+
 Contact Information
 -------------------
 

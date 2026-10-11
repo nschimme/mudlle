@@ -1,0 +1,34 @@
+--- a/genllvm.mud
++++ b/genllvm.mud
+@@ -917,8 +917,8 @@
+       load_label = format("vr_load_%d", id);
+       slow_label = format("vr_slow_%d", id);
+       join_label = format("vr_join_%d", id);
+-      writer:format(w, "  %s = call i32 @llvm_type_matches(i64 %s, i64 %d)\n",
+-                    type_ok, array, type_vector);
++      writer:format(w, "  %s = call i32 @mudlle_vector_matches(i64 %s)\n",
++                    type_ok, array);
+       writer:format(w, "  %s = icmp ne i32 %s, 0\n", valid, type_ok);
+       writer:format(w, "  %s = and i64 %s, 1\n", tag, index);
+       writer:format(w, "  %s = icmp eq i64 %s, 1\n", int_ok, tag);
+@@ -2038,7 +2038,8 @@
+               argument = llvm_read_var(car(args), w);
+               nerror = cadr(args)[mc:v_kvalue];
+               writer:format(w,
+-                "  call void @llvm_check_type(i64 %s, i64 %d)\n",
++                "  call void @%s(i64 %s, i64 %d)\n",
++                if (nerror == type_vector) "mudlle_check_vector" else "llvm_check_type",
+                 argument, nerror);
+             ]
+           else if (ins[mc:i_top] == mc:trap_typeset)
+@@ -2144,6 +2145,10 @@
+       writer:write_line(w, "declare void @llvm_loop_slow_path()\n");
+       writer:write_line(w, "@internal_xcount = external global i64\n");
+       writer:write_line(w, "declare void @llvm_check_type(i64, i64)\n");
++      // Test pointer tags before reading the object header. Failure retains
++      // the runtime diagnostic path and its offending value.
++      writer:format(w, "define internal i32 @mudlle_vector_matches(i64 %%value) {\nentry:\n  %%tag = and i64 %%value, 1\n  %%even = icmp eq i64 %%tag, 0\n  %%nonnull = icmp ne i64 %%value, 0\n  %%pointer = and i1 %%even, %%nonnull\n  br i1 %%pointer, label %%header, label %%no\nheader:\n  %%object = inttoptr i64 %%value to ptr\n  %%typeptr = getelementptr i8, ptr %%object, i64 9\n  %%type = load i8, ptr %%typeptr, align 1\n  %%matches = icmp eq i8 %%type, %d\n  %%result = zext i1 %%matches to i32\n  ret i32 %%result\nno:\n  ret i32 0\n}\n", type_vector);
++      writer:format(w, "define internal void @mudlle_check_vector(i64 %%value, i64 %%expected) {\nentry:\n  %%matches = call i32 @mudlle_vector_matches(i64 %%value)\n  %%ok = icmp ne i32 %%matches, 0\n  br i1 %%ok, label %%done, label %%slow\nslow:\n  call void @llvm_check_type(i64 %%value, i64 %%expected)\n  unreachable\ndone:\n  ret void\n}\n");
+       writer:write_line(w, "declare void @llvm_check_integer_pair(i64, i64)\n");
+       writer:write_line(w,
+         "define internal void @mudlle_check_integer(i64 %value) {");

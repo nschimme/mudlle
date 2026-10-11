@@ -94,6 +94,24 @@
   err = trap_error(fn () length("blurb"), fn (n) n,
                    call_trace_off, null);
   assert(err == error_bad_type);
+  err = trap_error(fn () length(null), fn (n) n,
+                   call_trace_off, null);
+  assert(err == error_bad_type);
+  err = trap_error(fn () length(7), fn (n) n,
+                   call_trace_off, null);
+  assert(err == error_bad_type);
+  err = trap_error(fn () length(cons(1, null)), fn (n) n,
+                   call_trace_off, null);
+  assert(err == error_bad_type);
+  err = trap_error(fn () ref(null, 0), fn (n) n,
+                   call_trace_off, null);
+  assert(err == error_bad_type);
+  err = trap_error(fn () ref(7, 0), fn (n) n,
+                   call_trace_off, null);
+  assert(err == error_bad_type);
+  err = trap_error(fn () ref(cons(1, null), 0), fn (n) n,
+                   call_trace_off, null);
+  assert(err == error_bad_type);
 
   display("LLVM_FAST_PATHS_OK\n");
 ];
