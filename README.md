@@ -249,19 +249,27 @@ comparison.
 Full samples and provenance: `doc/benchmarks/2026-10-11-native-cache.json` and
 `doc/benchmarks/2026-10-11-arm64.json`.
 
-Interpreter comparison on Apple Silicon (LLVM 23.1.3), same loop as
-`regression/benchmark.mud` (50,000 iterations x 2,000 runs), three runs each,
-cache disabled. `regression/benchmark-interpreter.mud` runs the loop without
-the compiler:
+Interpreter comparison, same loop as `regression/benchmark.mud` (50,000
+iterations x 2,000 runs), three runs each, cache disabled.
+`regression/benchmark-interpreter.mud` runs the loop without the compiler.
+The x86_64 x64 and interpreter rows come from clean builds; the x86_64 LLVM
+rows used an existing LLVM 19.1.7 build that was not rebuilt for this run.
 
-| Backend | CPU median (ms) | Speedup vs interpreter |
-|---------|-----------------|------------------------|
-| Interpreter | 3024 | 1x |
-| LLVM none | 283 | ~11x |
-| LLVM O2 | 63 | ~48x |
+| Platform | Backend | CPU median (ms) | Speedup vs interpreter |
+|----------|---------|-----------------|------------------------|
+| Apple Silicon, LLVM 23.1.3 | Interpreter | 3024 | 1x |
+| Apple Silicon, LLVM 23.1.3 | LLVM none | 283 | ~11x |
+| Apple Silicon, LLVM 23.1.3 | LLVM O2 | 63 | ~48x |
+| x86_64 (Ryzen 9 7940HS), LLVM 19.1.7 | Interpreter | 2486 | 1x |
+| x86_64 (Ryzen 9 7940HS), LLVM 19.1.7 | LLVM none | 407 | ~6x |
+| x86_64 (Ryzen 9 7940HS), LLVM 19.1.7 | x64 | 87 | ~29x |
+| x86_64 (Ryzen 9 7940HS), LLVM 19.1.7 | LLVM O2 | 40 | ~62x |
 
-This is one tight integer loop, a best case for compiled code rather than a
-general speed estimate.
+Speedups are relative to the interpreter on the same host; absolute times are
+not comparable across hosts. On x86_64, LLVM O2 is about 2x faster than the
+native x64 backend, while unoptimized LLVM is about 4.7x slower. This is one
+tight integer loop, a best case for compiled code rather than a general speed
+estimate.
 
 Reproduce kernel/cache measurements on Apple Silicon after building with
 Homebrew Bison, Flex, and LLVM:
