@@ -1949,9 +1949,17 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                   else
                     type_idx = op - mc:branch_ntype?;
                   matched_value = format("%%typematch_%d", seq);
-                  writer:format(w,
-                    "  %s = call i32 @llvm_type_matches(i64 %s, i64 %d)\n",
-                    matched_value, v1, type_idx);
+                  // Plain object types are a pointer test and a type byte
+                  // compare; typesets and immediates keep the runtime query.
+                  if (type_idx == type_pair || type_idx == type_vector
+                      || type_idx == type_string)
+                    writer:format(w,
+                      "  %s = call i32 @mudlle_has_type(i64 %s, i64 %d)\n",
+                      matched_value, v1, type_idx)
+                  else
+                    writer:format(w,
+                      "  %s = call i32 @llvm_type_matches(i64 %s, i64 %d)\n",
+                      matched_value, v1, type_idx);
                   writer:format(w, "  %s = icmp %s i32 %s, 0\n", cmp,
                     if (op < mc:branch_ntype?) "ne" else "eq", matched_value);
                 ]
@@ -1997,6 +2005,12 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
           tmp_seq = tmp_seq + 1;
           call_id = tmp_seq;
           res = format("%%call_%d", call_id);
+          if (secure_call && arg_count == 3
+              && string_equal?(fn_var[mc:v_name], "set!"))
+            [
+              llvm_write_var(dest_var, llvm_emit_set(call_args, w), w);
+              exit<function> null;
+            ];
           if (secure_call)
             [
               // A constant global callee is read by the runtime after the
@@ -2292,6 +2306,26 @@ no:
   ret i32 0
 }
 """, type_vector);
+      writer:format(w, """
+define internal i32 @mudlle_has_type(i64 %%value, i64 %%expected) {
+entry:
+  %%tag = and i64 %%value, 1
+  %%even = icmp eq i64 %%tag, 0
+  %%nonnull = icmp ne i64 %%value, 0
+  %%pointer = and i1 %%even, %%nonnull
+  br i1 %%pointer, label %%header, label %%no
+header:
+  %%object = inttoptr i64 %%value to ptr
+  %%typeptr = getelementptr i8, ptr %%object, i64 9
+  %%type = load i8, ptr %%typeptr, align 1
+  %%want = trunc i64 %%expected to i8
+  %%matches = icmp eq i8 %%type, %%want
+  %%result = zext i1 %%matches to i32
+  ret i32 %%result
+no:
+  ret i32 0
+}
+""");
       // Pair access and vector length: tag and type test, then a direct load.
       // Failures call the runtime helpers, which raise the usual diagnostics.
       writer:format(w, """
