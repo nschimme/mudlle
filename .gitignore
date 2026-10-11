@@ -30,3 +30,4 @@ runtime/llvm-cache-abi.h
 # Temporary regression outputs
 test_asmwriter_tmp.txt
 test_llvm_reg.s
+.mudlle-history
