@@ -24,6 +24,8 @@ runtime/mudllecst.c
 .depend
 runtime/.depend
 .mudlle-arch
+.mudlle-llvm-cache/
+runtime/llvm-cache-abi.h
 
 # Temporary regression outputs
 test_asmwriter_tmp.txt

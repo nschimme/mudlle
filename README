@@ -16,7 +16,7 @@ Linux Setup and Backend Validation
 ----------------------------------
 On Debian or Ubuntu, install the build tools and LLVM development files:
 
-  sudo apt install build-essential flex bison libgmp-dev libreadline-dev llvm llvm-dev
+  sudo apt install build-essential flex bison python3 libgmp-dev libreadline-dev llvm llvm-dev
 
 The build detects LLVM through `llvm-config`; normal JIT execution does not
 need the LLVM command-line tools. Keep the LLVM headers, C API library, and
@@ -118,128 +118,85 @@ the backends.
 Without LLVM installed, the interpreter remains available. Native x86-64
 compilation continues to use the existing backend.
 
-Validation and Compatibility
+Validation and Performance
+--------------------------
+Validated on Linux x86-64 with GCC 14.2.0, LLVM 19.1.7 and an AMD Ryzen 9 7940HS.
+Mudlle remains single threaded; LLVM compiles on the calling thread with O2 by
+default. x64 and LLVM runtime/three-stage compiler builds pass. LLVM bootstrap
+uses `MUDLLE_LLVM_OPT=none`; its final compiler runs under default O2.
+
+The full `regression/all.mud` suite passes with both source and compiled
+compilers on both backends. LLVM O2 passes on cache misses and hits; warm source
+and compiled suites record 4,405 and 4,426 hits, respectively, with zero misses.
+The LLVM source compiler also passes with optimization disabled. LLVM 14.0.6
+builds and passes `regression/llvm.mud` and the focused cache tests; its full
+suite/bootstrap and ARM64/RISC-V cache behavior still need direct validation.
+
+Persistent LLVM Object Cache
 ----------------------------
-Linux x86-64 validation on 2026-10-11: GCC 14.2.0 (Debian 14.2.0-19),
-LLVM 19.1.7, AMD Ryzen 9 7940HS. Mudlle execution remains single threaded.
+LLVM saves ORC's relocatable native objects in `.mudlle-llvm-cache` and reuses
+them across restarts. A miss uses the normal O2 pipeline; a hit skips IR parsing,
+optimization and machine-code generation while preserving O2 execution.
+Serialized `.obj` files still contain IR and GC-rooted constants.
 
-* Clean x64 runtime and three-stage compiler builds succeed, and the full
-  regression suite prints `SUCCESS`.
-* LLVM passes the full suite with the source compiler under default O2 and
-  with `MUDLLE_LLVM_OPT=none`. The corrected three-stage bootstrap succeeds
-  with `MUDLLE_LLVM_OPT=none`; its final compiled compiler loads under default
-  O2 and the full suite prints `SUCCESS`.
-* LLVM 14 opaque-pointer compatibility was validated on 2026-10-10; it has
-  not been revalidated after these changes. Earlier Apple Silicon validation
-  passed `regression/llvm.mud`. ARM64 and RISC-V runtime compatibility still
-  need direct validation.
-* Remaining parity gaps include synthetic callback names/source locations,
-  ORC modules retained for the process lifetime, unsupported `global_syms`,
-  and compiler startup performance. Float and bigint arithmetic dispatches
-  through Mudlle primitives. LLVM and x64 serialized code formats differ.
+Set `MUDLLE_LLVM_CACHE=/absolute/path` to choose a private cache directory (its
+parent must exist), `MUDLLE_LLVM_CACHE=` to disable persistence, or
+`MUDLLE_LLVM_CACHE_TRACE=1` to print hits/misses. Unavailable, mismatched or
+damaged entries fall back to compilation. Writes use private files and atomic
+rename; there is no automatic eviction.
 
-LLVM emits module-local tag guards for integer operations and promotes scalar
-locals to SSA when no generated operation can collect. Allocating functions
-retain GC roots and reload their closure environment; variadic entry setup is
-also allocating. The loop counter uses atomic monotonic load/store operations
-compatible with the signal handler. To inspect the scalar kernel's IR:
+Keys include relocated IR/entry names, the runtime ABI fingerprint, LLVM
+version, target/data layout, CPU/features and optimization settings. Changed
+global offsets safely miss. LLVM 19+ isolates stable object symbols in separate
+ORC namespaces; older LLVM includes sequence-prefixed symbols in the key.
+`doc/llvm-backend.md` describes the implementation and compatibility rules.
 
-    ./mudlle -e xc.mud -e regression/llvm-benchmark-ir.mud
-    opt -passes='default<O2>' -S /tmp/mudlle-benchmark.ll \
-      -o /tmp/mudlle-benchmark.opt.ll
+Three sequential samples per configuration, fresh processes, warm filesystem
+cache, no CPU pinning. Compiler startup loads `icxc.mud` and checks an evaluation
+of `iadd(20,22)`. The kernel performs 100 million integer-reduction iterations;
+its CPU timer starts after compilation/linking.
 
-Quick benchmark (2026-10-11)
-----------------------------
-Three sequential samples per configuration on the host above, with default
-GCC -O2 runtime builds. Fresh processes, warm filesystem caches, no CPU pinning.
-The kernel performs 2,000 calls of 50,000 integer reduction iterations; its
-CPU timer starts after compilation/linking. Compiler load timing measures a
-fresh process loading the final `icxc.mud` compiler and checking an evaluation
-of `iadd(20,22)`. It includes object loading, JIT work, and that small evaluation.
+| Configuration | Kernel CPU median (ms) | Compiler startup wall median (s) |
+|---------------|------------------------|----------------------------------|
+| x64 | 83 | 0.029431 |
+| LLVM O2, cache disabled | 37 | 39.255493 |
+| LLVM none, cache disabled | 368 | 4.766852 |
+| LLVM O2, cache miss | 38 | 40.533222 |
+| LLVM O2, cache hit | 37 | 0.697817 |
 
-| Configuration | Kernel CPU samples (ms) | Median (ms) | Compiler load wall samples (s) | Median (s) |
-|---------------|-------------------------|-------------|-------------------------------|------------|
-| x64           | 115, 105, 96            | 105         | 0.0438, 0.0471, 0.0579        | 0.0471     |
-| LLVM O2       | 52, 40, 45              | 45          | 66.1473, 67.3429, 67.1650     | 67.1650    |
-| LLVM none     | 419, 415, 410           | 415         | 7.4374, 7.4747, 7.0611        | 7.4374     |
+Cached O2 startup is about 58 times faster than a miss, with 22 hits and zero
+misses in every warm sample. Kernel performance matches uncached O2 and is
+about 2.2 times faster than x64 on this workload. Startup remains about 24 times
+slower than x64; these samples do not establish broad performance parity.
 
-LLVM O2 executes this scalar workload about 2.3 times as fast as x64, while
-compiled compiler loading is about 1,426 times slower. Disabling the optional
-IR optimization pipeline reduces LLVM loading time about 9 times, but slows
-this kernel about 9.2 times relative to O2. These small samples do not establish
-broad execution parity or identify the individual startup phases. The current
-LLVM path recompiles saved IR on each restart; persistent native object caching
-is the next performance task. Source metadata and other parity gaps remain.
-
-All samples, including whole-process user/system/wall times, are recorded in
-`doc/benchmarks/2026-10-11-llvm-x64.json`. Reproduce with separately built x64
-and LLVM trees containing their final compiler objects:
+All samples, user/system/wall times, cache counters, executable hashes and ABI
+fingerprints are in `doc/benchmarks/2026-10-11-native-cache.json`. Reproduce with
+separately built backend trees containing their final compiler objects:
 
     python3 regression/benchmark-backends.py \
       --x64 /path/to/x64-build --llvm /path/to/llvm-build --runs 3 \
-      > /tmp/mudlle-backend-benchmark.json
+      > /tmp/mudlle-native-cache-benchmark.json
 
-The runner checks workload completion because process exit status alone does
-not detect every Mudlle load error. It runs samples sequentially and explicitly
-selects O2 or none for LLVM, ignoring an inherited `MUDLLE_LLVM_OPT` setting.
+The runner isolates cold caches, primes before warm measurements, overrides
+inherited settings, and checks backend identity and completion sentinels.
+Run the focused checks after an LLVM build:
 
-Resolved LLVM bootstrap failures (2026-10-11)
--------------------------------------------
+    python3 regression/test-llvm-cache-abi.py
+    python3 regression/test-llvm-cache.py
 
-The old build1/.comp-0 GC assertion was traced with GDB outside the ptrace
-sandbox. The six-element vector was marked readonly and immutable, but its
-children were still movable vectors. After promotion to generation 1, minor
-collections skipped its fields and left stale pointers into generation 0.
-`llvm_build_vector` now checks every element before setting OBJ_IMMUTABLE.
-The regression covers a readonly vector of nested constants across collections.
-
-Once that corruption was fixed, bootstrap exposed duplicate SSA names for
-coalesced or discarded arguments in phase2. Incoming loads now use argument
-positions for names and keep slot numbers only for storage. The regression
-checks a function with several unused arguments.
-
-Native dispatch and slot reuse address the next recursion failures. LLVM calls
-previously re-entered the bytecode interpreter, and GC-visible stack slots
-could not be reused by LLVM because their addresses escaped to C. The generator
-now colors local slots using the existing compiler liveness analysis. Slot zero
-remains reserved for discarded values, including unused argument-count writes.
-Indirect variables have exclusive slots. Builtin code generation uses separate
-guards instead of a deeply nested else-if chain.
-
-The C callback constructor also protects its callback object before allocating
-its string cache. Numeric fallback comparisons reload their rooted operation
-name after calling a primitive that can move it.
-
-The final compiler initially rejected `mc:get_loc` as no longer immutable.
-`compiler_stable_closure?` had incorrectly declared a bigint result (`x.b`)
-while returning an integer boolean. Inference therefore treated its false
-result as truthy and recorded an invalid immutable dependency. Its signature
-now matches the other boolean predicates (`x.n`), with a conditional regression.
-
-Reproduce the Linux LLVM 19 validation in a fresh build directory:
+For full LLVM validation, run each loader twice with the same cache directory
+and require the final `SUCCESS` sentinel (exit zero alone is insufficient):
 
     make USE_LLVM=yes
     MUDLLE_LLVM_OPT=none make compiler USE_LLVM=yes
-    ./mudlle -c 'silent=true' -e icxc.mud -e regression/all.mud
-    ./mudlle -c 'silent=true' -e xc.mud -e regression/all.mud
+    MUDLLE_LLVM_CACHE=/tmp/mudlle-validation-cache \
+      ./mudlle -c 'silent=true' -e xc.mud -e regression/all.mud
+    MUDLLE_LLVM_CACHE=/tmp/mudlle-validation-cache \
+      ./mudlle -c 'silent=true' -e icxc.mud -e regression/all.mud
 
-The bootstrap command disables the optional LLVM IR optimization passes;
-the following commands use default O2. Check for the final `SUCCESS` sentinel:
-a Mudlle load error can occur even when the process exits zero. Compiler objects
-are backend-specific; use separate build directories for LLVM and x64.
-
-Performance follow-up: the earlier default-O2 run completed the two compiled
-bootstrap stages in 534.5 and 542.5 seconds, compared with 2.1 and 1.9 seconds
-for a separate serial x64 build on the same host. These are checkpoint-to-
-checkpoint wall times, including compiler loading and compilation, rather than
-steady-state execution benchmarks. The corrected run with
-`MUDLLE_LLVM_OPT=none` took 134.0 and 129.7 seconds for those stages; this
-setting still performs JIT machine-code generation. LLVM continued advancing
-through all eight slices; it was not hung. Investigate compiler loading/JIT
-cost and compilation cost separately in the next session. ORC can reload
-native object files;
-`doc/llvm-backend.md` records the proposed cache and relocation work. Keep the
-runtime single threaded.
+Keep LLVM validation and benchmarks serial: ORC modules remain resident until
+process exit. Remaining limitations include synthetic callback source metadata,
+unsupported `global_syms`, and incompatible x64/LLVM serialized code formats.
 
 Contact Information
 -------------------

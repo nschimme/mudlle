@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include "llvm-cache-abi.h"
 
 #include "../alloc.h"
 #include "../compile.h"
@@ -120,20 +123,216 @@ static void llvm_orc_initialize(void)
     LLVMOrcLLJITGetMainJITDylib(llvm_orc_jit), generator);
 }
 
+/* Cache files are private, disposable native-code artifacts. The complete key
+   is stored and compared, so filename hash collisions cannot reuse wrong code.
+   Writes use rename, allowing independent single-threaded processes to race. */
+static uint64_t llvm_cache_hash(const void *bytes, size_t length)
+{
+  const unsigned char *p = bytes;
+  uint64_t hash = UINT64_C(14695981039346656037);
+  for (size_t i = 0; i < length; ++i)
+    hash = (hash ^ p[i]) * UINT64_C(1099511628211);
+  return hash;
+}
+
+static void llvm_cache_key(struct strbuf *key, struct string *ir,
+                           struct string *symbol)
+{
+  sb_init(key);
+  sb_addstr(key, "mudlle-native-object-v2\n" MUDLLE_LLVM_CACHE_ABI "\n"
+            LLVM_VERSION_STRING "\norc-default-codegen\n");
+  sb_addstr(key, LLVMOrcLLJITGetTripleString(llvm_orc_jit));
+  sb_addstr(key, "\n");
+  sb_addstr(key, LLVMOrcLLJITGetDataLayoutStr(llvm_orc_jit));
+  char *cpu = LLVMGetTargetMachineCPU(llvm_orc_target_machine);
+  char *features = LLVMGetTargetMachineFeatureString(llvm_orc_target_machine);
+  sb_addstr(key, "\n"); sb_addstr(key, cpu);
+  sb_addstr(key, "\n"); sb_addstr(key, features);
+  LLVMDisposeMessage(cpu); LLVMDisposeMessage(features);
+  const char *pipeline = llvm_optimization_pipeline();
+  sb_addstr(key, "\n"); sb_addstr(key, pipeline ? pipeline : "none");
+  sb_addstr(key, "\n"); sb_addstr(key, symbol->str);
+  sb_addstr(key, "\n"); sb_addmem(key, ir->str, string_len(ir));
+}
+
+static char *llvm_cache_path(struct strbuf *key)
+{
+  const char *directory = getenv("MUDLLE_LLVM_CACHE");
+  if (directory == NULL) directory = ".mudlle-llvm-cache";
+  if (*directory == '\0') return NULL;
+  if (mkdir(directory, 0700) != 0)
+    {
+      struct stat st;
+      if (stat(directory, &st) != 0 || !S_ISDIR(st.st_mode)) return NULL;
+    }
+  size_t size = strlen(directory) + 32;
+  char *path = malloc(size);
+  if (path != NULL)
+    snprintf(path, size, "%s/%016llx.cache", directory,
+             (unsigned long long)llvm_cache_hash(sb_str(key), sb_len(key)));
+  return path;
+}
+
+static LLVMMemoryBufferRef llvm_cache_read(const char *path, struct strbuf *key)
+{
+  if (path == NULL) return NULL;
+  FILE *file = fopen(path, "rb");
+  if (file == NULL) return NULL;
+  uint64_t header[3];
+  LLVMMemoryBufferRef result = NULL;
+  size_t key_size = sb_len(key);
+  if (fread(header, sizeof header, 1, file) == 1 && header[0] == key_size
+      && header[1] > 0 && header[1] <= 256 * 1024 * 1024)
+    {
+      char *stored_key = malloc(key_size);
+      char *object = malloc((size_t)header[1]);
+      if (stored_key != NULL && object != NULL
+          && fread(stored_key, 1, key_size, file) == key_size
+          && memcmp(stored_key, sb_str(key), key_size) == 0
+          && fread(object, 1, (size_t)header[1], file) == header[1]
+          && fgetc(file) == EOF
+          && llvm_cache_hash(object, (size_t)header[1]) == header[2])
+        result = LLVMCreateMemoryBufferWithMemoryRangeCopy(
+          object, (size_t)header[1], "mudlle-cached-object");
+      free(stored_key); free(object);
+    }
+  fclose(file);
+  return result;
+}
+
+static void llvm_cache_write(char *path, struct strbuf *key,
+                             LLVMMemoryBufferRef object)
+{
+  if (path == NULL) return;
+  char *temporary = malloc(strlen(path) + 8);
+  if (temporary == NULL) { free(path); return; }
+  sprintf(temporary, "%s.XXXXXX", path);
+  int fd = mkstemp(temporary);
+  if (fd >= 0)
+    {
+      FILE *file = fdopen(fd, "wb");
+      if (file != NULL)
+        {
+          uint64_t header[] = { sb_len(key), LLVMGetBufferSize(object),
+            llvm_cache_hash(LLVMGetBufferStart(object), LLVMGetBufferSize(object)) };
+          bool ok = fwrite(header, sizeof header, 1, file) == 1
+            && fwrite(sb_str(key), 1, header[0], file) == header[0]
+            && fwrite(LLVMGetBufferStart(object), 1, header[1], file) == header[1];
+          if (fclose(file) != 0) ok = false;
+          if (ok) (void)rename(temporary, path);
+        }
+      else close(fd);
+      unlink(temporary);
+    }
+  free(temporary); free(path);
+}
+
+#if LLVM_VERSION_MAJOR >= 19
+struct llvm_lookup_result { LLVMOrcExecutorAddress address; bool done; };
+static void llvm_lookup_complete(LLVMErrorRef error,
+                                 LLVMOrcCSymbolMapPairs symbols, size_t count,
+                                 void *opaque)
+{
+  llvm_orc_check_error(error);
+  struct llvm_lookup_result *result = opaque;
+  if (count != 1) runtime_error(error_bad_value);
+  result->address = symbols[0].Sym.Address;
+  result->done = true;
+}
+#endif
+
+static LLVMOrcJITDylibRef llvm_orc_module_dylib(size_t sequence)
+{
+#if LLVM_VERSION_MAJOR < 19
+  /* Older LLVM releases have no C API for lookup in a selected dylib. Include the
+     sequence in their key and object symbols instead of sharing names. */
+  (void)sequence;
+  return LLVMOrcLLJITGetMainJITDylib(llvm_orc_jit);
+#else
+  char name[64];
+  snprintf(name, sizeof name, "mudlle_module_%zu", sequence);
+  LLVMOrcJITDylibRef dylib;
+  LLVMOrcExecutionSessionRef session = LLVMOrcLLJITGetExecutionSession(llvm_orc_jit);
+  llvm_orc_check_error(LLVMOrcExecutionSessionCreateJITDylib(session, &dylib, name));
+  LLVMOrcDefinitionGeneratorRef generator;
+  llvm_orc_check_error(LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
+    &generator, LLVMOrcLLJITGetGlobalPrefix(llvm_orc_jit), NULL, NULL));
+  LLVMOrcJITDylibAddGenerator(dylib, generator);
+  return dylib;
+#endif
+}
+
+static void *llvm_orc_lookup(LLVMOrcJITDylibRef dylib, const char *symbol,
+                             size_t sequence)
+{
+#if LLVM_VERSION_MAJOR < 19
+  (void)dylib;
+  struct strbuf name = sb_initf("mudlle_module_%zu_%s", sequence, symbol);
+  LLVMOrcExecutorAddress address;
+  LLVMErrorRef error = LLVMOrcLLJITLookup(llvm_orc_jit, &address, sb_str(&name));
+  sb_free(&name);
+  llvm_orc_check_error(error);
+  return (void *)(uintptr_t)address;
+#else
+  (void)sequence;
+  LLVMOrcCJITDylibSearchOrderElement order = {
+    dylib, LLVMOrcJITDylibLookupFlagsMatchAllSymbols };
+  LLVMOrcCLookupSetElement lookup = {
+    LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, symbol),
+    LLVMOrcSymbolLookupFlagsRequiredSymbol };
+  struct llvm_lookup_result result = {0};
+  /* Default LLJIT and process generators complete synchronously. No workers. */
+  LLVMOrcExecutionSessionLookup(LLVMOrcLLJITGetExecutionSession(llvm_orc_jit),
+    LLVMOrcLookupKindStatic, &order, 1, &lookup, 1, llvm_lookup_complete, &result);
+  if (!result.done) runtime_error(error_bad_value);
+  return (void *)(uintptr_t)result.address;
+#endif
+}
+
+struct llvm_cache_capture { char *path; struct strbuf *key; };
+static LLVMErrorRef llvm_cache_capture_object(void *opaque,
+                                              LLVMMemoryBufferRef *object)
+{
+  struct llvm_cache_capture *capture = opaque;
+  if (capture != NULL)
+    {
+      llvm_cache_write(capture->path, capture->key, *object);
+      capture->path = NULL;
+    }
+  return LLVMErrorSuccess;
+}
+
 static void *llvm_orc_compile_ir(struct string *ir, struct string *symbol)
 {
   char *parse_message = NULL;
-  char *unique_symbol;
   LLVMOrcThreadSafeContextRef safe_context;
   LLVMContextRef context;
   LLVMMemoryBufferRef buffer;
   LLVMModuleRef module;
-  LLVMOrcThreadSafeModuleRef safe_module;
-  LLVMOrcExecutorAddress address;
   size_t sequence;
 
   llvm_orc_initialize();
+  /* A previous Mudlle error may have unwound a lookup. Never leave a
+     transform referring to that call's stack-local capture context. */
+  LLVMOrcObjectTransformLayerSetTransform(
+    LLVMOrcLLJITGetObjTransformLayer(llvm_orc_jit), llvm_cache_capture_object, NULL);
   sequence = llvm_orc_module_sequence++;
+  struct strbuf key;
+  llvm_cache_key(&key, ir, symbol);
+#if LLVM_VERSION_MAJOR < 19
+  sb_printf(&key, "\nlegacy-module-sequence=%zu", sequence);
+#endif
+  LLVMOrcJITDylibRef dylib = llvm_orc_module_dylib(sequence);
+  char *cache_path = llvm_cache_path(&key);
+  buffer = llvm_cache_read(cache_path, &key);
+  if (getenv("MUDLLE_LLVM_CACHE_TRACE") != NULL)
+    fprintf(stderr, "LLVM object cache %s\n", buffer ? "hit" : "miss");
+  if (buffer != NULL)
+    {
+      free(cache_path); sb_free(&key);
+      llvm_orc_check_error(LLVMOrcLLJITAddObjectFile(llvm_orc_jit, dylib, buffer));
+      return llvm_orc_lookup(dylib, symbol->str, sequence);
+    }
 #if LLVM_VERSION_MAJOR >= 21
   /* LLVM 21 removed the ORC accessor for a context created by ORC. */
   context = LLVMContextCreate();
@@ -151,6 +350,7 @@ static void *llvm_orc_compile_ir(struct string *ir, struct string *symbol)
       if (parse_message != NULL)
         LLVMDisposeMessage(parse_message);
       LLVMOrcDisposeThreadSafeContext(safe_context);
+      free(cache_path); sb_free(&key);
       runtime_error(error_bad_value);
     }
   if (parse_message != NULL)
@@ -173,10 +373,12 @@ static void *llvm_orc_compile_ir(struct string *ir, struct string *symbol)
         {
           LLVMDisposeModule(module);
           LLVMOrcDisposeThreadSafeContext(safe_context);
+          free(cache_path); sb_free(&key);
           llvm_orc_check_error(error);
         }
     }
 
+#if LLVM_VERSION_MAJOR < 19
   for (LLVMValueRef function = LLVMGetFirstFunction(module); function != NULL;
        function = LLVMGetNextFunction(function))
     if (LLVMCountBasicBlocks(function) != 0)
@@ -208,32 +410,19 @@ static void *llvm_orc_compile_ir(struct string *ir, struct string *symbol)
         free(new_name);
       }
 
-  int symbol_length = snprintf(NULL, 0, "mudlle_module_%zu_%s",
-                               sequence, symbol->str);
-  if (symbol_length < 0)
-    {
-      LLVMDisposeModule(module);
-      LLVMOrcDisposeThreadSafeContext(safe_context);
-      runtime_error(error_bad_value);
-    }
-  unique_symbol = malloc((size_t)symbol_length + 1);
-  if (unique_symbol == NULL)
-    {
-      LLVMDisposeModule(module);
-      LLVMOrcDisposeThreadSafeContext(safe_context);
-      runtime_error(error_bad_value);
-    }
-  snprintf(unique_symbol, (size_t)symbol_length + 1,
-           "mudlle_module_%zu_%s", sequence, symbol->str);
-
-  safe_module = LLVMOrcCreateNewThreadSafeModule(module, safe_context);
+#endif
+  LLVMOrcThreadSafeModuleRef safe_module =
+    LLVMOrcCreateNewThreadSafeModule(module, safe_context);
   LLVMOrcDisposeThreadSafeContext(safe_context);
-  llvm_orc_check_error(LLVMOrcLLJITAddLLVMIRModule(
-    llvm_orc_jit, LLVMOrcLLJITGetMainJITDylib(llvm_orc_jit), safe_module));
-  llvm_orc_check_error(LLVMOrcLLJITLookup(llvm_orc_jit, &address,
-                                          unique_symbol));
-  free(unique_symbol);
-  return (void *)(uintptr_t)address;
+  struct llvm_cache_capture capture = { cache_path, &key };
+  LLVMOrcObjectTransformLayerRef layer = LLVMOrcLLJITGetObjTransformLayer(llvm_orc_jit);
+  LLVMOrcObjectTransformLayerSetTransform(layer, llvm_cache_capture_object, &capture);
+  llvm_orc_check_error(LLVMOrcLLJITAddLLVMIRModule(llvm_orc_jit, dylib, safe_module));
+  void *address = llvm_orc_lookup(dylib, symbol->str, sequence);
+  LLVMOrcObjectTransformLayerSetTransform(layer, llvm_cache_capture_object, NULL);
+  free(capture.path);
+  sb_free(&key);
+  return address;
 }
 
 void llvm_raise_error(int64_t error_code, int64_t argument);

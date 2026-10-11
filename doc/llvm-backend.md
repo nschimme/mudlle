@@ -10,31 +10,68 @@ The LLVM backend emits LLVM IR for Mudlle functions. ORC LLJIT compiles and load
 
 The IR leaves the target triple and data layout unspecified. This lets LLVM select its host target, including 64-bit ARM and RISC-V targets when LLVM provides them. This is code generation coverage, not proof of runtime compatibility or production readiness.
 
-### Restart performance follow-up
+### Persistent native object cache
 
-Currently `.obj` files contain textual LLVM IR, which the loader parses,
-optimizes, and compiles again in each process. A native object cache can skip
-these steps on a cache hit, while ORC links and relocates the object at load time.
-The installed LLVM 19 C headers expose the necessary APIs:
+`.obj` files remain portable textual LLVM IR plus rooted constants and global
+relocations. The runtime caches the **relocatable native object**, rather than
+optimized bitcode or linked addresses. On a miss it uses the existing O2 IR
+pipeline and ORC compilation path; an object-transform callback captures the
+emitted bytes before linking. On a hit it calls `LLVMOrcLLJITAddObjectFile`,
+skipping IR parsing, optimization, and machine-code generation. ORC still
+resolves runtime symbols and object relocations in the new process.
 
-- `LLVMOrcLLJITGetObjTransformLayer` and
-  `LLVMOrcObjectTransformLayerSetTransform` can capture emitted object bytes.
-- `LLVMOrcLLJITAddObjectFile` can load the saved relocatable object.
+The default cache directory is `.mudlle-llvm-cache` in the working directory.
+Set `MUDLLE_LLVM_CACHE=/absolute/path` to share a private cache across restarts,
+or set `MUDLLE_LLVM_CACHE=` to disable persistence. The parent directory must
+exist; an unavailable cache falls back to compilation. Set
+`MUDLLE_LLVM_CACHE_TRACE=1` for one `LLVM object cache hit` or `miss` line per
+module. Cache directories are created with mode 0700 and files with mode 0600.
+They contain executable artifacts and should remain under the user's control.
+There is no automatic eviction; deleting the directory discards the cache.
+
+The key includes the complete **relocated IR** and entry symbol, a generated
+SHA256 fingerprint of runtime C/header sources (including generated ABI headers),
+Makefile and C/CPP flags, LLVM's full version, target triple and data layout,
+host CPU/features, and the selected optimization pipeline. The cache format
+version and ORC default code-generation policy are included too. Changes to
+constant indices or layouts affect IR; actual constant values are loaded from
+the current GC-rooted closure environment, never embedded as process addresses.
+
+Global offsets are resolved before lookup. A changed global registration order
+therefore produces a safe miss, and each mapping can subsequently hit its own
+object. This deliberately trades some reuse for retaining direct global access
+and the existing serialized descriptor format. LLVM 19 and newer load each
+object into its own JITDylib, preserving stable object symbol names without
+process-sequence prefixes or duplicate-definition collisions. Older releases
+use the established main-dylib lookup API with sequence-prefixed function names;
+the sequence is also in their cache key, restricting reuse to matching load
+order. Entry names and generated function numbers remain part of the content
+key; changed descriptors safely miss.
+
+A cache file stores the full key, native object length and checksum, and object
+bytes. The filename is only a hash index: a hit requires exact key equality,
+correct lengths, and a matching object checksum. Missing, truncated, mismatched,
+or damaged entries are recompiled. Writes use a temporary file and atomic
+rename; failed writes do not prevent execution. Independent processes may
+populate the same directory without partial-file reads. This introduces no
+Mudlle threads: default LLJIT compiles on the calling thread, and the transform
+capture is scoped to its synchronous lookup. JIT modules remain resident for
+the process lifetime, as before.
+
+Run the focused checks after an LLVM build:
+
+```sh
+python3 regression/test-llvm-cache-abi.py
+python3 regression/test-llvm-cache.py
+```
+
+The integration driver covers fresh-process hits, linking the same descriptor
+twice, serialized modules loaded with different global orders, optimization
+invalidation, damaged entries, and unavailable/disabled caches. README records
+full-backend validation and measured cold/warm startup results.
 
 See the [LLVM LLJIT C API](https://llvm.org/docs/doxygen/group__LLVMCExecutionEngineLLJIT.html)
 and [object transform API](https://llvm.org/doxygen/Orc_8h_source.html).
-Saving optimized bitcode alone still requires machine-code generation.
-
-Before implementing persistent caching, handle load-time global offsets and
-`mudlle_module_<sequence>_` symbol names: both currently depend on process state.
-Either include the resolved mapping in the cache key (limiting reuse), or change
-global access to use a per-module mapping and give cached objects stable symbol
-identities with isolated namespaces. Constants already use the rooted closure
-environment rather than embedding GC addresses. Cache validity must include
-module content/constants layout, Mudlle runtime ABI, LLVM version, target
-triple, CPU/features, and optimization settings. Compare cold and warm compiler
-loads separately from compilation work. Keep execution single threaded. This
-cache is proposed follow-up work and is not implemented yet.
 
 ### Native parity contract
 

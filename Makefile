@@ -221,6 +221,22 @@ charset.$(OBJEXT): CFLAGS:=-Wno-invalid-source-encoding $(CFLAGS)
 .PHONY: all
 all: mudlle
 
+# Force recomputation so source contents and compiler flags define the cache ABI.
+.PHONY: FORCE_LLVM_CACHE_ABI
+FORCE_LLVM_CACHE_ABI:
+
+LLVM_CACHE_ABI_GENERATED := $(OBJDEP) $(BUILTINDEPS) genconstdefs.h \
+	parser.tab.h lexer.c runtime/mudllecst.c
+runtime/llvm-cache-abi.h: FORCE_LLVM_CACHE_ABI $(srcdir)runtime/llvm-cache-abi.py $(srcdir)Makefile $(LLVM_CACHE_ABI_GENERATED)
+	@echo "Creating $@"
+	$(Q)python3 $(srcdir)runtime/llvm-cache-abi.py \
+	    --source-dir "$(srcdir)" --makefile "$(srcdir)Makefile" \
+	    --cflags="$(CFLAGS)" --cppflags="$(CPPFLAGS)" --output "$@"
+
+# Dependency scanning includes llvm.c before the first object build.
+runtime/.depend: | runtime/llvm-cache-abi.h
+runtime/llvm.$(OBJEXT): runtime/llvm-cache-abi.h
+
 mudlle: $(OBJS)
 	@echo "Linking $@"
 	$(Q)$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)

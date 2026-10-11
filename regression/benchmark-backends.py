@@ -2,22 +2,58 @@
 """Measure compiled kernel execution and fresh compiler loads sequentially."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import resource
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 
 
-def measure(directory, optimization, workload):
+def build_provenance(directory):
+    executable = directory / "mudlle"
+    arch_file = directory / ".mudlle-arch"
+    abi_header = directory / "runtime" / "llvm-cache-abi.h"
+    abi_match = None
+    if abi_header.is_file():
+        match = re.search(
+            r'^#define MUDLLE_LLVM_CACHE_ABI "([0-9a-f]+)"$',
+            abi_header.read_text(encoding="ascii"), re.MULTILINE)
+        if match:
+            abi_match = match[1]
+    executable_hash = None
+    if executable.is_file():
+        hasher = hashlib.sha256()
+        with executable.open("rb") as binary:
+            for block in iter(lambda: binary.read(1024 * 1024), b""):
+                hasher.update(block)
+        executable_hash = hasher.hexdigest()
+    return {
+        "path": str(directory),
+        "mudlle_arch": arch_file.read_text(encoding="utf-8").strip()
+        if arch_file.is_file() else None,
+        "mudlle_sha256": executable_hash,
+        "llvm_cache_abi": abi_match,
+    }
+
+
+def measure(directory, optimization, workload, cache_directory=None):
     env = os.environ.copy()
     env.pop("MUDLLE_LLVM_OPT", None)
     if optimization is not None:
         env["MUDLLE_LLVM_OPT"] = optimization
+    if cache_directory is None:
+        env["MUDLLE_LLVM_CACHE"] = ""
+        env.pop("MUDLLE_LLVM_CACHE_TRACE", None)
+    else:
+        env["MUDLLE_LLVM_CACHE"] = str(cache_directory)
+        env["MUDLLE_LLVM_CACHE_TRACE"] = "1"
     command = ["./mudlle", "-c", "silent=true"]
     if workload == "kernel":
         command += ["-e", "xc.mud", "-e", "regression/benchmark.mud"]
@@ -37,6 +73,11 @@ def measure(directory, optimization, workload):
         "user_s": round(after.ru_utime - before.ru_utime, 6),
         "system_s": round(after.ru_stime - before.ru_stime, 6),
     }
+    if cache_directory is not None:
+        sample["cache_hits"] = len(re.findall(
+            r"^LLVM object cache hit$", result.stderr, re.MULTILINE))
+        sample["cache_misses"] = len(re.findall(
+            r"^LLVM object cache miss$", result.stderr, re.MULTILINE))
     # Mudlle can return zero after a load error; require workload completion.
     if result.returncode != 0:
         raise RuntimeError(result.stdout + result.stderr)
@@ -59,14 +100,20 @@ def main():
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")
+    x64_directory = args.x64.resolve()
+    llvm_directory = args.llvm.resolve()
     report = {"runs": args.runs, "kernel_iterations": 100_000_000,
               "compiler_load": "icxc.mud followed by checked eval(iadd(20,22))",
               "cache_state": "fresh processes; OS filesystem cache not flushed",
+              "host": {"platform": platform.platform(),
+                       "machine": platform.machine()},
+              "builds": {"x64": build_provenance(x64_directory),
+                         "llvm": build_provenance(llvm_directory)},
               "results": {}}
     for label, directory, optimization in [
-        ("x64", args.x64.resolve(), None),
-        ("llvm_O2", args.llvm.resolve(), "O2"),
-        ("llvm_none", args.llvm.resolve(), "none"),
+        ("x64", x64_directory, None),
+        ("llvm_O2", llvm_directory, "O2"),
+        ("llvm_none", llvm_directory, "none"),
     ]:
         workloads = {}
         for workload in ("kernel", "compiler_load"):
@@ -88,6 +135,41 @@ def main():
                             for key in metrics},
             }
         report["results"][label] = workloads
+
+    # Pair each cold-cache sample with a warm-cache measurement in its own
+    # temporary cache, so runs cannot inherit entries from earlier samples.
+    cached_workloads = {}
+    for workload in ("kernel", "compiler_load"):
+        miss_samples = []
+        hit_samples = []
+        for run in range(args.runs):
+            with tempfile.TemporaryDirectory(prefix="mudlle-llvm-cache-") as cache:
+                miss = measure(llvm_directory, "O2", workload, cache)
+                if miss["cache_misses"] < 1:
+                    raise RuntimeError(f"LLVM cache miss was not observed: {miss}")
+                # Explicitly prime immediately before timing the cache hit.
+                measure(llvm_directory, "O2", workload, cache)
+                hit = measure(llvm_directory, "O2", workload, cache)
+                if hit["cache_hits"] < 1 or hit["cache_misses"] != 0:
+                    raise RuntimeError(f"LLVM warm cache was not exclusively hit: {hit}")
+                if workload == "kernel":
+                    if miss["backend"] != "llvm" or hit["backend"] != "llvm":
+                        raise RuntimeError(f"{llvm_directory} is not an llvm build")
+                miss_samples.append(miss)
+                hit_samples.append(hit)
+                print(f"llvm_O2_cache_miss {workload} {run + 1}/{args.runs}: {miss}",
+                      file=sys.stderr, flush=True)
+                print(f"llvm_O2_cache_hit {workload} {run + 1}/{args.runs}: {hit}",
+                      file=sys.stderr, flush=True)
+        for suffix, samples in (("miss", miss_samples), ("hit", hit_samples)):
+            metrics = [key for key, value in samples[0].items()
+                       if isinstance(value, (int, float))]
+            cached_workloads.setdefault(f"llvm_O2_cache_{suffix}", {})[workload] = {
+                "samples": samples,
+                "medians": {key: statistics.median(s[key] for s in samples)
+                            for key in metrics},
+            }
+    report["results"].update(cached_workloads)
     print(json.dumps(report, indent=2))
 
 
