@@ -1509,6 +1509,26 @@ struct vector *try_alloc_vector(value *arguments, size_t entries,
   return vector;
 }
 
+/* Pair counterpart of try_alloc_vector: NULL without collecting if the
+   nursery cannot fit it, so unrooted car/cdr are safe on success. */
+struct list *try_alloc_list(value car, value cdr, bool readonly)
+{
+  ulong size = sizeof (struct obj) + 2 * sizeof (value);
+  if (!alloc_available(MUDLLE_ALIGN(size, sizeof(value))))
+    return NULL;
+  struct obj *obj = get_free_list(size);
+  if (obj == NULL)
+    obj = fast_gc_allocate(size);
+  struct list *p = (struct list *)initialize_allocated_obj(
+    obj, garbage_record, type_pair, size, 0);
+  p->car = car;
+  p->cdr = cdr;
+  if (readonly)
+    p->o.flags |= OBJ_READONLY
+      | (immutablep(car) && immutablep(cdr) ? OBJ_IMMUTABLE : 0);
+  return p;
+}
+
 struct grecord *alloc_record_noinit(
   enum garbage_type garbage_type, enum mudlle_type type, size_t entries)
 {

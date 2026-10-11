@@ -651,11 +651,15 @@ int64_t llvm_cons(int64_t raw_car, int64_t raw_cdr, int64_t readonly);
 int64_t llvm_cons(int64_t raw_car, int64_t raw_cdr, int64_t readonly)
 {
   value car = (value)(uintptr_t)raw_car, cdr = (value)(uintptr_t)raw_cdr;
-  struct list *p = alloc_list(car, cdr);
-  if (readonly)
+  struct list *p = try_alloc_list(car, cdr, readonly != 0);
+  if (p == NULL)
     {
-      unsigned imm = immutablep(car) && immutablep(cdr) ? OBJ_IMMUTABLE : 0;
-      p->o.flags |= OBJ_READONLY | imm;
+      p = alloc_list(car, cdr);
+      if (readonly)
+        {
+          unsigned imm = immutablep(car) && immutablep(cdr) ? OBJ_IMMUTABLE : 0;
+          p->o.flags |= OBJ_READONLY | imm;
+        }
     }
   return (int64_t)(uintptr_t)p;
 }

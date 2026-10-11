@@ -258,6 +258,8 @@ static ALWAYS_INLINE ulong record_size(ulong nentries)
 struct vector *try_alloc_vector(value *arguments, size_t entries,
                                 bool readonly, bool immutable);
 
+struct list *try_alloc_list(value car, value cdr, bool readonly);
+
 struct grecord *allocate_record(enum mudlle_type type, size_t entries);
 struct grecord *allocate_mtemp(enum mudlle_type type, size_t entries);
 
