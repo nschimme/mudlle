@@ -65,6 +65,8 @@ LLVM_HELPER struct gcpro *llvm_gc_roots_enter(value **slots, int64_t nslots,
 LLVM_HELPER void llvm_gc_roots_leave(struct gcpro *old_gcpro);
 LLVM_HELPER value llvm_call_value(value caller, value function, value *arguments,
                                   size_t nargs, int64_t secure_call);
+LLVM_HELPER value llvm_call_global_constant(int64_t offset, value caller,
+                                          value *arguments, int64_t nargs);
 LLVM_HELPER int64_t llvm_call_global(int64_t caller, int64_t name, value *arguments,
                                      int64_t nargs);
 LLVM_HELPER int64_t llvm_variable_new(int64_t value);

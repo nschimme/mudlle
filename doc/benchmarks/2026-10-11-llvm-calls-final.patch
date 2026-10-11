@@ -1,0 +1,301 @@
+--- a/runtime/llvm.c
++++ b/runtime/llvm.c
+@@ -201,6 +201,7 @@
+     LLVM_SYMBOL_ENTRY(llvm_gc_roots_leave),
+     LLVM_SYMBOL_ENTRY(llvm_call_value),
+     LLVM_SYMBOL_ENTRY(llvm_call_global),
++    LLVM_SYMBOL_ENTRY(llvm_call_global_constant),
+     LLVM_SYMBOL_ENTRY(llvm_variable_new),
+     LLVM_SYMBOL_ENTRY(llvm_variable_get),
+     LLVM_SYMBOL_ENTRY(llvm_variable_set),
+@@ -1013,6 +1014,26 @@
+   gcpro = old_gcpro;
+ }
+ 
++/* Call a fixed-arity primitive with its arguments passed by value, as callv()
++   does after copying them out of an argument vector. The caller has verified
++   callability, so nargs matches the primitive and no vector is allocated. */
++static value llvm_call_primitive(struct primitive *prim, const value *args,
++                                 size_t nargs)
++{
++  switch (nargs)
++    {
++    case 0: return ((op0_fn)prim->op->op)();
++#define __ARGV(N) args[DEC(N)]
++#define __PCALLOP(N)                                                    \
++    case N:                                                             \
++      return ((PRIMOPTYPE(N))prim->op->op)(CONCATCOMMA(N, __ARGV))
++    DOPRIMARGS(__PCALLOP, SEP_SEMI);
++#undef __PCALLOP
++#undef __ARGV
++    }
++  abort();
++}
++
+ /* Keep the allocating fallback out of the native call's C stack frame. */
+ static value llvm_call_fallback(value function, value *arguments, size_t nargs)
+ {
+@@ -1060,7 +1081,12 @@
+     callable(function, (long)nargs);
+   void *cbdata = NULL;
+   value result;
+-  if (TYPE(function, closure)
++  if (TYPE(function, primitive) || TYPE(function, secure))
++    /* The generated frame already roots the arguments, and a fixed-arity
++       primitive receives them by value: no argument vector is needed. */
++    result = llvm_call_primitive((struct primitive *)function, arguments,
++                                 nargs);
++  else if (TYPE(function, closure)
+       && mcallback_varargs_matches(function, llvm_call_closure, &cbdata))
+     result = llvm_invoke_closure(cbdata, function, arguments, nargs);
+   else
+@@ -1070,6 +1096,61 @@
+   return result;
+ }
+ 
++/* Call through a constant global without a generated root frame. Primitives
++   take their arguments by value and protect them themselves; every other
++   callee gets the arguments rooted in a C frame before it can collect. */
++value llvm_call_global_constant(int64_t offset, value caller, value *arguments,
++                                int64_t nargs)
++{
++  if (offset < 0 || (ulong)offset >= vector_len(global_names)
++      || nargs < 0 || nargs > MAX_FUNCTION_ARGS
++      || (nargs != 0 && arguments == NULL))
++    {
++      runtime_error(error_bad_value);
++      return NULL;
++    }
++  seclev_t caller_seclevel = llvm_caller_seclevel(caller);
++  value function = GVAR((ulong)offset);
++  seclev_t old_seclevel = internal_seclevel;
++  bool old_seclevel_valid = seclevel_valid;
++  set_seclevel(caller_seclevel);
++  llvm_check_callable(function, (long)nargs, caller_seclevel);
++  value result;
++  if (TYPE(function, primitive) || TYPE(function, secure))
++    {
++      for (int64_t i = 0; i < nargs; ++i)
++        GCCHECK(arguments[i]);
++      result = llvm_call_primitive((struct primitive *)function, arguments,
++                                   (size_t)nargs);
++    }
++  else
++    {
++      value rooted_args[nargs ? (size_t)nargs : 1];
++      value *slots[nargs ? (size_t)nargs : 1];
++      struct gcpro roots[nargs ? (size_t)nargs : 1];
++      for (int64_t i = 0; i < nargs; ++i)
++        {
++          rooted_args[i] = arguments[i];
++          slots[i] = &rooted_args[i];
++        }
++      struct gcpro *old_gcpro = llvm_gc_roots_enter(slots, nargs, roots);
++      void *cbdata = NULL;
++      if (TYPE(function, closure)
++          && mcallback_varargs_matches(function, llvm_call_closure, &cbdata))
++        result = llvm_invoke_closure(cbdata, function, rooted_args,
++                                     (size_t)nargs);
++      else
++        result = llvm_call_fallback(function, rooted_args, (size_t)nargs);
++      llvm_gc_roots_leave(old_gcpro);
++    }
++  set_seclevel(old_seclevel);
++  seclevel_valid = old_seclevel_valid;
++  return result;
++}
++
++enum llvm_compare_kind { compare_none, compare_lt, compare_le, compare_gt,
++                         compare_ge };
++
+ int64_t llvm_call_global(int64_t raw_caller, int64_t raw_name,
+                          value *arguments, int64_t nargs)
+ {
+@@ -1080,31 +1161,20 @@
+       || (nargs != 0 && arguments == NULL))
+     { runtime_error(error_bad_value); return (int64_t)(uintptr_t)NULL; }
+ 
+-  struct gcpro *old_gcpro = gcpro;
+-  struct gcpro name_root;
+-  GCPROV(name_root, name);
+-  value rooted_args[nargs ? (size_t)nargs : 1];
+-  struct gcpro argument_roots[nargs ? (size_t)nargs : 1];
+   bool has_float = false, has_bigint = false;
+   for (int64_t i = 0; i < nargs; ++i)
+     {
+-      rooted_args[i] = arguments[i];
+-      argument_roots[i] = (struct gcpro){
+-        .next = i == 0 ? &name_root : &argument_roots[i - 1],
+-        .obj = &rooted_args[i]
+-      };
+-      GCCHECK(rooted_args[i]);
+-      has_float |= TYPE(rooted_args[i], float);
+-      has_bigint |= TYPE(rooted_args[i], bigint);
++      GCCHECK(arguments[i]);
++      has_float |= TYPE(arguments[i], float);
++      has_bigint |= TYPE(arguments[i], bigint);
+     }
+-  if (nargs != 0) gcpro = &argument_roots[nargs - 1];
+ 
+   seclev_t old_seclevel = internal_seclevel;
+   bool old_seclevel_valid = seclevel_valid;
+   set_seclevel(caller_seclevel);
+   const char *name_text = ((struct string *)(uintptr_t)name)->str;
++  enum llvm_compare_kind compare = compare_none;
+   const char *resolved_name = name_text;
+-  bool compare = false;
+   if (strcmp(name_text, ".") == 0) resolved_name = "cons";
+   else if (strcmp(name_text, "set") == 0) resolved_name = "set!";
+   else if (strcmp(name_text, "i+") == 0) resolved_name = "iadd";
+@@ -1116,9 +1186,10 @@
+       else if (strcmp(name_text, "*") == 0) resolved_name = "fmul";
+       else if (strcmp(name_text, "/") == 0) resolved_name = "fdiv";
+       else if (strcmp(name_text, "%") == 0) resolved_name = "fmod";
+-      else if (strcmp(name_text, "<") == 0 || strcmp(name_text, "<=") == 0
+-               || strcmp(name_text, ">") == 0 || strcmp(name_text, ">=") == 0)
+-        { resolved_name = "fcmp"; compare = true; }
++      else if (strcmp(name_text, "<") == 0) { resolved_name = "fcmp"; compare = compare_lt; }
++      else if (strcmp(name_text, "<=") == 0) { resolved_name = "fcmp"; compare = compare_le; }
++      else if (strcmp(name_text, ">") == 0) { resolved_name = "fcmp"; compare = compare_gt; }
++      else if (strcmp(name_text, ">=") == 0) { resolved_name = "fcmp"; compare = compare_ge; }
+     }
+   else if (has_bigint)
+     {
+@@ -1128,33 +1199,57 @@
+       else if (strcmp(name_text, "*") == 0) resolved_name = "bimul";
+       else if (strcmp(name_text, "/") == 0) resolved_name = "bitdiv_q";
+       else if (strcmp(name_text, "%") == 0) resolved_name = "bitdiv_r";
+-      else if (strcmp(name_text, "<") == 0 || strcmp(name_text, "<=") == 0
+-               || strcmp(name_text, ">") == 0 || strcmp(name_text, ">=") == 0)
+-        { resolved_name = "bicmp"; compare = true; }
++      else if (strcmp(name_text, "<") == 0) { resolved_name = "bicmp"; compare = compare_lt; }
++      else if (strcmp(name_text, "<=") == 0) { resolved_name = "bicmp"; compare = compare_le; }
++      else if (strcmp(name_text, ">") == 0) { resolved_name = "bicmp"; compare = compare_gt; }
++      else if (strcmp(name_text, ">=") == 0) { resolved_name = "bicmp"; compare = compare_ge; }
+     }
+ 
++
+   value function = GVAR(global_lookup(resolved_name));
+-  struct gcpro function_root;
+-  GCPROV(function_root, function);
+-  struct vector *argv = alloc_vector((size_t)nargs);
+-  struct gcpro argv_root;
+-  GCPROV(argv_root, argv);
+-  for (int64_t i = 0; i < nargs; ++i) argv->data[i] = rooted_args[i];
+   llvm_check_callable(function, (long)nargs, caller_seclevel);
+-  value result = callv(function, argv);
++  value result;
++  if (TYPE(function, primitive) || TYPE(function, secure))
++    /* Nothing here allocates, so name and arguments need no roots. Primitives
++       protect their own parameters. */
++    result = llvm_call_primitive((struct primitive *)function, arguments,
++                                 (size_t)nargs);
++  else
++    {
++      struct gcpro *old_gcpro = gcpro;
++      struct gcpro function_root;
++      GCPROV(function_root, function);
++      value rooted_args[nargs ? (size_t)nargs : 1];
++      struct gcpro argument_roots[nargs ? (size_t)nargs : 1];
++      for (int64_t i = 0; i < nargs; ++i)
++        {
++          rooted_args[i] = arguments[i];
++          argument_roots[i] = (struct gcpro){
++            .next = i == 0 ? &function_root : &argument_roots[i - 1],
++            .obj = &rooted_args[i]
++          };
++        }
++      if (nargs != 0) gcpro = &argument_roots[nargs - 1];
++      struct vector *argv = alloc_vector((size_t)nargs);
++      struct gcpro argv_root;
++      GCPROV(argv_root, argv);
++      for (int64_t i = 0; i < nargs; ++i) argv->data[i] = rooted_args[i];
++      result = callv(function, argv);
++      gcpro = old_gcpro;
++    }
+   set_seclevel(old_seclevel);
+   seclevel_valid = old_seclevel_valid;
+-  if (compare)
++  if (compare != compare_none)
+     {
+       long relation = intval(result);
+-      /* The primitive call can move the rooted name string. */
+-      name_text = ((struct string *)name)->str;
+-      if (strcmp(name_text, "<") == 0) result = makebool(relation < 0);
+-      else if (strcmp(name_text, "<=") == 0) result = makebool(relation <= 0);
+-      else if (strcmp(name_text, ">") == 0) result = makebool(relation > 0);
+-      else result = makebool(relation >= 0);
++      switch (compare)
++        {
++        case compare_lt: result = makebool(relation < 0); break;
++        case compare_le: result = makebool(relation <= 0); break;
++        case compare_gt: result = makebool(relation > 0); break;
++        default: result = makebool(relation >= 0); break;
++        }
+     }
+-  gcpro = old_gcpro;
+   return (int64_t)(uintptr_t)result;
+ }
+ 
+@@ -1377,7 +1472,8 @@
+         "@llvm_global_read(i64 ",
+         "@llvm_check_global_read(i64 ",
+         "@llvm_global_write(i64 ",
+-        "@llvm_check_global_write(i64 "
++        "@llvm_check_global_write(i64 ",
++        "@llvm_call_global_constant(i64 "
+       };
+       struct strbuf output;
+       sb_init(&output);
+--- a/runtime/llvm.h
++++ b/runtime/llvm.h
+@@ -65,6 +65,8 @@
+ LLVM_HELPER void llvm_gc_roots_leave(struct gcpro *old_gcpro);
+ LLVM_HELPER value llvm_call_value(value caller, value function, value *arguments,
+                                   size_t nargs, int64_t secure_call);
++LLVM_HELPER value llvm_call_global_constant(int64_t offset, value caller,
++                                          value *arguments, int64_t nargs);
+ LLVM_HELPER int64_t llvm_call_global(int64_t caller, int64_t name, value *arguments,
+                                      int64_t nargs);
+ LLVM_HELPER int64_t llvm_variable_new(int64_t value);
+--- a/genllvm.mud
++++ b/genllvm.mud
+@@ -1896,6 +1896,28 @@
+           tmp_seq = tmp_seq + 1;
+           call_id = tmp_seq;
+           res = format("%%call_%d", call_id);
++          if (secure_call)
++            [
++              // A constant global callee is read by the runtime after the
++              // arguments are copied; primitives need no generated roots.
++              | copied |
++              copied = llvm_emit_copying_arguments(call_args, "gcall", w);
++              writer:format(w,
++                "  %s = call i64 @llvm_call_global_constant(i64 %d, i64 %s,\
++ ptr %s, i64 %d)\n",
++                res, fn_var[mc:v_goffset], llvm_read_env(w), copied[0],
++                copied[3]);
++              if (copied[3] != 0)
++                [
++                  if (!string_equal?(copied[2], "null"))
++                    writer:format(w, "  call void @llvm_gc_roots_leave(ptr %s)\n",
++                                  copied[2]);
++                  writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
++                                copied[1]);
++                ];
++              llvm_write_var(dest_var, res, w);
++              exit<function> null;
++            ];
+           [
+               root_count = arg_count + 1;
+               arg_array = format("%%call_values_%d", call_id);
+@@ -2123,6 +2145,9 @@
+  i64)\n");
+       writer:write_line(w,
+                         "declare i64 @llvm_call_global(i64, i64, ptr, i64)\n");
++      writer:write_line(w,
++                        "declare i64 @llvm_call_global_constant(i64, i64, ptr,\
++ i64)\n");
+       writer:write_line(w, "declare i64 @llvm_argument_get(ptr, i64, i64)\n");
+       writer:write_line(w, "declare i64 @llvm_make_varargs(ptr, i64, i64)\n");
+       writer:write_line(w, "declare void @llvm_check_arity(i64, i64, i64)\n");

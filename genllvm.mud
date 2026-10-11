@@ -1896,6 +1896,28 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
           tmp_seq = tmp_seq + 1;
           call_id = tmp_seq;
           res = format("%%call_%d", call_id);
+          if (secure_call)
+            [
+              // A constant global callee is read by the runtime after the
+              // arguments are copied; primitives need no generated roots.
+              | copied |
+              copied = llvm_emit_copying_arguments(call_args, "gcall", w);
+              writer:format(w,
+                "  %s = call i64 @llvm_call_global_constant(i64 %d, i64 %s,\
+ ptr %s, i64 %d)\n",
+                res, fn_var[mc:v_goffset], llvm_read_env(w), copied[0],
+                copied[3]);
+              if (copied[3] != 0)
+                [
+                  if (!string_equal?(copied[2], "null"))
+                    writer:format(w, "  call void @llvm_gc_roots_leave(ptr %s)\n",
+                                  copied[2]);
+                  writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
+                                copied[1]);
+                ];
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
           [
               root_count = arg_count + 1;
               arg_array = format("%%call_values_%d", call_id);
@@ -2123,6 +2145,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
  i64)\n");
       writer:write_line(w,
                         "declare i64 @llvm_call_global(i64, i64, ptr, i64)\n");
+      writer:write_line(w,
+                        "declare i64 @llvm_call_global_constant(i64, i64, ptr,\
+ i64)\n");
       writer:write_line(w, "declare i64 @llvm_argument_get(ptr, i64, i64)\n");
       writer:write_line(w, "declare i64 @llvm_make_varargs(ptr, i64, i64)\n");
       writer:write_line(w, "declare void @llvm_check_arity(i64, i64, i64)\n");

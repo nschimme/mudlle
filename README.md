@@ -759,6 +759,124 @@ or duplicate results. Require those checks; interpreter exit zero alone is
 insufficient. Benchmark construction and mechanical validation used Luna;
 measurements ran separately from compiler/bootstrap/cache validation.
 
+LLVM primitive and function call overhead
+-----------------------------------------
+
+Profiling the native list/vector conversion kernel on fresh e1831ce builds
+(`gcc -pg`; `perf` is denied by `perf_event_paranoid=4` and Valgrind stops on an
+unsupported instruction in `allocate_obj`) showed the cost in the call path,
+not in root slots: about 5.4M name-based `global_lookup` hash lookups, 11.6M
+`alloc_vector` argument vectors, 11.2M `callv` and 11.2M callability checks per
+run. Every non-inlined primitive reached `llvm_call_global` or
+`llvm_call_value`, which rooted the arguments again, allocated an argv vector
+and re-dispatched through `callv`. Explicit shadow roots and the GC ABI are
+unchanged. JIT code is not attributed by `gprof`.
+
+Three independent stages were built from e1831ce, each in its own archive, and
+measured with `benchmark-rich-backends.pl` (five fresh serial processes per
+backend, native cache disabled) against the same x64 build. CPU medians in ms
+(`doc/benchmarks/2026-10-11-llvm-calls-{base,s1,s2,s3}.json`):
+
+| Workload | e1831ce | S1 | S2 | S3 | x64 |
+|----------|---------|----|----|----|-----|
+| Floating point | 613 | 627 | 321 | 235 | 137 |
+| Bigint | 96 | 99 | 77 | 70 | 58 |
+| Mixed math | 83 | 89 | 60 | 56 | 41 |
+| Native conversions, width 32 | 237 | 209 | 184 | 177 | 22 |
+| Native conversions, width 257 | 288 | 253 | 234 | 213 | 34 |
+| Tables, 32 keys | 25 | 25 | 18 | 17 | 9 |
+| Tables, 257 keys | 27 | 28 | 20 | 19 | 11 |
+
+- **S1**: `llvm_call_global` calls a fixed-arity primitive directly with its
+  arguments passed by value (as `callv` does), instead of rooting a second
+  copy and allocating a vector. Small gain on native conversions only.
+- **S2**: the same direct dispatch in `llvm_call_value` for primitives and
+  secures. Roots stay in the generated frame. Largest single win for floats.
+- **S3**: calls whose callee is a constant global use
+  `llvm_call_global_constant(offset, caller, args, n)`, which reads the global
+  in C after the arguments are copied. No generated root frame or
+  `llvm_global_read` is emitted; primitives are called directly, other callees
+  get their arguments rooted in a C frame. The offset is the first argument so
+  the cache/load relocator (`@llvm_call_global_constant(i64 ` pattern) patches
+  it when a compiled object is loaded into a session with different global
+  offsets. (An earlier version had the offset second; the three-stage
+  bootstrap caught it at "bad function: expected function; got 1". S1-S3
+  stage measurements predate that argument reorder, which does not change the
+  work per call.)
+- **Rejected**: a direct-mapped cache of resolved builtin names (strcmp chain
+  and hash lookup) gave no float gain (592 vs 613) and only a small
+  native-conversion gain that stage S1 already provides. It was not kept.
+
+Final tree (S1+S2+S3) against x64, paired back-to-back runs alternating
+baseline and final LLVM against the same x64 build while the host was loaded by
+other VMs (x64 itself ran 10-25% slower than in the quiet staged runs). CPU
+medians in ms, two pairs (`2026-10-11-llvm-calls-paired-*.json`):
+
+| Workload | e1831ce LLVM | final LLVM | x64 |
+|----------|--------------|------------|-----|
+| Floating point | 607 / 683 | 285 / 267 | 148-184 |
+| Bigint | 113 / 114 | 88 / 85 | 64-71 |
+| Mixed math | 100 / 92 | 62 / 61 | 41-50 |
+| Native conversions, width 32 | 224 / 267 | 193 / 180 | 23-28 |
+| Native conversions, width 257 | 312 / 335 | 204 / 193 | 34-40 |
+| Tables, 32 keys | 29 / 33 | 18 / 17 | 10-11 |
+| Tables, 257 keys | 34 / 36 | 22 / 19 | 11-13 |
+
+LLVM remains slower than x64 on every one of these; the floating-point gap
+narrows from about 4x to about 1.7x, but native conversions are still roughly
+7x slower. No parity is claimed. Per-op overhead is still in the generated
+call sequence, `llvm_constant_get` for builtin names, and loop/type helpers;
+the remaining conversion deficit needs generator-level inlining of `pair?`,
+`make_vector`, `set_car!` and similar primitives, which depends on proving the
+constant global's identity at compile time (not done here).
+
+The vector benchmark is retained as a regression check
+(`2026-10-11-llvm-calls-roots-{base,final}.json`). Under the same load, final
+LLVM/x64 medians for 0/1/4/16 references are 126/126, 142/145, 157/237 and
+281/518 ms, so the vector allocation advantage is preserved.
+
+Reports record samples, checksums, host details and workload hashes;
+`2026-10-11-llvm-calls-provenance.json` records source and binary hashes for
+every stage, and `*-s1/s2/s3/final.patch` reproduce them on e1831ce.
+`2026-10-11-llvm-calls-medians.json` lists all medians and samples. Reproduce
+with fresh archives, serial runs, and no concurrent builds:
+
+    mkdir -p /tmp/mudlle-calls-base /tmp/mudlle-calls-final /tmp/mudlle-calls-x64
+    git archive e1831ce | tar -x -C /tmp/mudlle-calls-base
+    git archive e1831ce | tar -x -C /tmp/mudlle-calls-final
+    git archive e1831ce | tar -x -C /tmp/mudlle-calls-x64
+    patch -d /tmp/mudlle-calls-final -p1 \
+      < doc/benchmarks/2026-10-11-llvm-calls-final.patch
+    make -C /tmp/mudlle-calls-base USE_LLVM=yes -j4
+    make -C /tmp/mudlle-calls-final USE_LLVM=yes -j4
+    make -C /tmp/mudlle-calls-x64 -j4
+    for t in base final; do
+      perl regression/benchmark-rich-backends.pl --llvm /tmp/mudlle-calls-$t \
+        --x64 /tmp/mudlle-calls-x64 --runs 5 --output /tmp/calls-$t.json
+    done
+    perl regression/benchmark-llvm-roots.pl --llvm /tmp/mudlle-calls-final \
+      --x64 /tmp/mudlle-calls-x64 --runs 5 --output /tmp/calls-roots.json
+
+Profile with `make USE_LLVM=yes CC='gcc -pg'` in a separate archive as in the
+roots section above.
+
+Validation of the final tree (serial, after the offset-order fix): LLVM O2,
+LLVM `none` and a rebuilt x64 tree all reach the final `SUCCESS` line of
+`regression/all.mud` (which includes the moving-child, collection and
+error-unwinding regression); both cache test scripts pass (ten ABI checks; the
+integration script prints its pass line); the three-stage bootstrap
+(`MUDLLE_LLVM_OPT=none MUDLLE_LLVM_CACHE= make compiler USE_LLVM=yes`)
+completes through build2; the compiled loader suite reaches `SUCCESS` with
+`MUDLLE_LLVM_VERIFY_EACH=1` on a cold cache (4,437 misses, zero hits) and the
+warm repeat (4,437 hits, zero misses). `regression/llvm-call-diagnostics.mud`
+produces identical stdout and stderr (including error codes for non-pair,
+wrong arity, wrong operand and float/non-float compare cases) on e1831ce and
+final LLVM, as does `llvm-vector-diagnostics.mud`. Commands are the validation
+commands listed in the vector-guards section. Execution remains single
+threaded; no LLVM 14, ARM64 or RISC-V validation was performed. The profile and
+the stage-isolation/benchmark runs used a Claude subagent for mechanical build
+and measurement orchestration (no Luna tool was available).
+
 Contact Information
 -------------------
 

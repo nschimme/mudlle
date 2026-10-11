@@ -1,0 +1,74 @@
+{
+  "base_commit": "e1831ce",
+  "stages": {
+    "s1": {
+      "description": "call_global direct primitive dispatch",
+      "patch": "2026-10-11-llvm-calls-s1.patch",
+      "patch_sha256": "bd5921c7e44652ae1b2b53a3be51bd514da4a0e02d6d1f9f1bd48ee66830fa55",
+      "source_sha256": {
+        "runtime/llvm.c": "200ec9327166adb19db06c2354a328333b4151ef0a50fce76f1a98828187b2a9",
+        "runtime/llvm.h": "0e5336d0b6453f6dbb220443acdfc4f2ede56d8a5069c9f440680750a14818e6",
+        "genllvm.mud": "c37efad7b18e822fdced58796e49aef9c8cbd35ab05a3b0d1c42f6b1764f3fb3"
+      },
+      "mudlle_binary_sha256": "c9e63ced38c95521dec4c19ebe081b507803fecf1c5fa532bdeb28b0ad629941"
+    },
+    "s2": {
+      "description": "call_value direct primitive dispatch",
+      "patch": "2026-10-11-llvm-calls-s2.patch",
+      "patch_sha256": "84386c527298c55440f5e99dbeb0ea6dd923c12a438f225726ab60b1fb60867a",
+      "source_sha256": {
+        "runtime/llvm.c": "f7a4f2b0a28279eae434bda54b02d7fdcbe5403126c45e9137e602f1ad45d992",
+        "runtime/llvm.h": "0e5336d0b6453f6dbb220443acdfc4f2ede56d8a5069c9f440680750a14818e6",
+        "genllvm.mud": "c37efad7b18e822fdced58796e49aef9c8cbd35ab05a3b0d1c42f6b1764f3fb3"
+      },
+      "mudlle_binary_sha256": "714301f7bfac817f5844bfbcf1fd1a5a6d9de0cbb8b39361ffc4654ca9aea127"
+    },
+    "s3": {
+      "description": "constant-global call without generated roots",
+      "patch": "2026-10-11-llvm-calls-s3.patch",
+      "patch_sha256": "171522772556692fab27d3af8cf028db943c258317af8442215d838b25f5a8fb",
+      "source_sha256": {
+        "runtime/llvm.c": "b37d7a3880b0969acd6e03f7b879d0c9fcf6782b72b067489da6cd5295e3920f",
+        "runtime/llvm.h": "202c53a444ffe6aea60e8aef30ac17092e47c79387e7b0cee76f6d7c9ad1a0b9",
+        "genllvm.mud": "19da196a683dbcc105f781246045b9af3810afba548414bd1d3c0080eb3649d4"
+      },
+      "mudlle_binary_sha256": "7cedb1f1bc0eca60cd5331a92a84d485d5670b67697dc0512fadd8e457c2ed37"
+    },
+    "s4": {
+      "description": "builtin-name resolution cache (rejected)",
+      "patch": null,
+      "patch_sha256": "265d1371c8313ce615e2ceace0ad873f5efac50048c57acac33cce272039ca60",
+      "source_sha256": {
+        "runtime/llvm.c": "fc274a9a7a98d4cdaf9717d10c244bd82367cc725a9167d2f6336161ef9fd319",
+        "runtime/llvm.h": "0e5336d0b6453f6dbb220443acdfc4f2ede56d8a5069c9f440680750a14818e6",
+        "genllvm.mud": "c37efad7b18e822fdced58796e49aef9c8cbd35ab05a3b0d1c42f6b1764f3fb3"
+      },
+      "mudlle_binary_sha256": "e0a13a031697aec78d462657e67195d2d4cc823b23de98ecb164dda81c98418b"
+    },
+    "fin": {
+      "description": "final: s1+s2+s3",
+      "patch": "2026-10-11-llvm-calls-final.patch",
+      "patch_sha256": "60bf426a8ebd32d9f22b108a9c26a5fae32a6809ccf1ee066602be04516e74c9",
+      "source_sha256": {
+        "runtime/llvm.c": "6fe3db40e7791fd6621236122893cfab67aaec8c772f6c914533537d7e36909f",
+        "runtime/llvm.h": "cfccb0a2bf20d9664100c78178af8c94cec0f1ef273a3f169aa0cfcb94f37bb6",
+        "genllvm.mud": "dcbaf261b6cfc83fc457bc25d2feb0e6d4545cb48565f2c56427f9284ab93ad9"
+      },
+      "mudlle_binary_sha256": "4f8d5300453862958b8848101a727f5ceac6852a5a16bf3706d758b73f163ad0"
+    }
+  },
+  "baseline": {
+    "llvm_binary_sha256": "4e0e8462c69354ae5bdc2f9dbda41e828f83d392b18273e53a4ff15db5e1f922",
+    "x64_binary_sha256": "a04080a4359c65a3e01452f56cb424641763a161d2eb5bd8f7d7422724be2e78",
+    "source_sha256": {
+      "runtime/llvm.c": "429143199a3029c715f7e2c7215a63f58aa51307c07dde3c209f418d41b88bbe",
+      "runtime/llvm.h": "0e5336d0b6453f6dbb220443acdfc4f2ede56d8a5069c9f440680750a14818e6",
+      "genllvm.mud": "c37efad7b18e822fdced58796e49aef9c8cbd35ab05a3b0d1c42f6b1764f3fb3"
+    }
+  },
+  "final_tree_matches_repo": {
+    "runtime/llvm.c": true,
+    "runtime/llvm.h": true,
+    "genllvm.mud": true
+  }
+}

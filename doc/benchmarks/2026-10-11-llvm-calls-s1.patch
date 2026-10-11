@@ -1,0 +1,157 @@
+--- a/runtime/llvm.c
++++ b/runtime/llvm.c
+@@ -1070,6 +1070,29 @@
+   return result;
+ }
+ 
++enum llvm_compare_kind { compare_none, compare_lt, compare_le, compare_gt,
++                         compare_ge };
++
++/* Call a fixed-arity primitive with its arguments passed by value, as callv()
++   does after copying them out of an argument vector. The caller has verified
++   callability, so nargs matches the primitive and no vector is allocated. */
++static value llvm_call_primitive(struct primitive *prim, const value *args,
++                                 size_t nargs)
++{
++  switch (nargs)
++    {
++    case 0: return ((op0_fn)prim->op->op)();
++#define __ARGV(N) args[DEC(N)]
++#define __PCALLOP(N)                                                    \
++    case N:                                                             \
++      return ((PRIMOPTYPE(N))prim->op->op)(CONCATCOMMA(N, __ARGV))
++    DOPRIMARGS(__PCALLOP, SEP_SEMI);
++#undef __PCALLOP
++#undef __ARGV
++    }
++  abort();
++}
++
+ int64_t llvm_call_global(int64_t raw_caller, int64_t raw_name,
+                          value *arguments, int64_t nargs)
+ {
+@@ -1080,31 +1103,20 @@
+       || (nargs != 0 && arguments == NULL))
+     { runtime_error(error_bad_value); return (int64_t)(uintptr_t)NULL; }
+ 
+-  struct gcpro *old_gcpro = gcpro;
+-  struct gcpro name_root;
+-  GCPROV(name_root, name);
+-  value rooted_args[nargs ? (size_t)nargs : 1];
+-  struct gcpro argument_roots[nargs ? (size_t)nargs : 1];
+   bool has_float = false, has_bigint = false;
+   for (int64_t i = 0; i < nargs; ++i)
+     {
+-      rooted_args[i] = arguments[i];
+-      argument_roots[i] = (struct gcpro){
+-        .next = i == 0 ? &name_root : &argument_roots[i - 1],
+-        .obj = &rooted_args[i]
+-      };
+-      GCCHECK(rooted_args[i]);
+-      has_float |= TYPE(rooted_args[i], float);
+-      has_bigint |= TYPE(rooted_args[i], bigint);
++      GCCHECK(arguments[i]);
++      has_float |= TYPE(arguments[i], float);
++      has_bigint |= TYPE(arguments[i], bigint);
+     }
+-  if (nargs != 0) gcpro = &argument_roots[nargs - 1];
+ 
+   seclev_t old_seclevel = internal_seclevel;
+   bool old_seclevel_valid = seclevel_valid;
+   set_seclevel(caller_seclevel);
+   const char *name_text = ((struct string *)(uintptr_t)name)->str;
+   const char *resolved_name = name_text;
+-  bool compare = false;
++  enum llvm_compare_kind compare = compare_none;
+   if (strcmp(name_text, ".") == 0) resolved_name = "cons";
+   else if (strcmp(name_text, "set") == 0) resolved_name = "set!";
+   else if (strcmp(name_text, "i+") == 0) resolved_name = "iadd";
+@@ -1116,9 +1128,10 @@
+       else if (strcmp(name_text, "*") == 0) resolved_name = "fmul";
+       else if (strcmp(name_text, "/") == 0) resolved_name = "fdiv";
+       else if (strcmp(name_text, "%") == 0) resolved_name = "fmod";
+-      else if (strcmp(name_text, "<") == 0 || strcmp(name_text, "<=") == 0
+-               || strcmp(name_text, ">") == 0 || strcmp(name_text, ">=") == 0)
+-        { resolved_name = "fcmp"; compare = true; }
++      else if (strcmp(name_text, "<") == 0) { resolved_name = "fcmp"; compare = compare_lt; }
++      else if (strcmp(name_text, "<=") == 0) { resolved_name = "fcmp"; compare = compare_le; }
++      else if (strcmp(name_text, ">") == 0) { resolved_name = "fcmp"; compare = compare_gt; }
++      else if (strcmp(name_text, ">=") == 0) { resolved_name = "fcmp"; compare = compare_ge; }
+     }
+   else if (has_bigint)
+     {
+@@ -1128,33 +1141,56 @@
+       else if (strcmp(name_text, "*") == 0) resolved_name = "bimul";
+       else if (strcmp(name_text, "/") == 0) resolved_name = "bitdiv_q";
+       else if (strcmp(name_text, "%") == 0) resolved_name = "bitdiv_r";
+-      else if (strcmp(name_text, "<") == 0 || strcmp(name_text, "<=") == 0
+-               || strcmp(name_text, ">") == 0 || strcmp(name_text, ">=") == 0)
+-        { resolved_name = "bicmp"; compare = true; }
++      else if (strcmp(name_text, "<") == 0) { resolved_name = "bicmp"; compare = compare_lt; }
++      else if (strcmp(name_text, "<=") == 0) { resolved_name = "bicmp"; compare = compare_le; }
++      else if (strcmp(name_text, ">") == 0) { resolved_name = "bicmp"; compare = compare_gt; }
++      else if (strcmp(name_text, ">=") == 0) { resolved_name = "bicmp"; compare = compare_ge; }
+     }
+ 
+   value function = GVAR(global_lookup(resolved_name));
+-  struct gcpro function_root;
+-  GCPROV(function_root, function);
+-  struct vector *argv = alloc_vector((size_t)nargs);
+-  struct gcpro argv_root;
+-  GCPROV(argv_root, argv);
+-  for (int64_t i = 0; i < nargs; ++i) argv->data[i] = rooted_args[i];
+   llvm_check_callable(function, (long)nargs, caller_seclevel);
+-  value result = callv(function, argv);
++  value result;
++  if (TYPE(function, primitive) || TYPE(function, secure))
++    /* Nothing here allocates, so name and arguments need no roots. Primitives
++       protect their own parameters. */
++    result = llvm_call_primitive((struct primitive *)function, arguments,
++                                 (size_t)nargs);
++  else
++    {
++      struct gcpro *old_gcpro = gcpro;
++      struct gcpro function_root;
++      GCPROV(function_root, function);
++      value rooted_args[nargs ? (size_t)nargs : 1];
++      struct gcpro argument_roots[nargs ? (size_t)nargs : 1];
++      for (int64_t i = 0; i < nargs; ++i)
++        {
++          rooted_args[i] = arguments[i];
++          argument_roots[i] = (struct gcpro){
++            .next = i == 0 ? &function_root : &argument_roots[i - 1],
++            .obj = &rooted_args[i]
++          };
++        }
++      if (nargs != 0) gcpro = &argument_roots[nargs - 1];
++      struct vector *argv = alloc_vector((size_t)nargs);
++      struct gcpro argv_root;
++      GCPROV(argv_root, argv);
++      for (int64_t i = 0; i < nargs; ++i) argv->data[i] = rooted_args[i];
++      result = callv(function, argv);
++      gcpro = old_gcpro;
++    }
+   set_seclevel(old_seclevel);
+   seclevel_valid = old_seclevel_valid;
+-  if (compare)
++  if (compare != compare_none)
+     {
+       long relation = intval(result);
+-      /* The primitive call can move the rooted name string. */
+-      name_text = ((struct string *)name)->str;
+-      if (strcmp(name_text, "<") == 0) result = makebool(relation < 0);
+-      else if (strcmp(name_text, "<=") == 0) result = makebool(relation <= 0);
+-      else if (strcmp(name_text, ">") == 0) result = makebool(relation > 0);
+-      else result = makebool(relation >= 0);
++      switch (compare)
++        {
++        case compare_lt: result = makebool(relation < 0); break;
++        case compare_le: result = makebool(relation <= 0); break;
++        case compare_gt: result = makebool(relation > 0); break;
++        default: result = makebool(relation >= 0); break;
++        }
+     }
+-  gcpro = old_gcpro;
+   return (int64_t)(uintptr_t)result;
+ }
+ 
