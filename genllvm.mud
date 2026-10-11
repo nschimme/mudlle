@@ -1992,7 +1992,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
             arg_array, arg_ptr, arg_index, stack_mark, root_count,
             root_slots, root_records, root_token, root_slot_ptr,
             root_slots_data, root_records_data, arg_count,
-            arg_slot, root_index, call_id, secure_call |
+            arg_slot, root_index, call_id, secure_call, floatop, floatres |
           dest_var = ins[mc:i_cdest];
           call_args = ins[mc:i_cargs];
           fn_var = car(call_args);
@@ -2010,6 +2010,37 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
             [
               llvm_write_var(dest_var, llvm_emit_set(call_args, w), w);
               exit<function> null;
+            ];
+          floatop = if (secure_call && arg_count == 2
+                        && !lexists?(fn (v) v[mc:v_class] == mc:v_function,
+                                     call_args))
+            [
+              | nm |
+              nm = fn_var[mc:v_name];
+              if (string_equal?(nm, "fadd")) 0
+              else if (string_equal?(nm, "fsub")) 1
+              else if (string_equal?(nm, "fmul")) 2
+              else if (string_equal?(nm, "fdiv")) 3
+              else -1
+            ]
+          else -1;
+          if (floatop >= 0)
+            [
+              // Direct float arithmetic; non-numeric operands fall through
+              // to the generic call so errors are unchanged.
+              | fa, fb, fid |
+              fa = llvm_read_var(car(call_args), w);
+              fb = llvm_read_var(cadr(call_args), w);
+              fid = call_id;
+              floatres = format("%%fl_fast_%d", fid);
+              writer:format(w, "  br label %%fl_start_%d\nfl_start_%d:\n",
+                            fid, fid);
+              writer:format(w,
+                "  %s = call i64 @llvm_float_binop(i64 %d, i64 %s, i64 %s)\n",
+                floatres, floatop, fa, fb);
+              writer:format(w,
+                "  %%fl_ok_%d = icmp ne i64 %s, 0\n  br i1 %%fl_ok_%d, label %%fl_join_%d, label %%fl_slow_%d\nfl_slow_%d:\n",
+                fid, floatres, fid, fid, fid, fid);
             ];
           if (secure_call)
             [
@@ -2029,6 +2060,13 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                                   copied[2]);
                   writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
                                 copied[1]);
+                ];
+              if (floatop >= 0)
+                [
+                  writer:format(w,
+                    "  br label %%fl_join_%d\nfl_join_%d:\n  %%fl_res_%d = phi i64 [ %s, %%fl_start_%d ], [ %s, %%fl_slow_%d ]\n",
+                    call_id, call_id, call_id, floatres, call_id, res, call_id);
+                  res = format("%%fl_res_%d", call_id);
                 ];
               llvm_write_var(dest_var, res, w);
               exit<function> null;
@@ -2425,6 +2463,7 @@ done:
       writer:write_line(w, "declare i32 @llvm_vector_find(i64, i64)\n");
       writer:write_line(w, "declare i64 @llvm_pair_car(i64)\n");
       writer:write_line(w, "declare i64 @llvm_cons(i64, i64, i64)\n");
+      writer:write_line(w, "declare i64 @llvm_float_binop(i64, i64, i64)\n");
       writer:write_line(w, "declare i64 @llvm_pair_cdr(i64)\n");
       writer:write_line(w, "declare i32 @llvm_equal(i64, i64)\n");
       writer:write_line(w, "declare ptr @llvm_gc_roots_enter(ptr, i64, ptr)\n");

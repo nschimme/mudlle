@@ -188,6 +188,7 @@ static void llvm_orc_register_absolute_symbols(LLVMOrcJITDylibRef dylib)
     LLVM_SYMBOL_ENTRY(llvm_pair_car),
     LLVM_SYMBOL_ENTRY(llvm_pair_cdr),
     LLVM_SYMBOL_ENTRY(llvm_cons),
+    LLVM_SYMBOL_ENTRY(llvm_float_binop),
     LLVM_SYMBOL_ENTRY(llvm_equal),
     LLVM_SYMBOL_ENTRY(llvm_build_vector),
     LLVM_SYMBOL_ENTRY(llvm_concat_strings),
@@ -662,6 +663,33 @@ int64_t llvm_cons(int64_t raw_car, int64_t raw_cdr, int64_t readonly)
         }
     }
   return (int64_t)(uintptr_t)p;
+}
+
+/* fadd/fsub/fmul/fdiv on floats and fixnums. Returns 0 for anything else so
+   the generic call reports the usual type error. The operands are read
+   before the result is allocated, so nothing needs rooting. */
+int64_t llvm_float_binop(int64_t op, int64_t raw_a, int64_t raw_b);
+
+int64_t llvm_float_binop(int64_t op, int64_t raw_a, int64_t raw_b)
+{
+  value a = (value)(uintptr_t)raw_a, b = (value)(uintptr_t)raw_b;
+  double x, y;
+  if (TYPE(a, float)) x = ((struct mudlle_float *)a)->d;
+  else if (integerp(a)) x = intval(a);
+  else return 0;
+  if (TYPE(b, float)) y = ((struct mudlle_float *)b)->d;
+  else if (integerp(b)) y = intval(b);
+  else return 0;
+  double r;
+  switch (op)
+    {
+    case 0: r = x + y; break;
+    case 1: r = x - y; break;
+    case 2: r = x * y; break;
+    case 3: r = x / y; break;
+    default: return 0;
+    }
+  return (int64_t)(uintptr_t)alloc_float(r);
 }
 
 int32_t llvm_predicate(int64_t raw_value, int64_t predicate)
