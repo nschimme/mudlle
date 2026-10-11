@@ -166,7 +166,7 @@ these stages. All compilation remains on the calling thread.
 Reproduce the serial pipeline comparison (fresh processes, cache disabled):
 
     make USE_LLVM=yes
-    python3 regression/benchmark-llvm-pipelines.py --llvm . --runs 3 \
+    perl regression/benchmark-llvm-pipelines.pl --llvm . --runs 3 \
       --timing --output /tmp/mudlle-llvm-pipelines.json
 
 The runner checks compiler-load evaluation and the 100-million-iteration
@@ -278,11 +278,11 @@ Reproduce kernel/cache measurements on Apple Silicon after building with
 Homebrew Bison, Flex, and LLVM:
 
     make clean && make USE_LLVM=yes
-    python3 regression/benchmark-backends.py --arm64 . --runs 3 --kernel-only
+    perl regression/benchmark-backends.pl --arm64 . --runs 3 --kernel-only
 Run the focused checks after an LLVM build:
 
-    python3 regression/test-llvm-cache-abi.py
-    python3 regression/test-llvm-cache.py
+    perl regression/test-llvm-cache-abi.pl
+    perl regression/test-llvm-cache.pl
 
 For full LLVM validation, run each loader twice with the same cache directory
 and require the final `SUCCESS` sentinel (exit zero alone is insufficient):

@@ -75,8 +75,8 @@ the process lifetime, as before.
 Run the focused checks after an LLVM build:
 
 ```sh
-python3 regression/test-llvm-cache-abi.py
-python3 regression/test-llvm-cache.py
+perl regression/test-llvm-cache-abi.pl
+perl regression/test-llvm-cache.pl
 ```
 
 The integration driver covers fresh-process hits, linking the same descriptor

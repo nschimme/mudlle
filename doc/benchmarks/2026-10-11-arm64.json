@@ -189,6 +189,6 @@
       2.79,
       2.77
     ],
-    "timing_method": "cache rows via /usr/bin/time -p (2-decimal precision); others via regression/measure-llvm-bootstrap.py"
+    "timing_method": "cache rows via /usr/bin/time -p (2-decimal precision); others via regression/measure-llvm-bootstrap.pl"
   }
 }
