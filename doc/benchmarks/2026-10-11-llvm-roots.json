@@ -1,0 +1,701 @@
+{
+  "build_commands": {
+    "llvm": "make USE_LLVM=yes -j4",
+    "x64": "make -j4"
+  },
+  "builds": {
+    "llvm": {
+      "mudlle_arch": "amd64-llvm",
+      "path": "/tmp/mudlle-roots-llvm",
+      "sha256": {
+        "/tmp/mudlle-roots-llvm/alloc.c": "29bc504325df32e73ad23939062c87a7f74dec228b35204e2a5c5616aed6f077",
+        "/tmp/mudlle-roots-llvm/alloc.h": "7f567b4ad32a851abe7c34d89890a7dfa57470d8ed29240055cf0114b8d09c31",
+        "/tmp/mudlle-roots-llvm/genllvm.mud": "7322ee715157f49e8bc2de18889256acc1de38e65211d8bfb2257907abc8361f",
+        "/tmp/mudlle-roots-llvm/mudlle": "85255d0a08c1ca1478e10510e20d65e872b141e3306cf753c1f4a10689bc8881",
+        "/tmp/mudlle-roots-llvm/regression/benchmark-llvm-roots.mud": "cb2d7ab85b520c17035a2f0e1299f9df7258122e35c221ded0c20482a9125eca",
+        "/tmp/mudlle-roots-llvm/runtime/llvm.c": "a2ca9c5abdab271c9be9a7438ed1a74f7d3ab3b42b911a9ec15bc34deffaea18",
+        "/tmp/mudlle-roots-llvm/runtime/llvm.h": "0e5336d0b6453f6dbb220443acdfc4f2ede56d8a5069c9f440680750a14818e6"
+      }
+    },
+    "x64": {
+      "mudlle_arch": "amd64-x64",
+      "path": "/tmp/mudlle-roots-x64",
+      "sha256": {
+        "/tmp/mudlle-roots-x64/alloc.c": "29bc504325df32e73ad23939062c87a7f74dec228b35204e2a5c5616aed6f077",
+        "/tmp/mudlle-roots-x64/alloc.h": "7f567b4ad32a851abe7c34d89890a7dfa57470d8ed29240055cf0114b8d09c31",
+        "/tmp/mudlle-roots-x64/genllvm.mud": "7322ee715157f49e8bc2de18889256acc1de38e65211d8bfb2257907abc8361f",
+        "/tmp/mudlle-roots-x64/mudlle": "57255ca37bc935cb45cd37c48ccd82b42f771f719c2aceaa74e3615472f3ad92",
+        "/tmp/mudlle-roots-x64/regression/benchmark-llvm-roots.mud": "cb2d7ab85b520c17035a2f0e1299f9df7258122e35c221ded0c20482a9125eca",
+        "/tmp/mudlle-roots-x64/runtime/llvm.c": "a2ca9c5abdab271c9be9a7438ed1a74f7d3ab3b42b911a9ec15bc34deffaea18",
+        "/tmp/mudlle-roots-x64/runtime/llvm.h": "0e5336d0b6453f6dbb220443acdfc4f2ede56d8a5069c9f440680750a14818e6"
+      }
+    }
+  },
+  "cache_state": "fresh serial processes; LLVM object cache disabled; OS filesystem cache not flushed",
+  "host": {
+    "machine": "x86_64",
+    "platform": "Linux-7.0.14-22-pve-x86_64"
+  },
+  "interpretation": "Controls match reference reads and accumulation. Allocation cases additionally construct a four-integer vector each loop. Differences include allocator, collection, and generated-code effects; they do not isolate a single GC-root cost.",
+  "limitations": [
+    "No CPU affinity or filesystem cache flush",
+    "perf denied by host perf_event_paranoid=4",
+    "Control loops do not allocate on their successful path but retain shadow roots for generic arithmetic/indexing fallback paths",
+    "Compile and link outside kernel CPU timers; measurements serial, separate from validation",
+    "Identity mode tests non-nullness; it is an overhead probe, not a moving-GC correctness test"
+  ],
+  "mode": "default",
+  "reproduction_runner_sha256": "8292ab18f5ae3617d70e8172245791fdfb43833d55970de92c048ceac7f13b4f",
+  "results": {
+    "llvm": {
+      "medians": {
+        "scalar-live-roots-0_cpu_ms": 7,
+        "scalar-live-roots-16_cpu_ms": 364,
+        "scalar-live-roots-1_cpu_ms": 26,
+        "scalar-live-roots-4_cpu_ms": 91,
+        "scalar-noalloc_cpu_ms": 5,
+        "vector-alloc-live-roots-0_cpu_ms": 205,
+        "vector-alloc-live-roots-16_cpu_ms": 647,
+        "vector-alloc-live-roots-1_cpu_ms": 240,
+        "vector-alloc-live-roots-4_cpu_ms": 304,
+        "wall_s": 2.355107
+      },
+      "samples": [
+        {
+          "wall_s": 2.38039,
+          "workloads": {
+            "scalar-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 7,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 24,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 362,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 91,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-noalloc": {
+              "checksum": 4999995000000,
+              "cpu_ms": 5,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 201,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 226,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 694,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 328,
+              "loops": 10,
+              "work": 1000000
+            }
+          }
+        },
+        {
+          "wall_s": 2.355107,
+          "workloads": {
+            "scalar-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 7,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 29,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 379,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 91,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-noalloc": {
+              "checksum": 4999995000000,
+              "cpu_ms": 6,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 203,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 240,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 614,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 311,
+              "loops": 10,
+              "work": 1000000
+            }
+          }
+        },
+        {
+          "wall_s": 2.338726,
+          "workloads": {
+            "scalar-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 6,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 26,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 364,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 92,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-noalloc": {
+              "checksum": 4999995000000,
+              "cpu_ms": 6,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 222,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 231,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 647,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 300,
+              "loops": 10,
+              "work": 1000000
+            }
+          }
+        },
+        {
+          "wall_s": 2.381088,
+          "workloads": {
+            "scalar-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 8,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 30,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 376,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 96,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-noalloc": {
+              "checksum": 4999995000000,
+              "cpu_ms": 5,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 212,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 248,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 658,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 304,
+              "loops": 10,
+              "work": 1000000
+            }
+          }
+        },
+        {
+          "wall_s": 2.24195,
+          "workloads": {
+            "scalar-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 7,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 25,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 354,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 89,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-noalloc": {
+              "checksum": 4999995000000,
+              "cpu_ms": 5,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 205,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 241,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 585,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 302,
+              "loops": 10,
+              "work": 1000000
+            }
+          }
+        }
+      ]
+    },
+    "x64": {
+      "medians": {
+        "scalar-live-roots-0_cpu_ms": 13,
+        "scalar-live-roots-16_cpu_ms": 368,
+        "scalar-live-roots-1_cpu_ms": 24,
+        "scalar-live-roots-4_cpu_ms": 92,
+        "scalar-noalloc_cpu_ms": 9,
+        "vector-alloc-live-roots-0_cpu_ms": 117,
+        "vector-alloc-live-roots-16_cpu_ms": 505,
+        "vector-alloc-live-roots-1_cpu_ms": 144,
+        "vector-alloc-live-roots-4_cpu_ms": 211,
+        "wall_s": 1.722453
+      },
+      "samples": [
+        {
+          "wall_s": 1.733933,
+          "workloads": {
+            "scalar-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 17,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 28,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 352,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 97,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-noalloc": {
+              "checksum": 4999995000000,
+              "cpu_ms": 13,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 128,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 144,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 505,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 211,
+              "loops": 10,
+              "work": 1000000
+            }
+          }
+        },
+        {
+          "wall_s": 1.722453,
+          "workloads": {
+            "scalar-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 13,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 27,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 381,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 92,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-noalloc": {
+              "checksum": 4999995000000,
+              "cpu_ms": 8,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 116,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 138,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 505,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 209,
+              "loops": 10,
+              "work": 1000000
+            }
+          }
+        },
+        {
+          "wall_s": 1.737409,
+          "workloads": {
+            "scalar-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 14,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 24,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 363,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 91,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-noalloc": {
+              "checksum": 4999995000000,
+              "cpu_ms": 9,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 117,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 144,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 506,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 235,
+              "loops": 10,
+              "work": 1000000
+            }
+          }
+        },
+        {
+          "wall_s": 1.720113,
+          "workloads": {
+            "scalar-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 12,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 24,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 368,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 90,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-noalloc": {
+              "checksum": 4999995000000,
+              "cpu_ms": 9,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 137,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 144,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 495,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 200,
+              "loops": 10,
+              "work": 1000000
+            }
+          }
+        },
+        {
+          "wall_s": 1.691122,
+          "workloads": {
+            "scalar-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 11,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 24,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 373,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 99,
+              "loops": 10,
+              "work": 1000000
+            },
+            "scalar-noalloc": {
+              "checksum": 4999995000000,
+              "cpu_ms": 8,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-0": {
+              "checksum": 10000000000000,
+              "cpu_ms": 112,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-1": {
+              "checksum": 10000010000000,
+              "cpu_ms": 134,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-16": {
+              "checksum": 10001360000000,
+              "cpu_ms": 482,
+              "loops": 10,
+              "work": 1000000
+            },
+            "vector-alloc-live-roots-4": {
+              "checksum": 10000100000000,
+              "cpu_ms": 216,
+              "loops": 10,
+              "work": 1000000
+            }
+          }
+        }
+      ]
+    }
+  },
+  "runs": 5,
+  "source_commit": "31f766228a6adf58dacd52fbccfd3d7f513bd0cf",
+  "toolchain": {
+    "cpu": "AMD Ryzen 9 7940HS",
+    "gcc": "14.2.0",
+    "llvm": "19.1.7"
+  },
+  "transform_sha256": "a6894febcf123a2176fdbf5171f6d95fa75a309949b8041d9a754886a7dbf4ca",
+  "workload_parameters": {
+    "allocation_count_per_allocating_workload": 10000000,
+    "iterations_per_kernel": 1000000,
+    "timed_calls": 10
+  },
+  "workload_source_sha256": {
+    "llvm": "cb2d7ab85b520c17035a2f0e1299f9df7258122e35c221ded0c20482a9125eca",
+    "x64": "cb2d7ab85b520c17035a2f0e1299f9df7258122e35c221ded0c20482a9125eca"
+  },
+  "workloads": [
+    "scalar-noalloc",
+    "scalar-live-roots-0",
+    "vector-alloc-live-roots-0",
+    "scalar-live-roots-1",
+    "vector-alloc-live-roots-1",
+    "scalar-live-roots-4",
+    "vector-alloc-live-roots-4",
+    "scalar-live-roots-16",
+    "vector-alloc-live-roots-16"
+  ]
+}

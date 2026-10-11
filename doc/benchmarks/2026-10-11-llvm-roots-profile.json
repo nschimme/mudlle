@@ -1,0 +1,375 @@
+{
+  "decision": "Defer statepoints: controlled identity workload does not show root-slot traffic as the dominant remaining cost. No runtime/generator/ABI or thread changes.",
+  "gprof": {
+    "build_command": "make USE_LLVM=yes CC=\"gcc -pg\" -j4 (fresh archive); omit USE_LLVM=yes for x64",
+    "builds": {
+      "llvm": {
+        "binary_sha256": "5b8001a6ec221443ab59f059117d7e0158f156aa9bc3aa5758a29999ef8f7ced",
+        "root_enter_self_seconds": 0.0,
+        "self_time_nonzero": [
+          {
+            "name": "llvm_type_matches",
+            "self_seconds": 0.78
+          },
+          {
+            "name": "llvm_check_typeset",
+            "self_seconds": 0.17
+          },
+          {
+            "name": "minor_forward_immutablep",
+            "self_seconds": 0.11
+          },
+          {
+            "name": "_init",
+            "self_seconds": 0.1
+          },
+          {
+            "name": "alloc_record_noinit",
+            "self_seconds": 0.07
+          },
+          {
+            "name": "llvm_finish_vector",
+            "self_seconds": 0.07
+          },
+          {
+            "name": "gccheck_qdebug",
+            "self_seconds": 0.05
+          },
+          {
+            "name": "llvm_build_vector",
+            "self_seconds": 0.05
+          },
+          {
+            "name": "gc_allocate",
+            "self_seconds": 0.04
+          },
+          {
+            "name": "garbage_collect",
+            "self_seconds": 0.04
+          },
+          {
+            "name": "module_vstatus",
+            "self_seconds": 0.01
+          },
+          {
+            "name": "peephole",
+            "self_seconds": 0.01
+          },
+          {
+            "name": "llvm_cache_capture_object",
+            "self_seconds": 0.01
+          }
+        ],
+        "workload_sha256": "cb2d7ab85b520c17035a2f0e1299f9df7258122e35c221ded0c20482a9125eca"
+      },
+      "x64": {
+        "binary_sha256": "93768801073f923c6b14136795f46a74bb312b60af273c3efead59dd18c03bf4",
+        "root_enter_self_seconds": null,
+        "self_time_nonzero": [
+          {
+            "name": "bref",
+            "self_seconds": 0.41
+          },
+          {
+            "name": "bvref",
+            "self_seconds": 0.28
+          },
+          {
+            "name": "bsref",
+            "self_seconds": 0.18
+          },
+          {
+            "name": "minor_forward_immutablep",
+            "self_seconds": 0.07
+          },
+          {
+            "name": "garbage_collect",
+            "self_seconds": 0.04
+          },
+          {
+            "name": "alloc_bytes",
+            "self_seconds": 0.04
+          },
+          {
+            "name": "gccheck_qdebug",
+            "self_seconds": 0.03
+          },
+          {
+            "name": "bbitref",
+            "self_seconds": 0.02
+          },
+          {
+            "name": "bvarargs",
+            "self_seconds": 0.02
+          },
+          {
+            "name": "allocate",
+            "self_seconds": 0.01
+          },
+          {
+            "name": "ins1",
+            "self_seconds": 0.01
+          },
+          {
+            "name": "env_lookup",
+            "self_seconds": 0.01
+          },
+          {
+            "name": "prim_vswap",
+            "self_seconds": 0.01
+          }
+        ],
+        "workload_sha256": "cb2d7ab85b520c17035a2f0e1299f9df7258122e35c221ded0c20482a9125eca"
+      }
+    },
+    "sample_seconds": 0.01,
+    "scope": "whole process; instrumented executable text only; dynamic JIT code and libLLVM are not attributed. Instrumentation changes timing. Percentages are NOT fractions of total process CPU, and call counts from JIT entries are incomplete."
+  },
+  "ir": {
+    "default": {
+      "files": {
+        "benchmark-llvm-roots-0.mud.opt.ll": {
+          "fn_1_published_slots": 4,
+          "fn_1_slot_loads_static_including_exit_paths": 7,
+          "fn_1_type_match_calls_static_including_exit_paths": 2,
+          "sha256": "56199cc43cdca77c4057b50e3904d2ba1e8dde9f8f0308e7a83e36578ed42238"
+        },
+        "benchmark-llvm-roots-1.mud.opt.ll": {
+          "fn_1_published_slots": 6,
+          "fn_1_slot_loads_static_including_exit_paths": 21,
+          "fn_1_type_match_calls_static_including_exit_paths": 6,
+          "sha256": "3d900687f0aac035dd3c8c7bc1a569250ad41f41ef95de35bcc0efa13217a8f8"
+        },
+        "benchmark-llvm-roots-16.mud.opt.ll": {
+          "fn_1_published_slots": 36,
+          "fn_1_slot_loads_static_including_exit_paths": 96,
+          "fn_1_type_match_calls_static_including_exit_paths": 36,
+          "sha256": "2230277f368836f8642fe1494f7b53c00ddd4d557f49d7efc38c4e6e664743d4"
+        },
+        "benchmark-llvm-roots-4.mud.opt.ll": {
+          "fn_1_published_slots": 12,
+          "fn_1_slot_loads_static_including_exit_paths": 36,
+          "fn_1_type_match_calls_static_including_exit_paths": 12,
+          "sha256": "5831e93cd246b4705e90e94ffaa5b33ac256bc936f24f47fcea47cca271b662a"
+        },
+        "benchmark-llvm-roots-control-0.mud.opt.ll": {
+          "fn_1_published_slots": 0,
+          "fn_1_slot_loads_static_including_exit_paths": 0,
+          "fn_1_type_match_calls_static_including_exit_paths": 0,
+          "sha256": "69dde40a330fdb27cff0cfe75e2405980598016c7cc1fb33e2a8ec3f5bc6b454"
+        },
+        "benchmark-llvm-roots-control-1.mud.opt.ll": {
+          "fn_1_published_slots": 4,
+          "fn_1_slot_loads_static_including_exit_paths": 5,
+          "fn_1_type_match_calls_static_including_exit_paths": 1,
+          "sha256": "569b0356f5878cf63907366048ef7b7eaf531a40a6fabd1efeee458c49c77fe4"
+        },
+        "benchmark-llvm-roots-control-16.mud.opt.ll": {
+          "fn_1_published_slots": 34,
+          "fn_1_slot_loads_static_including_exit_paths": 50,
+          "fn_1_type_match_calls_static_including_exit_paths": 16,
+          "sha256": "cbab0a09c77ddc54dfbfb48acd70192981743d9ada5789e30ea574ec48b9244e"
+        },
+        "benchmark-llvm-roots-control-4.mud.opt.ll": {
+          "fn_1_published_slots": 10,
+          "fn_1_slot_loads_static_including_exit_paths": 14,
+          "fn_1_type_match_calls_static_including_exit_paths": 4,
+          "sha256": "6f00a88873665c7a3ff19558bccef8a335b70599cabb2dc90dbc81a1d3129a0c"
+        },
+        "benchmark-llvm-roots-scalar.mud.opt.ll": {
+          "fn_1_published_slots": 0,
+          "fn_1_slot_loads_static_including_exit_paths": 0,
+          "fn_1_type_match_calls_static_including_exit_paths": 0,
+          "sha256": "1514a97da4b7495d1570c4ba026a0f4d0f442bd5defc567b56dd8ec737ab8dfa"
+        }
+      },
+      "native_objects": [
+        {
+          "file": "native-001.o",
+          "sha256": "199dc0744c856c395761a894a6c2e2524ded1a073c4ac9201a81ac5bc3976635"
+        },
+        {
+          "file": "native-002.o",
+          "sha256": "4bf25b090a29fda727e5203a2e1ae848a8e6bc8f1c25aa00a6dca18f38a50e82"
+        },
+        {
+          "file": "native-003.o",
+          "sha256": "39b6213150fab385cad2b45fe52b4fcd59902c76dfdb48aa31561b669ce745ba"
+        },
+        {
+          "file": "native-004.o",
+          "sha256": "cfa407ca8f07046e7300c954b51d171fb693d3b17dd1b23fc62af2307b214047"
+        },
+        {
+          "file": "native-005.o",
+          "sha256": "05b96cf045ea2d0705323aed8c0070687faad85ca5246fd754a629d93f2501fe"
+        },
+        {
+          "file": "native-006.o",
+          "sha256": "30b16cf1b016d95b6831b1494f3ab604a118b11e2d005d87ae891a0743f65fcd"
+        },
+        {
+          "file": "native-007.o",
+          "sha256": "bbea012c8d4c2176d70c9f97d85aff136d07a9be42b4f04e477c4b710ff3a40f"
+        },
+        {
+          "file": "native-008.o",
+          "sha256": "5c6fcea39a745414ba4d7ef78e2d04bceeee822def25bff18fdcfc2b9c69fea9"
+        },
+        {
+          "file": "native-009.o",
+          "sha256": "a07231e0a9f6d041d4a7b1aaa4aecbfc7a05efe65af7829dfac0d47cb129e527"
+        }
+      ],
+      "pipeline": "opt-19 -passes=default<O2> -mtriple=x86_64-pc-linux-gnu (not host CPU tuned); native objects separately captured from ORC"
+    },
+    "identity-only": {
+      "files": {
+        "benchmark-llvm-roots-0.mud.opt.ll": {
+          "fn_1_published_slots": 4,
+          "fn_1_slot_loads_static_including_exit_paths": 7,
+          "fn_1_type_match_calls_static_including_exit_paths": 2,
+          "sha256": "2cd46da43d31546906b47394b6096823749db53621f311281eb10cb218c8635a"
+        },
+        "benchmark-llvm-roots-1.mud.opt.ll": {
+          "fn_1_published_slots": 5,
+          "fn_1_slot_loads_static_including_exit_paths": 18,
+          "fn_1_type_match_calls_static_including_exit_paths": 4,
+          "sha256": "1a490043a1aa14cffe9eb35cb78e5f8a8ac0a1e763e79eed245beed90f4a33c1"
+        },
+        "benchmark-llvm-roots-16.mud.opt.ll": {
+          "fn_1_published_slots": 20,
+          "fn_1_slot_loads_static_including_exit_paths": 48,
+          "fn_1_type_match_calls_static_including_exit_paths": 4,
+          "sha256": "7e5cdecd458960bae08ae3b5a1da0a6c609f45c4f91d24b3e64a020dcde85ade"
+        },
+        "benchmark-llvm-roots-4.mud.opt.ll": {
+          "fn_1_published_slots": 8,
+          "fn_1_slot_loads_static_including_exit_paths": 24,
+          "fn_1_type_match_calls_static_including_exit_paths": 4,
+          "sha256": "d7539deb37335b7b0ddc0f3611421f87e8b6bdb403acc058081459e6fb9034c2"
+        },
+        "benchmark-llvm-roots-control-0.mud.opt.ll": {
+          "fn_1_published_slots": 0,
+          "fn_1_slot_loads_static_including_exit_paths": 0,
+          "fn_1_type_match_calls_static_including_exit_paths": 0,
+          "sha256": "e3561e559042e797a242d5085f12dac5721a4286023d7b9d9ca46efd8665becd"
+        },
+        "benchmark-llvm-roots-control-1.mud.opt.ll": {
+          "fn_1_published_slots": 3,
+          "fn_1_slot_loads_static_including_exit_paths": 3,
+          "fn_1_type_match_calls_static_including_exit_paths": 0,
+          "sha256": "3fb3d55b284ddb349bbb5bc44b9f6a2845e4b103c9cd5940e8caf41070379ddf"
+        },
+        "benchmark-llvm-roots-control-16.mud.opt.ll": {
+          "fn_1_published_slots": 18,
+          "fn_1_slot_loads_static_including_exit_paths": 18,
+          "fn_1_type_match_calls_static_including_exit_paths": 0,
+          "sha256": "c78feb458b78b0850306dceac63ea8dd2b3f944b7a404f55c852dc8a4ad3c4c4"
+        },
+        "benchmark-llvm-roots-control-4.mud.opt.ll": {
+          "fn_1_published_slots": 6,
+          "fn_1_slot_loads_static_including_exit_paths": 6,
+          "fn_1_type_match_calls_static_including_exit_paths": 0,
+          "sha256": "63742027ec13b489820046a5676a517b124154cdf60dbfd9ffd0d4dad8401651"
+        },
+        "benchmark-llvm-roots-scalar.mud.opt.ll": {
+          "fn_1_published_slots": 0,
+          "fn_1_slot_loads_static_including_exit_paths": 0,
+          "fn_1_type_match_calls_static_including_exit_paths": 0,
+          "sha256": "4818a30f4a8211b8a7a906c56ff193fde1cc7ee5125cce024d886709d85578eb"
+        }
+      },
+      "native_objects": [
+        {
+          "file": "native-001.o",
+          "sha256": "bc654fa69923131986b3d1139a51f6e23ef5c8a0609eaf09fe4bff4104dcb078"
+        },
+        {
+          "file": "native-002.o",
+          "sha256": "e7664e87a34fb6a38aaf0793b9ade65984ec1145cf3db79f608d3b67319e4c3f"
+        },
+        {
+          "file": "native-003.o",
+          "sha256": "2d4c9486243707dd01e3ec9f88fc646d9f48238e0a111c40ffe90dfc7e05739c"
+        },
+        {
+          "file": "native-004.o",
+          "sha256": "bbea012c8d4c2176d70c9f97d85aff136d07a9be42b4f04e477c4b710ff3a40f"
+        },
+        {
+          "file": "native-005.o",
+          "sha256": "5c6fcea39a745414ba4d7ef78e2d04bceeee822def25bff18fdcfc2b9c69fea9"
+        },
+        {
+          "file": "native-006.o",
+          "sha256": "2653d10b6649dd883f092d542316acdc7eeff8aaf1d055d55f3ddea11381aff1"
+        },
+        {
+          "file": "native-007.o",
+          "sha256": "a07231e0a9f6d041d4a7b1aaa4aecbfc7a05efe65af7829dfac0d47cb129e527"
+        },
+        {
+          "file": "native-008.o",
+          "sha256": "6810b055629a8c649021072fa1b6994a7b2785c5e94cae450c7bc265ce1a2b2b"
+        },
+        {
+          "file": "native-009.o",
+          "sha256": "bb7fe3c14bdbeed5c8423c31969eb19e91eb140d3fb4ac3f4de9505c9d6d8fe3"
+        }
+      ],
+      "pipeline": "opt-19 -passes=default<O2> -mtriple=x86_64-pc-linux-gnu (not host CPU tuned); native objects separately captured from ORC"
+    }
+  },
+  "native_identity_16_confirmation": {
+    "disassembly_sha256": "dbcaa3eb4237d4d8909110e698a94f35478c113530cda5e5c6b12b1e38fbd6a8",
+    "object": "native-008.o",
+    "registration": "mov $0x14,%esi; call llvm_gc_roots_enter"
+  },
+  "perf": {
+    "available": false,
+    "outside_sandbox_retry": "also denied",
+    "perf_event_paranoid": 4
+  },
+  "reproduction_inspector_sha256": "f4d75661b4ff5d2ab9a1455250e1d0ab30223e7a9777d83fc3ca712c4c817d08",
+  "source_commit": "31f766228a6adf58dacd52fbccfd3d7f513bd0cf",
+  "validation": {
+    "llvm_cache_abi": {
+      "final_lines": [
+        "ok 8 - generated header is excluded from fingerprint",
+        "ok 9 - header has the expected form",
+        "ok 10 - regeneration preserves mtime when content is unchanged",
+        "1..10"
+      ],
+      "log_sha256": "0d2ac1fe26eb557ad5cb5880cad021b7e6d3639e8ad1a59c672948d05abf8b78",
+      "result": "10/10 pass"
+    },
+    "llvm_cache_integration": {
+      "final_lines": [
+        "LLVM native object cache integration tests passed"
+      ],
+      "log_sha256": "084c475003875d4aa2ec6506eaad4c80cc1a904f6fdaae6b943fdf90a93a5112",
+      "result": "pass"
+    },
+    "llvm_source_all": {
+      "final_lines": [
+        "LLVM restricted symbol resolution test passed",
+        "ALL LLVM & ASMWRITER TESTS PASSED SUCCESSFULLY",
+        "LLVM_FAST_PATHS_OK",
+        "SUCCESS"
+      ],
+      "log_sha256": "d2f148b7be8817a74ee11dcb7856a1caae378d9a84c127085c85b1044a36803e",
+      "result": "SUCCESS"
+    },
+    "x64_source_all": {
+      "final_lines": [
+        "function5 passed",
+        "function6 passed",
+        "function7 passed",
+        "SUCCESS"
+      ],
+      "log_sha256": "0be178ee9532cf195131e8598f2be2ce07532b6e567bc82aca87b16a5ba68fcc",
+      "result": "SUCCESS"
+    }
+  }
+}

@@ -73,6 +73,44 @@ a possible larger optimization after profiling shows root-slot traffic is the
 dominant remaining cost; no statepoint speedup has been measured. The guarded
 allocation path addresses repeated C argument-root setup independently.
 
+### Allocation/root-slot profile at 31f7662
+
+The continuation's controlled probes do not justify replacing shadow roots
+with statepoints yet. In five serial LLVM 19/x64 samples, the ten-million-vector
+workload is slower under LLVM even with zero incoming heap references (205 vs
+117 ms). When growing element reads are replaced with non-null identity checks,
+LLVM allocation medians are 242/216/249/245 ms for 0/1/4/16 incoming references.
+The sixteen-reference identity case retains 20 published roots and loop-body
+root reloads; the zero-reference case retains four roots. No clear allocation
+scaling with additional root slots is visible in that probe.
+
+The element-read probe has 36 published slots at sixteen references, including
+potential heap-valued element temporaries. Its nonallocating successful-path
+control still publishes 34 slots for fallback safety and performs close to x64.
+Whole-function publication is distinct from per-iteration root-frame setup;
+these loops register once per native invocation. Scalar slots remain promotable
+where the existing liveness/type analysis proves them private.
+
+A separate instrumented C profile points to type helpers and allocator/debug
+checks, but cannot measure generated-code root-load time: `perf` is denied by
+the host and gprof does not attribute dynamic JIT code. Absence of sampled root
+registration time is not proof that root slots are free. Likewise, control
+subtraction is not pure root cost, and the identity probe is not a GC test.
+
+Retain the moving-GC shadow-stack ABI, C roots, synchronous ORC loading/cache
+path, and longjmp root restoration. No prototype or runtime changes accompany
+this profile. Before a future statepoint experiment, obtain JIT-aware samples
+or another controlled measurement demonstrating a material root-slot bottleneck.
+The managed-pointer/stack-map/cache-hit/unwinding requirements above still apply;
+LLVM statepoints still require spilling live values at collecting calls.
+
+README records full samples, limitations, validation scope and Linux commands.
+`regression/benchmark-llvm-roots.pl --identity-only` generates the identity
+variant without modifying either source checkout. The inspection driver exports
+IR and actual ORC cache objects for both modes. It uses the normal
+`mc:compile`/`mc:linkrun` path and requires successful result checks before
+accepting artifacts.
+
 ### SIMD and automatic vectorization
 
 The runtime already enables loop vectorization, loop interleaving and SLP

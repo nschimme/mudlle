@@ -430,6 +430,122 @@ the cold run. Run both cache scripts listed above. Copy the updated
 `xc.mud`. Benchmark report validation entries record commands, final sentinels,
 exit statuses, cache counts and log hashes.
 
+LLVM allocation and root-slot profiling continuation (31f7662)
+-------------------------------------------------------------
+
+Fresh LLVM 19.1.7 and x64 builds from `31f7662` were measured serially on the
+same Ryzen 9 7940HS / GCC 14.2.0 Linux host. Each kernel is compiled and linked
+before its CPU timer starts. Five fresh, cache-disabled processes per backend
+run ten calls of one million iterations per case. Allocating cases construct
+the same four-integer vector every iteration and consume its elements; paired
+controls compute those integers directly. Both validate accumulated results.
+The 1/4/16-reference cases also retain distinct heap vectors across allocation.
+
+CPU medians, in milliseconds for ten million iterations:
+
+| Incoming heap references | LLVM control | LLVM allocation | x64 control | x64 allocation |
+|--------------------------|--------------|-----------------|-------------|----------------|
+| 0 | 7 | 205 | 13 | 117 |
+| 1 | 26 | 240 | 24 | 144 |
+| 4 | 91 | 304 | 92 | 211 |
+| 16 | 364 | 647 | 368 | 505 |
+
+Controls perform the same reference element reads and accumulation. They do
+not allocate on the successful path, but retain conservative shadow roots for
+arithmetic/indexing fallbacks. Allocation-minus-control includes allocation,
+collection, scratch indexing, type checks, and optimizer effects; it is not an
+isolated root-slot cost. Most of the LLVM deficit is already present with zero
+incoming heap references. Root-heavy controls are close to x64 in this mode.
+
+A second mode replaces each reference element read with a non-null identity
+comparison yielding the same integer. It removes the growing element-read/type
+checking work while keeping heap references live across allocation. This is an
+overhead probe, not a moving-GC correctness test. Its CPU medians are:
+
+| Incoming heap references | LLVM control | LLVM allocation | x64 control | x64 allocation |
+|--------------------------|--------------|-----------------|-------------|----------------|
+| 0 | 8 | 242 | 12 | 123 |
+| 1 | 9 | 216 | 15 | 124 |
+| 4 | 16 | 249 | 32 | 124 |
+| 16 | 42 | 245 | 112 | 202 |
+
+The LLVM allocating identity case has no clear increase from zero to sixteen
+incoming references. O2 IR confirms that the sixteen-reference case publishes
+20 roots and reloads references inside the loop, compared with four published
+roots in the zero-reference allocation case. Registration is at function entry,
+not on every loop iteration. With element reads instead, the corresponding
+frames contain 36 and four roots; loaded element temporaries can also be
+potential heap values. Cache-captured native disassembly confirms the 20-root
+registration and the out-of-line allocation/type helpers.
+
+Hardware `perf` counters and sampling were denied by the host's
+`perf_event_paranoid=4`, including an outside-sandbox retry. Separate `gcc -pg`
+builds provide a limited C profile: LLVM type helpers account for 0.95 s of
+1.51 s attributed to executable text; root registration has zero sampled self
+time at 10 ms resolution. The x64 profile attributes much of its executable
+text time to indexing builtins. These whole-process instrumented profiles omit
+dynamic JIT code/libLLVM attribution, distort timing, and have incomplete JIT
+call counts. They cannot assign a percentage of total CPU to root loads.
+
+Decision: keep explicit roots and defer a statepoint prototype. These probes
+do not establish root-slot traffic as the dominant remaining allocation cost.
+Investigate the common vector allocation/scratch access/type-helper path next;
+repeat profiling on a host allowing JIT-aware sampling before replacing the GC
+ABI. No runtime, generator, cache format, error-unwinding, or threading changes
+were made. No statepoint speedup or broader backend parity is claimed.
+
+Reports include individual samples, source/binary hashes and toolchain details:
+`doc/benchmarks/2026-10-11-llvm-roots.json`,
+`doc/benchmarks/2026-10-11-llvm-root-slots.json`, and
+`doc/benchmarks/2026-10-11-llvm-roots-profile.json`. No CPU affinity or filesystem
+cache flush was used; differences of a few milliseconds are within sample
+variation. Measurements were separate from validation.
+
+Reproduce using fresh directories (the archive preserves the exact runtime
+baseline, while the current benchmark is copied into each):
+
+    mkdir -p /tmp/mudlle-roots-llvm /tmp/mudlle-roots-x64
+    git archive 31f7662 | tar -x -C /tmp/mudlle-roots-llvm
+    git archive 31f7662 | tar -x -C /tmp/mudlle-roots-x64
+    make -C /tmp/mudlle-roots-llvm USE_LLVM=yes -j4
+    make -C /tmp/mudlle-roots-x64 -j4
+    cp regression/benchmark-llvm-roots.mud /tmp/mudlle-roots-llvm/regression/
+    cp regression/benchmark-llvm-roots.mud /tmp/mudlle-roots-x64/regression/
+    perl regression/benchmark-llvm-roots.pl \
+      --llvm /tmp/mudlle-roots-llvm --x64 /tmp/mudlle-roots-x64 \
+      --runs 5 --output /tmp/mudlle-roots.json
+    perl regression/benchmark-llvm-roots.pl --identity-only \
+      --llvm /tmp/mudlle-roots-llvm --x64 /tmp/mudlle-roots-x64 \
+      --runs 5 --output /tmp/mudlle-root-slots.json
+    perl regression/inspect-llvm-roots.pl \
+      --llvm /tmp/mudlle-roots-llvm --output /tmp/mudlle-roots-inspect
+    perl regression/inspect-llvm-roots.pl --identity-only \
+      --llvm /tmp/mudlle-roots-llvm --output /tmp/mudlle-root-slots-inspect
+
+The inspector writes emitted/O2 IR, a fresh private native cache, extracted
+relocatable objects, and `objdump -dr` output. It requires `opt-19`, `llvm-config`
+and `objdump`; set `LLVM_OPT` to select a matching alternative optimizer. The
+standalone O2 IR uses the host triple, while cached objects use ORC's host CPU
+settings. Use distinct output directories for different inspection modes.
+
+For C profiling, create another fresh archive, build with
+`make USE_LLVM=yes CC='gcc -pg' -j4`, copy the benchmark as above, and run:
+
+    cd /tmp/mudlle-roots-gprof
+    MUDLLE_LLVM_CACHE= MUDLLE_LLVM_OPT=O2 \
+      ./mudlle -c 'silent=true' -e xc.mud -e regression/benchmark-llvm-roots.mud
+    gprof ./mudlle gmon.out > profile.txt
+
+For x64 omit `USE_LLVM=yes` in its separate fresh build. Do not use instrumented
+CPU timings as ordinary benchmark samples.
+
+Validation of the baseline used here: both fresh builds' complete source
+`regression/all.mud` suites reach `SUCCESS`; LLVM's cache ABI tests pass all ten
+checks and its native-cache integration script passes. This includes the shared
+moving-child/collection/error-unwinding regression. The runtime remains single
+threaded. This profiling-only change does not repeat compiler bootstrap,
+compiled-loader suites, LLVM 14, ARM64, or RISC-V validation.
+
 Contact Information
 -------------------
 
