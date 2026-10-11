@@ -42,7 +42,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
     llvm_check_comparison_types, llvm_check_typed_integer_args,
     llvm_args_immutable?,
     llvm_emit_vector, llvm_emit_concat, llvm_emit_builtin,
-    llvm_emit_binary_builtin, llvm_emit_ref,
+    llvm_emit_binary_builtin, llvm_emit_ref, llvm_emit_set,
     llvm_read_var_storage, llvm_read_env,
     llvm_emit_rooted_arguments, llvm_emit_copying_arguments,
     llvm_constant_values, llvm_global_relocation_values,
@@ -968,6 +968,90 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       result
     ];
 
+  llvm_emit_set = fn (args, w)
+    [
+      | array, index, id, type_ok, tag, int_ok, valid, object, size,
+        bytes, length, raw_index, negative, from_end, normalized, in_bounds,
+        data, address, fast, slow, result, check_label, load_label,
+        slow_label, join_label, masked, newval, flagptr, flags, ro, rw_label |
+      if (lexists?(fn (v) v[mc:v_class] == mc:v_function, args))
+        exit<function> llvm_emit_builtin(mc:b_set, args, w);
+      array = llvm_read_var(car(args), w);
+      index = llvm_read_var(cadr(args), w);
+      newval = llvm_read_var(caddr(args), w);
+      tmp_seq = tmp_seq + 1;
+      id = tmp_seq;
+      type_ok = format("%%vs_type_%d", id);
+      tag = format("%%vs_tag_%d", id);
+      int_ok = format("%%vs_int_%d", id);
+      valid = format("%%vs_valid_%d", id);
+      check_label = format("vs_check_%d", id);
+      load_label = format("vs_load_%d", id);
+      slow_label = format("vs_slow_%d", id);
+      join_label = format("vs_join_%d", id);
+      writer:format(w, "  %s = call i32 @mudlle_vector_matches(i64 %s)\n",
+                    type_ok, array);
+      writer:format(w, "  %s = icmp ne i32 %s, 0\n", valid, type_ok);
+      writer:format(w, "  %s = and i64 %s, 1\n", tag, index);
+      writer:format(w, "  %s = icmp eq i64 %s, 1\n", int_ok, tag);
+      type_ok = format("%%vs_both_%d", id);
+      writer:format(w, "  %s = and i1 %s, %s\n", type_ok, valid, int_ok);
+      writer:format(w, "  br i1 %s, label %%%s, label %%%s\n",
+                    type_ok, check_label, slow_label);
+      writer:format(w, "%s:\n", check_label);
+      object = format("%%vs_object_%d", id);
+      size = format("%%vs_size_%d", id);
+      bytes = format("%%vs_bytes_%d", id);
+      length = format("%%vs_length_%d", id);
+      raw_index = format("%%vs_index_%d", id);
+      negative = format("%%vs_negative_%d", id);
+      from_end = format("%%vs_from_end_%d", id);
+      normalized = format("%%vs_normalized_%d", id);
+      in_bounds = format("%%vs_bounds_%d", id);
+      writer:format(w, "  %s = inttoptr i64 %s to ptr\n", object, array);
+      writer:format(w, "  %s = load i64, ptr %s, align 8\n", size, object);
+      writer:format(w, "  %s = sub i64 %s, 16\n", bytes, size);
+      writer:format(w, "  %s = lshr i64 %s, 3\n", length, bytes);
+      writer:format(w, "  %s = ashr i64 %s, 1\n", raw_index, index);
+      writer:format(w, "  %s = icmp slt i64 %s, 0\n", negative, raw_index);
+      writer:format(w, "  %s = add i64 %s, %s\n", from_end, raw_index, length);
+      writer:format(w, "  %s = select i1 %s, i64 %s, i64 %s\n",
+                    normalized, negative, from_end, raw_index);
+      writer:format(w, "  %s = icmp ult i64 %s, %s\n",
+                    in_bounds, normalized, length);
+      flagptr = format("%%vs_flagptr_%d", id);
+      flags = format("%%vs_flags_%d", id);
+      ro = format("%%vs_ro_%d", id);
+      rw_label = format("vs_rw_%d", id);
+      writer:format(w, "  br i1 %s, label %%%s, label %%%s\n",
+                    in_bounds, rw_label, slow_label);
+      writer:format(w, "%s:\n", rw_label);
+      writer:format(w, "  %s = getelementptr i8, ptr %s, i64 10\n", flagptr, object);
+      writer:format(w, "  %s = load i16, ptr %s, align 2\n", flags, flagptr);
+      masked = format("%%vs_masked_%d", id);
+      writer:format(w, "  %s = and i16 %s, 1\n", masked, flags);
+      writer:format(w, "  %s = icmp eq i16 %s, 0\n", ro, masked);
+      writer:format(w, "  br i1 %s, label %%%s, label %%%s\n",
+                    ro, load_label, slow_label);
+      writer:format(w, "%s:\n", load_label);
+      data = format("%%vs_data_%d", id);
+      address = format("%%vs_address_%d", id);
+      fast = format("%%vs_fast_value_%d", id);
+      writer:format(w, "  %s = getelementptr i8, ptr %s, i64 16\n", data, object);
+      writer:format(w, "  %s = getelementptr i64, ptr %s, i64 %s\n",
+                    address, data, normalized);
+      writer:format(w, "  store i64 %s, ptr %s, align 8\n", newval, address);
+      writer:format(w, "  br label %%%s\n", join_label);
+      writer:format(w, "%s:\n", slow_label);
+      slow = llvm_emit_builtin(mc:b_set, args, w);
+      writer:format(w, "  br label %%%s\n", join_label);
+      writer:format(w, "%s:\n", join_label);
+      result = format("%%vs_result_%d", id);
+      writer:format(w, "  %s = phi i64 [ %s, %%%s ], [ %s, %%%s ]\n",
+                    result, newval, load_label, slow, slow_label);
+      result
+    ];
+
   llvm:mgen_preamble = fn (ifn, ainfo)
     [
       | fname, args, vars_seen, root_vars_seen, add_var, w, code, root_vars,
@@ -1601,6 +1685,11 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
           if (op == mc:b_ref)
             [
               llvm_write_var(dest_var, llvm_emit_ref(args, w), w);
+              exit<function> null;
+            ];
+          if (op == mc:b_set)
+            [
+              llvm_write_var(dest_var, llvm_emit_set(args, w), w);
               exit<function> null;
             ];
           if (op == mc:b_vlength)
