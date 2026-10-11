@@ -33,6 +33,46 @@ are introduced. Statepoints would additionally require representing tagged
 values as managed references, registering ORC stack maps, relocating live
 references, and preserving error unwinding across C/native frames.
 
+### Vector allocation and statepoint assessment
+
+`llvm_build_vector` checks the allocator's aligned record size before taking
+its common path. With sufficient generation-zero space, the existing allocator
+cannot collect; the helper allocates an uninitialized record and fills every
+element before any subsequent allocating call. It reads the caller's argument
+buffer directly. On exhaustion, a separate non-inlined helper copies the
+arguments into registered C roots before allocation and initializes the vector
+from the relocated copies. Neither path marks a readonly vector immutable
+unless its actual children are immutable. There are no new threads or changes
+to the generated-code ABI. Runtime source fingerprints invalidate cached native
+objects when the helper implementation changes.
+
+This guard depends on synchronous, single-threaded collection. Keep vector
+initialization, immutability checks and debug checks nonallocating. If that
+contract changes, both paths need a new root/reload audit. Uninitialized records
+must never reach an intervening allocation before all fields have valid values.
+
+LLVM [statepoints](https://llvm.org/docs/Statepoints.html) describe live managed
+pointers at collecting calls; `gc.relocate` supplies the post-collection SSA
+values, and generated stack maps describe their spill locations. This could
+allow SSA optimization between safepoints and avoid whole-function escaping
+root slots. It does not eliminate allocation, initialization, or required
+safepoint spills.
+
+For Mudlle, adopting them would require a managed-pointer representation for
+the current mixed tagged `i64` values, base/derived-pointer tracking, ORC stack
+map registration on both object-cache misses and hits, and a stack scanner
+across nested native/C/interpreter calls. Error longjmp unwinding must remove
+active frames safely. Existing C roots still need protection. A prototype should
+first test mixed integers/null/static strings/heap values, nested allocating
+calls, moving collections, error recovery, cached objects, and LLVM 14/19 on
+each supported host. Merely adding statepoint intrinsics to the current IR
+would not provide these runtime guarantees.
+
+Recommendation: retain the explicit roots for this change. Statepoints remain
+a possible larger optimization after profiling shows root-slot traffic is the
+dominant remaining cost; no statepoint speedup has been measured. The guarded
+allocation path addresses repeated C argument-root setup independently.
+
 ### SIMD and automatic vectorization
 
 The runtime already enables loop vectorization, loop interleaving and SLP

@@ -352,6 +352,84 @@ Keep LLVM validation and benchmarks serial: ORC modules remain resident until
 process exit. Remaining limitations include synthetic callback source metadata,
 unsupported `global_syms`, and incompatible x64/LLVM serialized code formats.
 
+LLVM vector allocation continuation (6fd3a18)
+--------------------------------------------
+
+The next allocation change keeps the existing shadow roots and single-threaded
+runtime. Vector construction now checks available aligned heap space: the
+noncollecting path fills a new record directly from caller arguments; the
+collecting fallback copies and roots them before allocation. Both fully
+initialize uninitialized records and retain actual-child immutability checks.
+The shared GC regression now checks identity and contents of movable children
+through 100,000 vector constructions, explicit collections and error unwinding.
+
+Five serial, cache-disabled samples on Linux x86_64, GCC 14.2.0 / LLVM 19.1.7,
+compare fresh builds of `6fd3a18090f68e26028752811eda6c6e781faa2b` with the
+modified LLVM runtime and x64 from the same commit. CPU medians in ms:
+
+| Workload | 6fd3a18 LLVM O2 | Updated LLVM O2 | x64 |
+|----------|----------------|-----------------|-----|
+| Scalar arithmetic with allocations | 25 | 18 | 12 |
+| Vector element traversal | 5 | 5 | 5 |
+| Membership, absent | 40 | 40 | 223 |
+| Membership, late hit | 44 | 42 | 197 |
+| Membership, early hit | 10 | 10 | 3 |
+
+Allocation CPU time falls 28%, but remains 1.5x x64 on this workload.
+Whole-process wall medians are 0.209428 / 0.201943 / 0.501434 s; they include
+compilation and are not startup-only timings. No CPU pinning or filesystem
+cache flush was used. Initial samples overlapping validation were discarded.
+Samples, host information and source/binary hashes are recorded in
+`doc/benchmarks/2026-10-11-llvm-vector-allocation.json`.
+
+Reproduce using isolated source directories under `/tmp` (no Git worktree
+metadata writes needed). From the repository root:
+
+    mkdir -p /tmp/mudlle-alloc-baseline /tmp/mudlle-alloc-x64
+    git archive 6fd3a18 | tar -x -C /tmp/mudlle-alloc-baseline
+    git archive 6fd3a18 | tar -x -C /tmp/mudlle-alloc-x64
+    make -C /tmp/mudlle-alloc-baseline USE_LLVM=yes
+    make -C /tmp/mudlle-alloc-x64
+    make USE_LLVM=yes
+    perl regression/benchmark-llvm-gc.pl \
+      --baseline /tmp/mudlle-alloc-baseline --llvm . \
+      --x64 /tmp/mudlle-alloc-x64 --runs 5 \
+      --output /tmp/mudlle-vector-allocation.json
+
+LLVM statepoints could reduce escaping root-slot traffic by representing live
+heap references and their relocated SSA values at collecting calls. They need
+tagged-value representation work, ORC stack-map registration for cache misses
+and hits, native/C stack traversal and compatible error unwinding. They do not
+remove allocation or mandatory spills. Keep explicit roots for this change;
+no statepoint performance improvement is claimed. The implementation assessment
+and a proposed validation scope are in `doc/llvm-backend.md`, with references
+to LLVM's statepoint documentation.
+
+Validation on LLVM 19: the full source suite reaches `SUCCESS` under O2 and
+`none`; the rebuilt compiled compiler reaches `SUCCESS` on cold and warm O2
+caches with per-pass verification enabled. The cold compiled run records 4,437
+misses and zero hits; the warm run records 4,437 hits and zero misses. The
+three-stage bootstrap completes with optimization disabled. Both cache test
+scripts pass, and x64's full source suite passes with the new shared GC test.
+No new LLVM 14, ARM64 or RISC-V execution validation was performed.
+
+Reproduce the validation serially, requiring the final `SUCCESS` line for each
+suite (exit zero alone does not establish success):
+
+    MUDLLE_LLVM_CACHE= ./mudlle -c 'silent=true' -e xc.mud -e regression/all.mud
+    MUDLLE_LLVM_OPT=none MUDLLE_LLVM_CACHE= \
+      ./mudlle -c 'silent=true' -e xc.mud -e regression/all.mud
+    MUDLLE_LLVM_OPT=none make compiler USE_LLVM=yes
+    MUDLLE_LLVM_CACHE=/tmp/mudlle-alloc-validation-cache \
+      MUDLLE_LLVM_CACHE_TRACE=1 MUDLLE_LLVM_VERIFY_EACH=1 \
+      ./mudlle -c 'silent=true' -e icxc.mud -e regression/all.mud
+
+Repeat the last command for a warm-cache run; use a fresh cache directory for
+the cold run. Run both cache scripts listed above. Copy the updated
+`regression/gc.mud` into the x64 source directory, then run its full suite with
+`xc.mud`. Benchmark report validation entries record commands, final sentinels,
+exit statuses, cache counts and log hashes.
+
 Contact Information
 -------------------
 

@@ -717,15 +717,32 @@ void llvm_check_typeset(int64_t raw_value, int64_t raw_typeset,
     bad_typeset_error(v, expected, (int)raw_argnum);
 }
 
-value llvm_build_vector(value *arguments, int64_t nargs, int64_t readonly,
-                       int64_t immutable);
-
-value llvm_build_vector(value *arguments, int64_t nargs, int64_t readonly,
-                       int64_t immutable)
+/* This initialization must remain call-free with respect to Mudlle GC. */
+static value llvm_finish_vector(struct vector *vector, value *arguments,
+                                int64_t nargs, int64_t readonly,
+                                int64_t immutable)
 {
-  if (nargs < 0 || nargs > MAX_FUNCTION_ARGS)
-    runtime_error(error_bad_value);
+  for (int64_t i = 0; i < nargs; ++i)
+    {
+      GCCHECK(arguments[i]);
+      vector->data[i] = arguments[i];
+      /* Readonly constants can still contain movable mutable children. */
+      immutable = immutable && immutablep(arguments[i]);
+    }
+  if (readonly)
+    {
+      make_readonly(vector);
+      if (immutable)
+        vector->o.flags |= OBJ_IMMUTABLE;
+    }
+  return vector;
+}
 
+/* Keep the variable-sized copy and root records off the common path. */
+static __attribute__((noinline)) value
+llvm_build_vector_collecting(value *arguments, int64_t nargs, int64_t readonly,
+                             int64_t immutable)
+{
   struct gcpro *old_gcpro = gcpro;
   value rooted[nargs ? nargs : 1];
   struct gcpro roots[nargs ? nargs : 1];
@@ -741,25 +758,26 @@ value llvm_build_vector(value *arguments, int64_t nargs, int64_t readonly,
   if (nargs != 0)
     gcpro = &roots[nargs - 1];
 
-  value result = (value)alloc_vector((size_t)nargs);
-  struct gcpro result_root;
-  GCPROV(result_root, result);
-  struct vector *vector = result;
-  for (int64_t i = 0; i < nargs; ++i)
-    {
-      vector->data[i] = rooted[i];
-      /* Compiler constants can contain readonly values that have not become
-         immutable yet. Gen 1 must never retain a pointer to mutable gen 0. */
-      immutable = immutable && immutablep(rooted[i]);
-    }
-  if (readonly)
-    {
-      result = make_readonly(result);
-      if (immutable)
-        ((struct obj *)result)->flags |= OBJ_IMMUTABLE;
-    }
+  struct vector *vector = ALLOC_RECORD_NOINIT(vector, (size_t)nargs);
+  value result = llvm_finish_vector(vector, rooted, nargs, readonly, immutable);
   gcpro = old_gcpro;
   return result;
+}
+
+value llvm_build_vector(value *arguments, int64_t nargs, int64_t readonly,
+                       int64_t immutable)
+{
+  if (nargs < 0 || nargs > MAX_FUNCTION_ARGS)
+    runtime_error(error_bad_value);
+
+  /* Mudlle is single threaded: no collection can intervene between this
+     reservation check, allocation and complete initialization. Use the same
+     aligned size as gc_allocate; never read the caller buffer after a GC. */
+  ulong bytes = MUDLLE_ALIGN(record_size((ulong)nargs), sizeof(value));
+  if (!alloc_available(bytes))
+    return llvm_build_vector_collecting(arguments, nargs, readonly, immutable);
+  struct vector *vector = ALLOC_RECORD_NOINIT(vector, (size_t)nargs);
+  return llvm_finish_vector(vector, arguments, nargs, readonly, immutable);
 }
 
 value llvm_concat_strings(value *arguments, int64_t nargs);
