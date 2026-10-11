@@ -193,8 +193,7 @@ static struct vector *indexed_vector(struct vector *args,
 
   GCPRO(args);
   struct vector *result = alloc_vector(size);
-  struct gcpro result_root;
-  GCPROV(result_root, result);
+  UNGCPRO();
 
   bool immutable = readonly;
   idx = -1;
@@ -209,8 +208,6 @@ static struct vector *indexed_vector(struct vector *args,
       result->data[idx] = val;
       immutable = immutable && immutablep(val);
     }
-  UNGCPROV(result_root);
-  UNGCPRO();
   if (readonly)
     result->o.flags |= OBJ_READONLY | (immutable ? OBJ_IMMUTABLE : 0);
   return result;

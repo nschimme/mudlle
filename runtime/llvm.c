@@ -1114,6 +1114,8 @@ TYPEDOP(llvm_load_ir_closure, "llvm_load_ir_closure",
         llvm_call_closure, llvm_free_callback, data, captures,
         "llvm_load_ir_closure", GET_STATIC_STRING(llvm_function_closure_help),
         __FILE__, __LINE__, (seclev_t)seclev);
+      UNGCPROV(captures_root);
+      UNGCPROV(relocated_ir_root);
       UNGCPRO();
       return closure;
     }
@@ -1135,6 +1137,7 @@ TYPEDOP(llvm_load_ir_closure, "llvm_load_ir_closure",
     llvm_call_closure, llvm_free_callback, data, captures,
     "llvm_load_ir_closure", GET_STATIC_STRING(llvm_function_closure_help),
     __FILE__, __LINE__, (seclev_t)seclev);
+  UNGCPROV(captures_root);
   UNGCPRO();
   return closure;
 }
