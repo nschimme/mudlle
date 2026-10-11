@@ -91,6 +91,59 @@ test_genllvm = fn (string code_str)
 
 display("Testing LLVM mc:compile pipeline...\n");
 [
+  | source, tree, prelinked, result, values |
+  // Readonly constant vectors can still contain movable objects. Publishing
+  // their parent as immutable would leave stale pointers after a minor GC.
+  source = "'[ [,apply 1 2] [,session 1 ()] [,with_forbid 2 ()] [,with_maxseclevel 2 ()] [,with_minlevel 2 ()] [,with_output 2 ()] ]";
+  tree = mudlle_parse(source, "test-readonly-constants.mud", false);
+  prelinked = mc:compile(tree, false, 1, mc:source_code(source));
+  result = mc:linkrun(prelinked, 1, true);
+  values = car(result);
+  assert(readonly?(values));
+  assert(!immutable?(values) || immutable?(values[0]));
+  garbage_collect(0);
+  garbage_collect(0);
+  assert(vlength(values) == 6 && values[0][0] == apply);
+  assert(values[5][0] == with_output);
+  display("LLVM readonly constant vector GC test passed\n");
+];
+
+[
+  | source, tree, prelinked, result, function |
+  // Unused arguments may share a local slot after Phase 3.
+  source = "fn (a, b, c, d) d";
+  tree = mudlle_parse(source, "test-coalesced-args.mud", false);
+  prelinked = mc:compile(tree, false, 1, mc:source_code(source));
+  result = mc:linkrun(prelinked, 1, true);
+  function = car(result);
+  assert(function(11, 22, 33, 44) == 44);
+  display("LLVM coalesced argument test passed\n");
+];
+
+[
+  | source, tree, prelinked, function |
+  source = "fn (x) if (compiler_stable_closure?(x)) 1 else 0";
+  tree = mudlle_parse(source, "test-stable-closure-predicate.mud", false);
+  prelinked = mc:compile(tree, false, 1, mc:source_code(source));
+  assert(vector?(prelinked));
+  function = car(mc:linkrun(prelinked, 1, true));
+  assert(function(null) == 0);
+  display("LLVM stable closure predicate test passed\n");
+];
+
+[
+  | source, tree, prelinked, result, function, values |
+  source = "fn () [ assert(compiled?()); (fn (x) [ garbage_collect(0); garbage_collect(0); vector(compiled?(), x) ])(vector(7)) ]";
+  tree = mudlle_parse(source, "test-native-call-gc.mud", false);
+  prelinked = mc:compile(tree, false, 1, mc:source_code(source));
+  result = mc:linkrun(prelinked, 1, true);
+  function = car(result);
+  values = function();
+  assert(values[0] == true && values[1][0] == 7);
+  display("LLVM native call frame GC test passed\n");
+];
+
+[
   | source, tree, prelinked, result |
   source = "3 + 5";
   tree = mudlle_parse(source, "test.mud", false);

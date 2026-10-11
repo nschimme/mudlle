@@ -40,8 +40,8 @@ Run the same regression suite in each build:
 
 The suite should print `SUCCESS`. It includes the LLVM-specific checks when
 the LLVM backend is selected. Run `make compiler USE_LLVM=yes` to check the
-multi-stage compiler bootstrap as well; that bootstrap is not yet passing on
-x86-64 (details in the evidence below).
+multi-stage compiler bootstrap as well. The validation evidence below records
+the bootstrap status separately from the language regression suite.
 
 To compare execution after compilation, run the compiled-kernel benchmark:
 
@@ -120,141 +120,126 @@ compilation continues to use the existing backend.
 
 Validation and Compatibility
 ----------------------------
-Linux x86-64 validation (Debian 14.2.0-19 GCC, LLVM 14.0.6 and 19.1.7, 2026-10-10):
+Linux x86-64 validation on 2026-10-11: GCC 14.2.0 (Debian 14.2.0-19),
+LLVM 19.1.7, AMD Ryzen 9 7940HS. Mudlle execution remains single threaded.
 
-* `make` and `make USE_LLVM=yes` both build the runtime. The LLVM JIT uses the
-  host triple, CPU, and features for its optimization target. LLVM 14 opaque
-  pointer parsing is enabled at runtime. LLVM detection and normal JIT
-  execution do not need command-line LLVM tools.
-* `./mudlle -e xc.mud -e regression/all.mud` prints `SUCCESS` on both x64 and
-  LLVM 19.1.7. The LLVM-specific checks also pass on LLVM 19.1.7.
-* `make compiler` succeeds with the x64 backend. `make compiler USE_LLVM=yes`
-  still fails while compiling build1 slice 0: `gc_load` requests a major GC
-  before it reads the incoming compiler object, and that collection finds an
-  invalid pointer in the first element of a live six-element Mudlle vector.
-  This locates the bad reference in the already-live heap; the vector's
-  allocation site is not yet proven. The same failure occurs with
-  `MUDLLE_LLVM_OPT=none`, so LLVM's optimization pipeline is not required to
-  reproduce it. Temporary tracing also reproduced it with a larger GC area,
-  with the failing vector size changing; the corrupt value appears to point
-  inside another allocation, but its writer has not yet been identified.
-  This is a correctness blocker for self-hosting bootstrap and production
-  readiness. The x64 backend's clean compiler bootstrap passes.
-* `llvm_function_may_allocate?` now keeps roots for variadic functions because
-  their entry path allocates the rest-argument vector. The LLVM regression
-  checks this root publication in generated IR. This fixes a real root-elision
-  hole, but the build1 GC failure still reproduces and its bad vector has not
-  been identified as that varargs vector.
-* For the compiled integer reduction benchmark (2,000 calls × 50,000 loop
-  iterations), a clean LLVM 19.1.7 build measured 38, 43, and 41 ms of process
-  CPU time (median 41 ms). A clean x64 build measured 83, 87, and 96 ms
-  (median 87 ms). LLVM used about 53% less CPU time, or ran about 2.1 times as
-  fast, on this workload. This demonstrates a win for this scalar integer loop;
-  it is not yet broad backend parity evidence.
-* The x64 backend checks `b_iadd` operands and loop comparison types inline.
-  LLVM now emits module-local LLVM IR tag guards whose C error helpers are
-  reachable only for invalid values. The `default<O2>` optimized IR confirms
-  the guards inline and the normal loop has no C runtime calls. To regenerate
-  the IR, run:
+* Clean x64 runtime and three-stage compiler builds succeed, and the full
+  regression suite prints `SUCCESS`.
+* LLVM passes the full suite with the source compiler under default O2 and
+  with `MUDLLE_LLVM_OPT=none`. The corrected three-stage bootstrap succeeds
+  with `MUDLLE_LLVM_OPT=none`; its final compiled compiler loads under default
+  O2 and the full suite prints `SUCCESS`.
+* LLVM 14 opaque-pointer compatibility was validated on 2026-10-10; it has
+  not been revalidated after these changes. Earlier Apple Silicon validation
+  passed `regression/llvm.mud`. ARM64 and RISC-V runtime compatibility still
+  need direct validation.
+* Remaining parity gaps include synthetic callback names/source locations,
+  ORC modules retained for the process lifetime, unsupported `global_syms`,
+  and compiler startup performance. Float and bigint arithmetic dispatches
+  through Mudlle primitives. LLVM and x64 serialized code formats differ.
 
-      ./mudlle -e xc.mud -e regression/llvm-benchmark-ir.mud
-      opt -passes='default<O2>' -S /tmp/mudlle-benchmark.ll \
-        -o /tmp/mudlle-benchmark.opt.ll
+LLVM emits module-local tag guards for integer operations and promotes scalar
+locals to SSA when no generated operation can collect. Allocating functions
+retain GC roots and reload their closure environment; variadic entry setup is
+also allocating. The loop counter uses atomic monotonic load/store operations
+compatible with the signal handler. To inspect the scalar kernel's IR:
 
-  The optimized loop carries `sum` and `i` as SSA values and has this shape:
+    ./mudlle -e xc.mud -e regression/llvm-benchmark-ir.mud
+    opt -passes='default<O2>' -S /tmp/mudlle-benchmark.ll \
+      -o /tmp/mudlle-benchmark.opt.ll
 
-      %sum = phi i64 [ %next_sum, %loop ], [ 1, %entry ]
-      %i = phi i64 [ %next_i, %loop ], [ 1, %entry ]
-      %next_sum = add i64 %sum, %i
-      %next_i = add i64 %i, 2
-      %count = load atomic volatile i64, ptr @internal_xcount monotonic
-      %next_count = add i64 %count, -1
-      store atomic volatile i64 %next_count, ptr @internal_xcount monotonic
-      %in_budget = icmp sgt i64 %next_count, 0
-      br i1 %in_budget, label %loop, label %slow_path
+Quick benchmark (2026-10-11)
+----------------------------
+Three sequential samples per configuration on the host above, with default
+GCC -O2 runtime builds. Fresh processes, warm filesystem caches, no CPU pinning.
+The kernel performs 2,000 calls of 50,000 integer reduction iterations; its
+CPU timer starts after compilation/linking. Compiler load timing measures a
+fresh process loading the final `icxc.mud` compiler and checking an evaluation
+of `iadd(20,22)`. It includes object loading, JIT work, and that small evaluation.
 
-  The error-helper calls remain only on invalid-value paths. The earlier inline
-  guard implementation crashed during repeated calls; the current module-local
-  helpers pass the full LLVM regression suite. Dynamic `b_add` still uses the
-  runtime numeric path.
-* LLVM's loop counter path now uses monotonic atomic load/store operations,
-  inline subtraction, and a signed-positive branch. Its C slow path services
-  the profiling flag or raises the loop-limit error. This replaces the slower
-  per-iteration atomic read/modify/write operation and keeps the shared counter
-  compatible with the signal handler. As on x64, Mudlle execution is
-  single-threaded. Earlier `opt` remarks on this loop reported that calls
-  blocked vectorization and LLVM could not determine the loop trip count.
-* The generator now omits GC root publication in functions whose generated
-  operations cannot reach a collecting helper. LLVM promotes the integer
-  reduction's local slots to SSA `phi` values, as shown in optimized IR.
-  Functions that may allocate retain the conservative roots, including the
-  closure environment. Variadic entry setup is also treated as allocating
-  because it builds the rest-argument vector. Root entries are deduplicated;
-  the reduction kernel no longer publishes its environment and three scalar
-  locals (formerly 15 entries), and the repeated-call benchmark no longer
-  segfaults.
-* Functions that can allocate include their closure environment in the GC-root
-  set and reload it before constant and capture accesses. The LLVM regression
-  forces two collections before reading a captured vector and passes.
-* Older full-suite timings took 26.2 s wall for LLVM O2 and 4.64 s wall / 4.61
-  s user for x64; an earlier LLVM run without the optimization pipeline took
-  15.65 s wall / 15.36 s user. Those timings include loading and compiling test
-  snippets, so they do not isolate generated-code execution.
+| Configuration | Kernel CPU samples (ms) | Median (ms) | Compiler load wall samples (s) | Median (s) |
+|---------------|-------------------------|-------------|-------------------------------|------------|
+| x64           | 115, 105, 96            | 105         | 0.0438, 0.0471, 0.0579        | 0.0471     |
+| LLVM O2       | 52, 40, 45              | 45          | 66.1473, 67.3429, 67.1650     | 67.1650    |
+| LLVM none     | 419, 415, 410           | 415         | 7.4374, 7.4747, 7.0611        | 7.4374     |
 
-The ORC runtime runs a configurable LLVM IR optimization pipeline before
-adding modules to LLJIT. The integer reduction result applies to one scalar
-workload. Vectorizable loops, branches, calls, and allocation-heavy code need
-separate benchmarks before drawing broad performance conclusions.
+LLVM O2 executes this scalar workload about 2.3 times as fast as x64, while
+compiled compiler loading is about 1,426 times slower. Disabling the optional
+IR optimization pipeline reduces LLVM loading time about 9 times, but slows
+this kernel about 9.2 times relative to O2. These small samples do not establish
+broad execution parity or identify the individual startup phases. The current
+LLVM path recompiles saved IR on each restart; persistent native object caching
+is the next performance task. Source metadata and other parity gaps remain.
 
-The LLVM regression covers IR generation for arithmetic, branches, and loops,
-`mc:compile`/`mc:linkrun`, generated closures, optional and variadic arguments,
-primitive fallback, floating-point and bigint cases. LLVM float and bigint
-arithmetic currently dispatches through Mudlle primitives. The x86-64 suite
-skips LLVM-only tests when the x64 backend is selected. An earlier Apple
-Silicon/Homebrew validation also passed `regression/llvm.mud`; ARM64 and
-RISC-V runtime compatibility still need direct validation.
+All samples, including whole-process user/system/wall times, are recorded in
+`doc/benchmarks/2026-10-11-llvm-x64.json`. Reproduce with separately built x64
+and LLVM trees containing their final compiler objects:
 
-LLVM bootstrap GC debugging handoff
-------------------------------------
+    python3 regression/benchmark-backends.py \
+      --x64 /path/to/x64-build --llvm /path/to/llvm-build --runs 3 \
+      > /tmp/mudlle-backend-benchmark.json
 
-The failure is reproducible with `make compiler USE_LLVM=yes` on Linux x86-64
-at `build1/.comp-0`. `gc_load()` calls `gc_reserve()` before `_gc_load()` reads
-the incoming object, so the failing major collection finds an invalid
-reference in the existing live heap. GCQDEBUG reports the bad value in
-`data[0]` of a six-element `type_vector` (size 64 bytes). The pointer appears
-to land inside another allocation. Reproduction with
-`MUDLLE_LLVM_OPT=none` rules out the LLVM optimization pipeline as a necessary
-cause. A larger GC area changes the failing vector size and moves the failure
-earlier, so address-only logs do not establish the vector's allocator; track
-its identity across GC moves.
+The runner checks workload completion because process exit status alone does
+not detect every Mudlle load error. It runs samples sequentially and explicitly
+selects O2 or none for LLVM, ignoring an inherited `MUDLLE_LLVM_OPT` setting.
 
-GDB could not attach in the original sandbox because `ptrace` is denied. On a
-Linux machine where GDB can trace child processes, rebuild with debug symbols
-and no C optimization, then stop at the assertion:
+Resolved LLVM bootstrap failures (2026-10-11)
+-------------------------------------------
 
-    make clean
-    make USE_LLVM=yes NO_OPT=yes
-    make compiler USE_LLVM=yes NO_OPT=yes
-    gdb --args ./mudlle -c 'silent = true' \
-      -c 'garbage_collect(1024*1024)' \
-      -c 'objdir = "build0/"' -c 'dstdir = "build1/"' \
-      -c "build_slice = '(0 . 8)" -e ./icxc.mud -e ./pxslow.mud
+The old build1/.comp-0 GC assertion was traced with GDB outside the ptrace
+sandbox. The six-element vector was marked readonly and immutable, but its
+children were still movable vectors. After promotion to generation 1, minor
+collections skipped its fields and left stale pointers into generation 0.
+`llvm_build_vector` now checks every element before setting OBJ_IMMUTABLE.
+The regression covers a readonly vector of nested constants across collections.
 
-At the GDB prompt, run:
+Once that corruption was fixed, bootstrap exposed duplicate SSA names for
+coalesced or discarded arguments in phase2. Incoming loads now use argument
+positions for names and keep slot numbers only for storage. The regression
+checks a function with several unused arguments.
 
-    (gdb) break __assert_fail
-    (gdb) run
-    (gdb) bt full
-    (gdb) up
-    (gdb) info locals
+Native dispatch and slot reuse address the next recursion failures. LLVM calls
+previously re-entered the bytecode interpreter, and GC-visible stack slots
+could not be reused by LLVM because their addresses escaped to C. The generator
+now colors local slots using the existing compiler liveness analysis. Slot zero
+remains reserved for discarded values, including unused argument-count writes.
+Indirect variables have exclusive slots. Builtin code generation uses separate
+guards instead of a deeply nested else-if chain.
 
-The expected stack passes through `gccheck_qdebug`, `major_forward`, `scan`,
-`major_scan2`, `garbage_collect`, and `gc_load`. Inspect the containing `obj`,
-the current record slot (`o`), and the value at that slot. Then identify the
-vector's creator and the last write to `data[0]`; follow the GC movement of
-that same object rather than relying on its address, which changes during
-collection.
+The C callback constructor also protects its callback object before allocating
+its string cache. Numeric fallback comparisons reload their rooted operation
+name after calling a primitive that can move it.
 
+The final compiler initially rejected `mc:get_loc` as no longer immutable.
+`compiler_stable_closure?` had incorrectly declared a bigint result (`x.b`)
+while returning an integer boolean. Inference therefore treated its false
+result as truthy and recorded an invalid immutable dependency. Its signature
+now matches the other boolean predicates (`x.n`), with a conditional regression.
+
+Reproduce the Linux LLVM 19 validation in a fresh build directory:
+
+    make USE_LLVM=yes
+    MUDLLE_LLVM_OPT=none make compiler USE_LLVM=yes
+    ./mudlle -c 'silent=true' -e icxc.mud -e regression/all.mud
+    ./mudlle -c 'silent=true' -e xc.mud -e regression/all.mud
+
+The bootstrap command disables the optional LLVM IR optimization passes;
+the following commands use default O2. Check for the final `SUCCESS` sentinel:
+a Mudlle load error can occur even when the process exits zero. Compiler objects
+are backend-specific; use separate build directories for LLVM and x64.
+
+Performance follow-up: the earlier default-O2 run completed the two compiled
+bootstrap stages in 534.5 and 542.5 seconds, compared with 2.1 and 1.9 seconds
+for a separate serial x64 build on the same host. These are checkpoint-to-
+checkpoint wall times, including compiler loading and compilation, rather than
+steady-state execution benchmarks. The corrected run with
+`MUDLLE_LLVM_OPT=none` took 134.0 and 129.7 seconds for those stages; this
+setting still performs JIT machine-code generation. LLVM continued advancing
+through all eight slices; it was not hung. Investigate compiler loading/JIT
+cost and compilation cost separately in the next session. ORC can reload
+native object files;
+`doc/llvm-backend.md` records the proposed cache and relocation work. Keep the
+runtime single threaded.
 
 Contact Information
 -------------------

@@ -10,6 +10,32 @@ The LLVM backend emits LLVM IR for Mudlle functions. ORC LLJIT compiles and load
 
 The IR leaves the target triple and data layout unspecified. This lets LLVM select its host target, including 64-bit ARM and RISC-V targets when LLVM provides them. This is code generation coverage, not proof of runtime compatibility or production readiness.
 
+### Restart performance follow-up
+
+Currently `.obj` files contain textual LLVM IR, which the loader parses,
+optimizes, and compiles again in each process. A native object cache can skip
+these steps on a cache hit, while ORC links and relocates the object at load time.
+The installed LLVM 19 C headers expose the necessary APIs:
+
+- `LLVMOrcLLJITGetObjTransformLayer` and
+  `LLVMOrcObjectTransformLayerSetTransform` can capture emitted object bytes.
+- `LLVMOrcLLJITAddObjectFile` can load the saved relocatable object.
+
+See the [LLVM LLJIT C API](https://llvm.org/docs/doxygen/group__LLVMCExecutionEngineLLJIT.html)
+and [object transform API](https://llvm.org/doxygen/Orc_8h_source.html).
+Saving optimized bitcode alone still requires machine-code generation.
+
+Before implementing persistent caching, handle load-time global offsets and
+`mudlle_module_<sequence>_` symbol names: both currently depend on process state.
+Either include the resolved mapping in the cache key (limiting reuse), or change
+global access to use a per-module mapping and give cached objects stable symbol
+identities with isolated namespaces. Constants already use the rooted closure
+environment rather than embedding GC addresses. Cache validity must include
+module content/constants layout, Mudlle runtime ABI, LLVM version, target
+triple, CPU/features, and optimization settings. Compare cold and warm compiler
+loads separately from compilation work. Keep execution single threaded. This
+cache is proposed follow-up work and is not implemented yet.
+
 ### Native parity contract
 
 LLVM is a native compiler backend only when it can replace the x64 backend in
@@ -45,6 +71,15 @@ entries, builtins, globals, primitives, security-level patches, and source
 metadata before creating an `mcode`. LLVM uses its own loader and runtime
 helpers for those generated modules. Behavioral parity with the x64 linker and
 runtime remains an ongoing requirement.
+
+Remaining differences include synthetic callback names and source locations in
+LLVM code metadata, ORC modules retained for the lifetime of the process, and
+the unsupported `global_syms` argument to LLVM compilation. Compiler loading
+and bootstrap are also substantially slower than x64 on the measured Linux
+host; README records stage timings and validation commands.
+Bootstrap and language regression success do not establish parity for these
+behaviors. Primitive signatures must describe integer booleans as `n`, since
+`b` denotes bigint and allows inference to discard false branches.
 
 The Assembly Writer (`asmwriter.mud`) provides a writer abstraction that can emit IR and assembly to strings and files.
 
@@ -100,7 +135,22 @@ by `mc:linkrun`.
   - Untagging: `ashr i64 %val, 1`
   - Boolean `false`: `1` (tagged 0)
   - Boolean `true`: `3` (tagged 1)
-- **Local/Temporary Variables**: Allocated as 64-bit stack slots (`alloca i64`) in the function entry block. Reads and writes use `load i64` and `store i64`. LLVM's `mem2reg` pass automatically promotes these slots into pure SSA virtual registers and `phi` nodes.
+- **Local/Temporary Variables**: Stored in 64-bit stack slots (`alloca i64`) in the function entry block. The generator uses the compiler's liveness analysis to share slots between locals whose lifetimes do not overlap. Indirect variables keep exclusive slots because their storage cells are initialized at entry and can escape into closures. Slot zero is reserved for discarded values. Reads and writes use `load i64` and `store i64`. In functions that cannot allocate, LLVM can promote these slots into SSA values and `phi` nodes. Allocating functions publish the slots and closure environment as GC roots.
+
+### Native calls and garbage collection
+
+Generated calls to LLVM closures use their native argument-vector ABI directly.
+Calls to interpreted closures and primitives use the normal Mudlle runtime.
+The generator roots argument slots before materializing values, and keeps those
+roots until the call returns. A `call_llvm` frame exposes the active closure,
+code metadata, and actual arguments to GC and call-trace handling. Native entry
+preserves stack, interrupt, arity, minimum security level, and maximum security
+level checks. `compiled?()` recognizes these frames.
+
+Readonly vectors become immutable only when all their elements are immutable.
+A compiler hint alone cannot establish this: readonly constants can still
+contain movable objects. Prematurely promoting a parent vector to generation 1
+would leave references to generation 0 unvisited during minor collections.
 
 ### Helper Functions
 

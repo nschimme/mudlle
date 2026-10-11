@@ -24,7 +24,7 @@
  */
 
 library genllvm
-requires asmwriter, compiler, dlist, flow, ins3, misc, phase1, phase2, phase3, sequences, vars
+requires asmwriter, compiler, dlist, flow, graph, ins3, misc, optimise, phase1, phase2, phase3, sequences, vars
 
 defines mc:gen_llvm_ir, mc:gen_llvm_function,
   mc:llvm_constants, mc:llvm_global_relocations,
@@ -44,18 +44,88 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
     llvm_emit_rooted_arguments,
     llvm_constant_values, llvm_global_relocation_values,
     function_roots_required,
-    llvm_function_may_allocate? |
+    llvm_function_may_allocate?, llvm_allocate_slots, llvm_slot_number,
+    slot_indices |
 
   tmp_seq = 0;
   globals_seen = make_table();
   current_ifn = null;
   function_roots_required = false;
+  slot_indices = make_table();
   capture_indices = make_table();
   llvm_constant_list = null;
   llvm_constant_values = null;
   llvm_global_relocation_values = null;
   mc:llvm_constants = fn () llvm_constant_values;
   mc:llvm_global_relocations = fn () llvm_global_relocation_values;
+
+  llvm_slot_number = fn (var)
+    [
+      | slot |
+      slot = slot_indices[itoa(var[mc:v_number])];
+      if (integer?(slot)) slot else var[mc:v_number]
+    ];
+
+  // GC-visible slots escape to C, so LLVM cannot reuse their stack storage.
+  // Color the compiler's interference graph before flattening its blocks.
+  // Indirect variables keep exclusive slots because their cells are created
+  // at entry and may be used by closures throughout the function.
+  llvm_allocate_slots = fn (ifn)
+    [
+      | vars, neighbors, add_edges, all, args, color |
+      slot_indices = make_table();
+      if (!pair?(ifn[mc:c_fvalue])) exit<function> null;
+      mc:recompute_vars(ifn, false);
+      mc:flow_live(ifn);
+      vars = ifn[mc:c_flocals];
+      neighbors = make_table();
+      all = mc:new_varset(ifn);
+      lforeach(fn (v) [
+        neighbors[itoa(v[mc:v_number])] = mc:new_varset(ifn);
+        set_bit!(all, v[mc:v_number]);
+      ], vars);
+      add_edges = fn (live)
+        bforeach(fn (n) [
+          | edges |
+          edges = neighbors[itoa(n)];
+          if (edges != null) bunion!(edges, live);
+        ], live);
+      graph_nodes_apply(fn (node) [
+        mc:rscan_live(fn (il, live_in, live_out, x) [
+          add_edges(live_in);
+          add_edges(live_out);
+          null
+        ], null, graph_node_get(node));
+      ], cdr(ifn[mc:c_fvalue]));
+      // All arguments are loaded at entry, before the first instruction.
+      args = mc:new_varset(ifn);
+      lforeach(fn (fa) set_bit!(args, fa[0][0][mc:v_number]),
+               ifn[mc:c_ffullargs]);
+      if (ifn[mc:c_fnargs_var])
+        set_bit!(args, ifn[mc:c_fnargs_var][mc:vl_var][mc:v_number]);
+      add_edges(args);
+      lforeach(fn (v) [
+        if (v[mc:v_indirect])
+          [
+            bunion!(neighbors[itoa(v[mc:v_number])], all);
+            bforeach(fn (n) set_bit!(neighbors[itoa(n)], v[mc:v_number]), all);
+          ];
+      ], vars);
+      lforeach(fn (v) [
+        | used |
+        used = mc:new_varset(ifn);
+        bforeach(fn (n) [
+          color = slot_indices[itoa(n)];
+          if (integer?(color)) set_bit!(used, color);
+        ], neighbors[itoa(v[mc:v_number])]);
+        // Variable zero is the compiler's discarded-value slot. Entry setup
+        // can still write it (e.g. an unused argument-count variable).
+        color = 1;
+        while (bit_set?(used, color)) color = color + 1;
+        slot_indices[itoa(v[mc:v_number])] = color;
+      ], vars);
+      mc:clear_dataflow(ifn);
+    ];
 
   llvm_constant_index = fn (value)
     [
@@ -132,7 +202,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       else
         [
           | vnum, tname |
-          vnum = var[mc:v_number];
+          vnum = llvm_slot_number(var);
           tmp_seq = tmp_seq + 1;
           tname = format("%%rd_%d_%d", vnum, tmp_seq);
           writer:format(w, "  %s = load i64, ptr %%slot_%d\n", tname, vnum);
@@ -178,7 +248,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
           tmp_seq = tmp_seq + 1;
           result = format("%%cell_ptr_%d", tmp_seq);
           writer:format(w, "  %s = load i64, ptr %%slot_%d\n",
-                        result, var[mc:v_number]);
+                        result, llvm_slot_number(var));
           result
         ]
     ];
@@ -213,7 +283,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       else if (class != mc:v_constant && class != mc:v_function)
         [
           | vnum, cell |
-          vnum = var[mc:v_number];
+          vnum = llvm_slot_number(var);
           if (var[mc:v_indirect])
             [
               cell = llvm_read_var_storage(var, w);
@@ -676,7 +746,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                        && class != mc:v_closure)
                 [
                   | vnum |
-                  vnum = itoa(v[mc:v_number]);
+                  vnum = itoa(llvm_slot_number(v));
                   vars_seen[vnum] = v;
                   if (root_vars_seen[vnum] == null)
                     [
@@ -690,7 +760,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       args_seen = make_table();
       lforeach(fn (arg) [
         add_var(arg);
-        args_seen[itoa(arg[mc:v_number])] = true;
+        args_seen[itoa(llvm_slot_number(arg))] = true;
       ], args);
       if (ifn[mc:c_fnargs_var])
         add_var(ifn[mc:c_fnargs_var][mc:vl_var]);
@@ -722,8 +792,8 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
 
       // Allocate slots for all variables
       table_foreach(fn (@<_ = var>) [
-        writer:format(w, "  %%slot_%d = alloca i64\n", var[mc:v_number]);
-        writer:format(w, "  store i64 1, ptr %%slot_%d\n", var[mc:v_number]);
+        writer:format(w, "  %%slot_%d = alloca i64\n", llvm_slot_number(var));
+        writer:format(w, "  store i64 1, ptr %%slot_%d\n", llvm_slot_number(var));
       ], vars_seen);
 
       // Keep Mudlle values in local slots visible to the garbage collector.
@@ -760,7 +830,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64 %d\n",
               slot_ptr, root_count, root_slots, root_index);
             writer:format(w, "  store ptr %%slot_%d, ptr %s\n",
-                          root_var[mc:v_number], slot_ptr);
+                          llvm_slot_number(root_var), slot_ptr);
             root_index = root_index + 1;
           ], root_vars);
           root_slots_data = format("%%root_slots_data_%d", ifn[mc:c_fnumber]);
@@ -780,7 +850,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       arg_no = 0;
       lforeach(fn (arg) [
         | vnum, arg_value |
-        vnum = arg[mc:v_number];
+        vnum = llvm_slot_number(arg);
         if (arg_no == llength(args) - 1
             && last_element(ifn[mc:c_ffullargs])[mc:fullarg_arg][1] == null)
           [
@@ -791,7 +861,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
           ]
         else
           [
-            arg_value = format("%%argvalue_%d_%d", ifn[mc:c_fnumber], vnum);
+            // Phase 3 can coalesce argument variables into the same slot.
+            // Each incoming load still needs its own LLVM SSA name.
+            arg_value = format("%%argvalue_%d_%d", ifn[mc:c_fnumber], arg_no);
             writer:format(w,
               "  %s = call i64 @llvm_argument_get(ptr %%argv, i64 %%nargs, i64 %d)\n",
               arg_value, arg_no);
@@ -802,7 +874,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       if (ifn[mc:c_fnargs_var])
         [
           | nv, tagged_nargs, tagged_nargs_value |
-          nv = ifn[mc:c_fnargs_var][mc:vl_var][mc:v_number];
+          nv = llvm_slot_number(ifn[mc:c_fnargs_var][mc:vl_var]);
           tagged_nargs = format("%%tagged_nargs_%d", ifn[mc:c_fnumber]);
           tagged_nargs_value = format("%%tagged_nargs_value_%d", ifn[mc:c_fnumber]);
           writer:format(w, "  %s = shl i64 %%nargs, 1\n", tagged_nargs);
@@ -816,11 +888,11 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
         if (var[mc:v_indirect])
           [
             | raw, cell |
-            if (args_seen[itoa(var[mc:v_number])])
+            if (args_seen[itoa(llvm_slot_number(var))])
               [
                 raw = format("%%indirect_initial_%d", var[mc:v_number]);
                 writer:format(w, "  %s = load i64, ptr %%slot_%d\n",
-                              raw, var[mc:v_number]);
+                              raw, llvm_slot_number(var));
               ]
             else
               raw = "0";
@@ -828,7 +900,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
             writer:format(w,
               "  %s = call i64 @llvm_variable_new(i64 %s)\n", cell, raw);
             writer:format(w, "  store i64 %s, ptr %%slot_%d\n",
-                          cell, var[mc:v_number]);
+                          cell, llvm_slot_number(var));
           ];
       ], vars_seen);
 
@@ -891,6 +963,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
         ];
 
       current_ifn = ifn;
+      llvm_allocate_slots(ifn);
       if (pair?(ifn[mc:c_fvalue])) mc:flatten_blocks(ifn);
       function_roots_required = llvm_function_may_allocate?(ifn);
       capture_indices = make_table();
@@ -959,12 +1032,18 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               || ((op == mc:b_lt || op == mc:b_le
                    || op == mc:b_gt || op == mc:b_ge)
                   && !integer_compare))
-            llvm_write_var(dest_var, llvm_emit_builtin(op, args, w), w)
-          else if (op == mc:b_vector || op == mc:b_sequence)
-            llvm_write_var(dest_var,
-              llvm_emit_vector(args, op == mc:b_sequence,
-                               ins[mc:i_atypes], w), w)
-          else if (op == mc:b_iadd || op == mc:b_add)
+            [
+              llvm_write_var(dest_var, llvm_emit_builtin(op, args, w), w);
+              exit<function> null;
+            ];
+          if (op == mc:b_vector || op == mc:b_sequence)
+            [
+              llvm_write_var(dest_var,
+                llvm_emit_vector(args, op == mc:b_sequence,
+                                 ins[mc:i_atypes], w), w);
+              exit<function> null;
+            ];
+          if (op == mc:b_iadd || op == mc:b_add)
             [
               | a1, a2, t1, t2 |
               a1 = llvm_read_var(car(args), w);
@@ -975,8 +1054,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               writer:format(w, "  %s = add i64 %s, %s\n", t1, a1, a2);
               writer:format(w, "  %s = sub i64 %s, 1\n", t2, t1);
               llvm_write_var(dest_var, t2, w);
-            ]
-          else if (op == mc:b_subtract)
+              exit<function> null;
+            ];
+          if (op == mc:b_subtract)
             [
               | a1, a2, t1, t2 |
               a1 = llvm_read_var(car(args), w);
@@ -987,8 +1067,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               writer:format(w, "  %s = sub i64 %s, %s\n", t1, a1, a2);
               writer:format(w, "  %s = add i64 %s, 1\n", t2, t1);
               llvm_write_var(dest_var, t2, w);
-            ]
-          else if (op == mc:b_multiply)
+              exit<function> null;
+            ];
+          if (op == mc:b_multiply)
             [
               | a1, a2, u1, u2, m1, res |
               a1 = llvm_read_var(car(args), w);
@@ -1003,8 +1084,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               writer:format(w, "  %s = mul i64 %s, %s\n", m1, u1, u2);
               writer:format(w, "  %s = add i64 %s, 1\n", res, m1);
               llvm_write_var(dest_var, res, w);
-            ]
-          else if (op == mc:b_divide)
+              exit<function> null;
+            ];
+          if (op == mc:b_divide)
             [
               | a1, a2, u1, u2, d1, res, tagged_res |
               a1 = llvm_read_var(car(args), w);
@@ -1022,8 +1104,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               tagged_res = format("%%tagged_div_%d", tmp_seq);
               writer:format(w, "  %s = or i64 %s, 1\n", tagged_res, res);
               llvm_write_var(dest_var, tagged_res, w);
-            ]
-          else if (op == mc:b_bitand)
+              exit<function> null;
+            ];
+          if (op == mc:b_bitand)
             [
               | a1, a2, res |
               a1 = llvm_read_var(car(args), w);
@@ -1032,8 +1115,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               res = format("%%res_%d", tmp_seq);
               writer:format(w, "  %s = and i64 %s, %s\n", res, a1, a2);
               llvm_write_var(dest_var, res, w);
-            ]
-          else if (op == mc:b_bitor)
+              exit<function> null;
+            ];
+          if (op == mc:b_bitor)
             [
               | a1, a2, res |
               a1 = llvm_read_var(car(args), w);
@@ -1042,8 +1126,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               res = format("%%res_%d", tmp_seq);
               writer:format(w, "  %s = or i64 %s, %s\n", res, a1, a2);
               llvm_write_var(dest_var, res, w);
-            ]
-          else if (op == mc:b_bitxor)
+              exit<function> null;
+            ];
+          if (op == mc:b_bitxor)
             [
               | a1, a2, x1, res |
               a1 = llvm_read_var(car(args), w);
@@ -1054,8 +1139,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               writer:format(w, "  %s = xor i64 %s, %s\n", x1, a1, a2);
               writer:format(w, "  %s = or i64 %s, 1\n", res, x1);
               llvm_write_var(dest_var, res, w);
-            ]
-          else if (op == mc:b_eq)
+              exit<function> null;
+            ];
+          if (op == mc:b_eq)
             [
               | a1, a2, cmp, res |
               a1 = llvm_read_var(car(args), w);
@@ -1066,8 +1152,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               writer:format(w, "  %s = icmp eq i64 %s, %s\n", cmp, a1, a2);
               writer:format(w, "  %s = select i1 %s, i64 3, i64 1\n", res, cmp);
               llvm_write_var(dest_var, res, w);
-            ]
-          else if (op == mc:b_ne)
+              exit<function> null;
+            ];
+          if (op == mc:b_ne)
             [
               | a1, a2, cmp, res |
               a1 = llvm_read_var(car(args), w);
@@ -1078,8 +1165,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               writer:format(w, "  %s = icmp ne i64 %s, %s\n", cmp, a1, a2);
               writer:format(w, "  %s = select i1 %s, i64 3, i64 1\n", res, cmp);
               llvm_write_var(dest_var, res, w);
-            ]
-          else if (op == mc:b_lt || op == mc:b_le
+              exit<function> null;
+            ];
+          if (op == mc:b_lt || op == mc:b_le
                    || op == mc:b_gt || op == mc:b_ge)
             [
               | a1, a2, cmp, res, cmpop |
@@ -1095,8 +1183,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                             cmp, cmpop, a1, a2);
               writer:format(w, "  %s = select i1 %s, i64 3, i64 1\n", res, cmp);
               llvm_write_var(dest_var, res, w);
-            ]
-          else if (op == mc:b_remainder)
+              exit<function> null;
+            ];
+          if (op == mc:b_remainder)
             [
               | a1, a2, u1, u2, rem, res, tagged_res |
               a1 = llvm_read_var(car(args), w);
@@ -1113,8 +1202,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               tagged_res = format("%%tagged_rem_%d", tmp_seq);
               writer:format(w, "  %s = or i64 %s, 1\n", tagged_res, res);
               llvm_write_var(dest_var, tagged_res, w);
-            ]
-          else if (op == mc:b_shift_left || op == mc:b_shift_right)
+              exit<function> null;
+            ];
+          if (op == mc:b_shift_left || op == mc:b_shift_right)
             [
               | a1, a2, u1, u2, shift_count, shifted, res, shiftop, tagged_res |
               a1 = llvm_read_var(car(args), w);
@@ -1135,8 +1225,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               tagged_res = format("%%tagged_shift_%d", tmp_seq);
               writer:format(w, "  %s = or i64 %s, 1\n", tagged_res, res);
               llvm_write_var(dest_var, tagged_res, w);
-            ]
-          else if (op == mc:b_negate || op == mc:b_bitnot)
+              exit<function> null;
+            ];
+          if (op == mc:b_negate || op == mc:b_bitnot)
             [
               | arg, untagged, changed, res, tagged_res |
               arg = llvm_read_var(car(args), w);
@@ -1153,8 +1244,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               tagged_res = format("%%tagged_neg_%d", tmp_seq);
               writer:format(w, "  %s = or i64 %s, 1\n", tagged_res, res);
               llvm_write_var(dest_var, tagged_res, w);
-            ]
-          else if (op == mc:b_logical_not)
+              exit<function> null;
+            ];
+          if (op == mc:b_logical_not)
             [
               | arg, cmp, res |
               arg = llvm_read_var(car(args), w);
@@ -1164,8 +1256,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               writer:format(w, "  %s = icmp eq i64 %s, 1\n", cmp, arg);
               writer:format(w, "  %s = select i1 %s, i64 3, i64 1\n", res, cmp);
               llvm_write_var(dest_var, res, w);
-            ]
-          else if (op == mc:b_logical_xor)
+              exit<function> null;
+            ];
+          if (op == mc:b_logical_xor)
             [
               | a1, a2, truth1, truth2, xorv, res |
               a1 = llvm_read_var(car(args), w);
@@ -1180,8 +1273,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               writer:format(w, "  %s = xor i1 %s, %s\n", xorv, truth1, truth2);
               writer:format(w, "  %s = select i1 %s, i64 3, i64 1\n", res, xorv);
               llvm_write_var(dest_var, res, w);
-            ]
-          else if (op == mc:b_car || op == mc:b_cdr)
+              exit<function> null;
+            ];
+          if (op == mc:b_car || op == mc:b_cdr)
             [
               | arg, res, helper |
               arg = llvm_read_var(car(args), w);
@@ -1191,8 +1285,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               writer:format(w, "  %s = call i64 @%s(i64 %s)\n",
                             res, helper, arg);
               llvm_write_var(dest_var, res, w);
-            ]
-          else if (op == mc:b_funcarg)
+              exit<function> null;
+            ];
+          if (op == mc:b_funcarg)
             [
               | arg_index, arg_value |
               arg_index = car(args)[mc:v_kvalue];
@@ -1202,23 +1297,27 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                 "  %s = call i64 @llvm_argument_get(ptr %%argv, i64 %%nargs, i64 %d)\n",
                 arg_value, arg_index);
               llvm_write_var(dest_var, arg_value, w);
-            ]
-          else if (op == mc:b_assign)
+              exit<function> null;
+            ];
+          if (op == mc:b_assign)
             [
               | a1 |
               a1 = llvm_read_var(car(args), w);
               llvm_write_var(dest_var, a1, w);
-            ]
-          else if (op == mc:b_slength || op == mc:b_vlength
+              exit<function> null;
+            ];
+          if (op == mc:b_slength || op == mc:b_vlength
                    || op == mc:b_typeof || op == mc:b_loop_count
                    || op == mc:b_max_loop_count
                    || op == mc:b_symbol_name || op == mc:b_symbol_get
                    || op == mc:b_cons || op == mc:b_pcons
                    || op == mc:b_ref || op == mc:b_set
                    || op == mc:b_ffs)
-            llvm_write_var(dest_var, llvm_emit_builtin(op, args, w), w)
-          else
-            error(error_bad_value)
+            [
+              llvm_write_var(dest_var, llvm_emit_builtin(op, args, w), w);
+              exit<function> null;
+            ];
+          error(error_bad_value)
         ]
       else if (class == mc:i_memory)
         [

@@ -225,6 +225,7 @@ void record_allocation(enum mudlle_type type, long size)
       case call_string_argv:
         goto done;
       case call_bytecode:
+      case call_llvm:
         {
           struct call_stack_mudlle *mcs = (struct call_stack_mudlle *)cs;
           filename = mcs->fn->code->filename->str;

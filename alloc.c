@@ -642,6 +642,7 @@ static void forward_roots(void)
           continue;
 
 	case call_bytecode:
+        case call_llvm:
           {
             struct call_stack_mudlle *mstk = (struct call_stack_mudlle *)stk;
             special_forward(&mstk->fn);

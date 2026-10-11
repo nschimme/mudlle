@@ -197,7 +197,8 @@ enum call_class {
   call_session,                 /* a new session */
   call_invalid,                 /* invalid interpreter call */
   call_invalid_argp,            /* invalid call with pointer to args */
-  call_invalid_argv             /* invalid call with last arg a vector(arg) */
+  call_invalid_argv,            /* invalid call with last arg a vector(arg) */
+  call_llvm                    /* LLVM closure with native argument vector */
 };
 
 struct call_stack
@@ -206,11 +207,12 @@ struct call_stack
   enum call_class type;
 };
 
-struct call_stack_mudlle {      /* used for call_bytecode */
+struct call_stack_mudlle {      /* used for call_bytecode and call_llvm */
   struct call_stack s;
   struct closure *fn;           /* Actual function */
   struct icode *code;           /* The function's code */
   struct vector *locals;        /* Local vars */
+  value *native_args;           /* GC-rooted actual arguments for call_llvm */
   int nargs;                    /* -1 = don't know yet */
   int offset;                   /* Instr. offset called from */
 };

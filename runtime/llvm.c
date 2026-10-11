@@ -429,7 +429,12 @@ value llvm_build_vector(value *arguments, int64_t nargs, int64_t readonly,
   GCPROV(result_root, result);
   struct vector *vector = result;
   for (int64_t i = 0; i < nargs; ++i)
-    vector->data[i] = rooted[i];
+    {
+      vector->data[i] = rooted[i];
+      /* Compiler constants can contain readonly values that have not become
+         immutable yet. Gen 1 must never retain a pointer to mutable gen 0. */
+      immutable = immutable && immutablep(rooted[i]);
+    }
   if (readonly)
     {
       result = make_readonly(result);
@@ -568,6 +573,10 @@ struct llvm_callback_data
   bool stable;
 };
 
+static value llvm_invoke_closure(struct llvm_callback_data *data,
+                                 struct closure *closure,
+                                 value *arguments, size_t nargs);
+
 static value llvm_call_closure(void *cbdata, struct closure *closure,
                                struct vector *arguments)
 {
@@ -588,11 +597,10 @@ static value llvm_call_closure(void *cbdata, struct closure *closure,
       slots[i] = &argv[i];
     }
   struct gcpro *old_gcpro = llvm_gc_roots_enter(slots, nargs, roots);
-  int64_t result = data->entry((int64_t)(uintptr_t)closure, argv,
-                               (int64_t)nargs);
+  value result = llvm_invoke_closure(data, closure, argv, nargs);
   llvm_gc_roots_leave(old_gcpro);
   UNGCPRO();
-  return (value)(uintptr_t)result;
+  return result;
 }
 
 bool llvm_stable_closure(value fn)
@@ -610,6 +618,47 @@ bool llvm_stable_closure(value fn)
 static void llvm_free_callback(void *cbdata)
 {
   free(cbdata);
+}
+
+/* Generated calls can enter another LLVM closure directly. Keep a language
+   frame for GC and error traces without executing its interpreter wrapper. */
+static value llvm_invoke_closure(struct llvm_callback_data *data,
+                                 struct closure *closure,
+                                 value *arguments, size_t nargs)
+{
+  check_allow_mudlle_call();
+  llvm_check_stack();
+  check_interrupt();
+  struct call_stack_mudlle frame = {
+    .s = { .next = call_stack, .type = call_llvm },
+    .fn = closure,
+    .code = (struct icode *)closure->code,
+    .locals = NULL,
+    .native_args = arguments,
+    .nargs = (int)nargs,
+    .offset = -1
+  };
+  call_stack = &frame.s;
+
+  seclev_t level = closure->code->seclevel;
+  if (level < minlevel)
+    runtime_error(error_security_violation);
+  seclev_t maximum = intval(seclevel_to_maxseclevel(level));
+  seclev_t old_maximum = c_maxseclevel();
+  seclev_t old_trace = trace_seclevel();
+  if (maximum < old_maximum)
+    set_c_maxseclevel(maximum);
+  if (maximum < old_trace)
+    set_trace_seclevel(maximum);
+
+  if (data->check_arity && nargs != data->nargs)
+    runtime_error(error_wrong_parameters);
+  value result = (value)(uintptr_t)data->entry(
+    (int64_t)(uintptr_t)frame.fn, arguments, (int64_t)nargs);
+  set_c_maxseclevel(old_maximum);
+  set_trace_seclevel(old_trace);
+  call_stack = frame.s.next;
+  return result;
 }
 
 /* JIT-generated calls run as Mudlle code even though the caller is C here.
@@ -696,17 +745,9 @@ void llvm_gc_roots_leave(struct gcpro *old_gcpro)
   gcpro = old_gcpro;
 }
 
-/* Entry point used by generated LLVM code for calls through Mudlle values. */
-value llvm_call_value(value caller, value function, value *arguments,
-                      size_t nargs, int64_t secure_call)
+/* Keep the allocating fallback out of the native call's C stack frame. */
+static value llvm_call_fallback(value function, value *arguments, size_t nargs)
 {
-  if (nargs > MAX_FUNCTION_ARGS)
-    {
-      runtime_error(error_wrong_parameters);
-      return NULL;
-    }
-
-  seclev_t caller_seclevel = llvm_caller_seclevel(caller);
   struct gcpro *old_gcpro = gcpro;
   struct gcpro function_root;
   GCPROV(function_root, function);
@@ -724,22 +765,40 @@ value llvm_call_value(value caller, value function, value *arguments,
   if (nargs != 0)
     gcpro = &argument_roots[nargs - 1];
 
-  seclev_t old_seclevel = internal_seclevel;
-  bool old_seclevel_valid = seclevel_valid;
-  set_seclevel(caller_seclevel);
   struct vector *argv = alloc_vector(nargs);
   struct gcpro argv_root;
   GCPROV(argv_root, argv);
   for (size_t i = 0; i < nargs; ++i)
     argv->data[i] = rooted_args[i];
+  value result = callv(function, argv);
+  gcpro = old_gcpro;
+  return result;
+}
+
+/* Entry point used by generated LLVM code for calls through Mudlle values.
+   The generator roots the incoming argument slots for the entire call. */
+value llvm_call_value(value caller, value function, value *arguments,
+                      size_t nargs, int64_t secure_call)
+{
+  if (nargs > MAX_FUNCTION_ARGS)
+    runtime_error(error_wrong_parameters);
+  seclev_t caller_seclevel = llvm_caller_seclevel(caller);
+  seclev_t old_seclevel = internal_seclevel;
+  bool old_seclevel_valid = seclevel_valid;
+  set_seclevel(caller_seclevel);
   if (secure_call)
     llvm_check_callable(function, (long)nargs, caller_seclevel);
   else
     callable(function, (long)nargs);
-  value result = callv(function, argv);
+  void *cbdata = NULL;
+  value result;
+  if (TYPE(function, closure)
+      && mcallback_varargs_matches(function, llvm_call_closure, &cbdata))
+    result = llvm_invoke_closure(cbdata, function, arguments, nargs);
+  else
+    result = llvm_call_fallback(function, arguments, nargs);
   set_seclevel(old_seclevel);
   seclevel_valid = old_seclevel_valid;
-  gcpro = old_gcpro;
   return result;
 }
 
@@ -820,6 +879,8 @@ int64_t llvm_call_global(int64_t raw_caller, int64_t raw_name,
   if (compare)
     {
       long relation = intval(result);
+      /* The primitive call can move the rooted name string. */
+      name_text = ((struct string *)name)->str;
       if (strcmp(name_text, "<") == 0) result = makebool(relation < 0);
       else if (strcmp(name_text, "<=") == 0) result = makebool(relation <= 0);
       else if (strcmp(name_text, ">") == 0) result = makebool(relation > 0);

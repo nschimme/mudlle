@@ -885,7 +885,8 @@ static struct closure *make_primitive_closure_internal(
 {
   struct variable *cbvar = NULL;
   struct icode *icode = NULL;
-  GCPRO(cbvar, icode, captures);
+  value callback = cb;
+  GCPRO(callback, cbvar, icode, captures);
 
   assert(funcname != NULL);
   assert(help->o.garbage_type == garbage_static_string);
@@ -898,7 +899,7 @@ static struct closure *make_primitive_closure_internal(
     }
   init_string_cache(scache);
 
-  cbvar = alloc_variable(cb);
+  cbvar = alloc_variable(callback);
 
   const struct filename fname = {
     .filename = filename,

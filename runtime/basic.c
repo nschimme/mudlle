@@ -406,7 +406,8 @@ TYPEDOP(compiledp, "compiled?",
   struct call_stack *cstack = call_stack;
   while (cstack && cstack->type == call_c)
     cstack = cstack->next;
-  return makebool(cstack && cstack->type == call_compiled);
+  return makebool(cstack && (cstack->type == call_compiled
+                            || cstack->type == call_llvm));
 }
 
 TYPEDOP(max_loop_count, ,
@@ -1036,7 +1037,7 @@ TYPEDOP(immutablep, "immutable?",
 
 TYPEDOP(compiler_stable_closurep, "compiler_stable_closure?",
         "`x -> `b. Internal compiler predicate for stable backend closures.",
-        (value x), OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "x.b")
+        (value x), OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "x.n")
 {
 #ifdef MUDLLE_USE_LLVM
   return makebool(llvm_stable_closure(x));

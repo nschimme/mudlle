@@ -252,7 +252,8 @@ static bool print_bytecode_frame(struct call_stack_mudlle *mframe,
   int argvnum = -1;
 
   arguments = maybe_get_arguments(&fcode->code, nargs);
-  bool is_vararg = !onstack && code_is_vararg(&fcode->code);
+  bool native = mframe->s.type == call_llvm;
+  bool is_vararg = !native && !onstack && code_is_vararg(&fcode->code);
   if (is_vararg)
     {
       assert(arguments != NULL);
@@ -268,7 +269,9 @@ static bool print_bytecode_frame(struct call_stack_mudlle *mframe,
 
       /* Warning: This is somewhat intimate with the implementation of
          the compiler */
-      if (onstack)
+      if (native)
+        v = mframe->native_args[i];
+      else if (onstack)
         v = stack_get(i);
       else
         {
@@ -485,6 +488,7 @@ static void c_frame_info(struct c_info *dst,
       set_called_c_info(dst);
       break;
     case call_bytecode:
+    case call_llvm:
     case call_compiled:
     case call_session:
       abort();
@@ -1125,6 +1129,7 @@ static void iterate_call_trace(enum runtime_error error, bool onstack,
             break;
           }
         case call_bytecode:
+        case call_llvm:
           if (bytecode_frame((struct call_stack_mudlle *)scan, onstack,
                              cbdata))
             return;
