@@ -228,6 +228,11 @@ cause. A larger GC area changes the failing vector size and moves the failure
 earlier, so address-only logs do not establish the vector's allocator; track
 its identity across GC moves.
 
+Investigated root causes and attempted workarounds:
+- **C Root Stack & Stack Frame Alignment**: Verified `GCPRO` stack popping order in `runtime/llvm.c` (`llvm_load_ir_closure`, `indexed_vector`). Linked `call_stack` Mudlle stack frames (`call_compiled` / `call_bytecode`) inside `llvm_call_closure`.
+- **Environment Reloads & Closure Generation**: In `genllvm.mud`, reordered arguments metadata lookup before closure entry address formatting to ensure the closure environment vector slot is reloaded prior to creating LLVM closures.
+- **Serialization Parity (`.obj` Deserialization)**: Traced `build0/*.obj` prelink serialization via `mc:prelink_llvm`. While `gc_load` successfully deserializes prelinked module constant vectors, subsequent major GC sweeps encounter corrupt object headers or stale pointers during `build1` compilation (`icxc.mud`).
+
 GDB could not attach in the original sandbox because `ptrace` is denied. On a
 Linux machine where GDB can trace child processes, rebuild with debug symbols
 and no C optimization, then stop at the assertion:
