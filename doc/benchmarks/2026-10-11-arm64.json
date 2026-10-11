@@ -166,5 +166,29 @@
         }
       }
     }
+  },
+  "compiler_startup": {
+    "description": "icxc.mud load + iadd(20,22) check; compiler bootstrapped with MUDLLE_LLVM_OPT=none (~127 s); fresh processes, serial",
+    "O2_cache_disabled_wall_s": [
+      6.828592,
+      6.7326,
+      6.717379
+    ],
+    "none_cache_disabled_wall_s": [
+      5.844127,
+      5.962431,
+      5.981367
+    ],
+    "O2_cache_miss_wall_s": [
+      6.8,
+      6.81,
+      6.77
+    ],
+    "O2_cache_hit_wall_s": [
+      2.84,
+      2.79,
+      2.77
+    ],
+    "timing_method": "cache rows via /usr/bin/time -p (2-decimal precision); others via regression/measure-llvm-bootstrap.py"
   }
 }

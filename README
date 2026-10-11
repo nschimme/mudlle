@@ -227,7 +227,9 @@ ORC namespaces; older LLVM includes sequence-prefixed symbols in the key.
 Three sequential samples per configuration, fresh processes, warm filesystem
 cache, no CPU pinning. The kernel performs 100 million integer-reduction
 iterations; its CPU timer starts after compilation and linking. Startup loads
-`icxc.mud` and checks `iadd(20,22)`. ARM64 compiler startup was not measured.
+`icxc.mud` and checks `iadd(20,22)`. ARM64 startup uses a compiler bootstrapped
+with `MUDLLE_LLVM_OPT=none` (about 127 s on this host); the cache miss/hit rows
+were timed with `/usr/bin/time` (3 samples each) rather than the JSON runner.
 
 | Platform / backend | Configuration | Kernel CPU median (ms) | Startup wall median (s) |
 |--------------------|---------------|------------------------|-------------------------|
@@ -236,14 +238,14 @@ iterations; its CPU timer starts after compilation and linking. Startup loads
 | x86_64, LLVM 19.1.7 | LLVM none, cache disabled | 368 | 4.766852 |
 | x86_64, LLVM 19.1.7 | LLVM O2, cache miss | 38 | 40.533222 |
 | x86_64, LLVM 19.1.7 | LLVM O2, cache hit | 37 | 0.697817 |
-| Apple Silicon, LLVM 23.1.3 | LLVM O2, cache disabled | 72 | — |
-| Apple Silicon, LLVM 23.1.3 | LLVM none, cache disabled | 319 | — |
-| Apple Silicon, LLVM 23.1.3 | LLVM O2, cache miss | 70 | — |
-| Apple Silicon, LLVM 23.1.3 | LLVM O2, cache hit | 69 | — |
+| Apple Silicon, LLVM 23.1.3 | LLVM O2, cache disabled | 72 | 6.732600 |
+| Apple Silicon, LLVM 23.1.3 | LLVM none, cache disabled | 319 | 5.961800 |
+| Apple Silicon, LLVM 23.1.3 | LLVM O2, cache miss | 70 | 6.80 |
+| Apple Silicon, LLVM 23.1.3 | LLVM O2, cache hit | 69 | 2.79 |
 
 The x86_64 results predate per-pass verification changes; ARM64 uses source
 `229cf29`. Different hosts and LLVM versions prevent a direct regression or ABI
-comparison. The ARM64 compiler bootstrap was still running when stopped.
+comparison.
 Full samples and provenance: `doc/benchmarks/2026-10-11-native-cache.json` and
 `doc/benchmarks/2026-10-11-arm64.json`.
 
