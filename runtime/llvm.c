@@ -153,6 +153,74 @@ static void llvm_verify_module(LLVMModuleRef module,
     }
 }
 
+static void llvm_unresolved_symbol_stub(void)
+{
+  runtime_error(error_bad_value);
+}
+
+#define LLVM_SYMBOL_ENTRY(fn) \
+  { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, #fn), \
+    { (LLVMOrcExecutorAddress)(uintptr_t)&(fn), \
+      { LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable, 0 } } }
+
+#define LLVM_SYMBOL_ENTRY_VAL(name, fn) \
+  { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, name), \
+    { (LLVMOrcExecutorAddress)(uintptr_t)(fn), \
+      { LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable, 0 } } }
+
+static void llvm_orc_register_absolute_symbols(LLVMOrcJITDylibRef dylib)
+{
+  LLVMOrcCSymbolMapPair symbols[] = {
+    { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "internal_xcount"),
+      { (LLVMOrcExecutorAddress)(uintptr_t)&internal_xcount,
+        { LLVMJITSymbolGenericFlagsExported, 0 } } },
+    LLVM_SYMBOL_ENTRY(llvm_raise_error),
+    LLVM_SYMBOL_ENTRY(llvm_loop_check),
+    LLVM_SYMBOL_ENTRY(llvm_loop_slow_path),
+    LLVM_SYMBOL_ENTRY(llvm_check_type),
+    LLVM_SYMBOL_ENTRY(llvm_check_integer_pair),
+    LLVM_SYMBOL_ENTRY(llvm_check_typeset),
+    LLVM_SYMBOL_ENTRY(llvm_check_mutable),
+    LLVM_SYMBOL_ENTRY(llvm_type_matches),
+    LLVM_SYMBOL_ENTRY(llvm_object_length),
+    LLVM_SYMBOL_ENTRY(llvm_predicate),
+    LLVM_SYMBOL_ENTRY(llvm_vector_find),
+    LLVM_SYMBOL_ENTRY(llvm_pair_car),
+    LLVM_SYMBOL_ENTRY(llvm_pair_cdr),
+    LLVM_SYMBOL_ENTRY(llvm_equal),
+    LLVM_SYMBOL_ENTRY(llvm_build_vector),
+    LLVM_SYMBOL_ENTRY(llvm_concat_strings),
+    LLVM_SYMBOL_ENTRY(llvm_check_arity),
+    LLVM_SYMBOL_ENTRY(llvm_argument_get),
+    LLVM_SYMBOL_ENTRY(llvm_make_varargs),
+    LLVM_SYMBOL_ENTRY(llvm_global_read),
+    LLVM_SYMBOL_ENTRY(llvm_check_global_read),
+    LLVM_SYMBOL_ENTRY(llvm_global_write),
+    LLVM_SYMBOL_ENTRY(llvm_check_global_write),
+    LLVM_SYMBOL_ENTRY(llvm_gc_roots_enter),
+    LLVM_SYMBOL_ENTRY(llvm_gc_roots_leave),
+    LLVM_SYMBOL_ENTRY(llvm_call_value),
+    LLVM_SYMBOL_ENTRY(llvm_call_global),
+    LLVM_SYMBOL_ENTRY(llvm_variable_new),
+    LLVM_SYMBOL_ENTRY(llvm_variable_get),
+    LLVM_SYMBOL_ENTRY(llvm_variable_set),
+    LLVM_SYMBOL_ENTRY(llvm_make_function_closure),
+    LLVM_SYMBOL_ENTRY(llvm_constant_get),
+    LLVM_SYMBOL_ENTRY(llvm_closure_capture_get),
+    LLVM_SYMBOL_ENTRY(llvm_closure_capture_set),
+    LLVM_SYMBOL_ENTRY_VAL("system", llvm_unresolved_symbol_stub),
+    LLVM_SYMBOL_ENTRY_VAL("execve", llvm_unresolved_symbol_stub),
+    LLVM_SYMBOL_ENTRY_VAL("dlopen", llvm_unresolved_symbol_stub),
+    LLVM_SYMBOL_ENTRY_VAL("mmap", llvm_unresolved_symbol_stub),
+    LLVM_SYMBOL_ENTRY_VAL("popen", llvm_unresolved_symbol_stub),
+    LLVM_SYMBOL_ENTRY_VAL("fork", llvm_unresolved_symbol_stub)
+  };
+  size_t count = sizeof symbols / sizeof symbols[0];
+  LLVMOrcMaterializationUnitRef mu = LLVMOrcAbsoluteSymbols(symbols, count);
+  llvm_orc_check_error(LLVMOrcJITDylibDefine(dylib, mu));
+}
+
+
 static void llvm_orc_initialize(void)
 {
   if (llvm_orc_jit != NULL)
@@ -165,14 +233,11 @@ static void llvm_orc_initialize(void)
   if (LLVMInitializeNativeTarget() || LLVMInitializeNativeAsmPrinter())
     runtime_error(error_bad_value);
 
+
   /* A default LLJIT compiles on the calling thread; no worker pool is used. */
   llvm_orc_check_error(LLVMOrcCreateLLJIT(&llvm_orc_jit, NULL));
   llvm_orc_create_target_machine();
-  LLVMOrcDefinitionGeneratorRef generator;
-  llvm_orc_check_error(LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
-    &generator, LLVMOrcLLJITGetGlobalPrefix(llvm_orc_jit), NULL, NULL));
-  LLVMOrcJITDylibAddGenerator(
-    LLVMOrcLLJITGetMainJITDylib(llvm_orc_jit), generator);
+  llvm_orc_register_absolute_symbols(LLVMOrcLLJITGetMainJITDylib(llvm_orc_jit));
 }
 
 /* Cache files are private, disposable native-code artifacts. The complete key
@@ -306,10 +371,7 @@ static LLVMOrcJITDylibRef llvm_orc_module_dylib(size_t sequence)
   LLVMOrcJITDylibRef dylib;
   LLVMOrcExecutionSessionRef session = LLVMOrcLLJITGetExecutionSession(llvm_orc_jit);
   llvm_orc_check_error(LLVMOrcExecutionSessionCreateJITDylib(session, &dylib, name));
-  LLVMOrcDefinitionGeneratorRef generator;
-  llvm_orc_check_error(LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
-    &generator, LLVMOrcLLJITGetGlobalPrefix(llvm_orc_jit), NULL, NULL));
-  LLVMOrcJITDylibAddGenerator(dylib, generator);
+  llvm_orc_register_absolute_symbols(dylib);
   return dylib;
 #endif
 }
@@ -709,71 +771,6 @@ value llvm_concat_strings(value *arguments, int64_t nargs)
   return concat_strings((long)nargs, (struct string **)arguments);
 }
 
-TYPEDOP(llvm_load_function, "llvm_load_function",
-        "`s `s -> `n. Load a native LLVM shared library and return the address"
-        " of the named function. For the LLVM runtime bridge.",
-        (struct string *library, struct string *symbol),
-        OP_LEAF | OP_NOESCAPE | OP_STR_READONLY, "ss.n")
-{
-  CHECK_TYPES(library, string,
-              symbol, string);
-  llvm_orc_initialize();
-  LLVMOrcDefinitionGeneratorRef generator;
-  llvm_orc_check_error(LLVMOrcCreateDynamicLibrarySearchGeneratorForPath(
-    &generator, library->str, LLVMOrcLLJITGetGlobalPrefix(llvm_orc_jit),
-    NULL, NULL));
-  LLVMOrcJITDylibAddGenerator(
-    LLVMOrcLLJITGetMainJITDylib(llvm_orc_jit), generator);
-
-  LLVMOrcExecutorAddress function;
-  llvm_orc_check_error(LLVMOrcLLJITLookup(
-    llvm_orc_jit, &function, symbol->str));
-  return makeint((intptr_t)(uintptr_t)function);
-}
-
-typedef int64_t (*llvm_native_fn0)(int64_t);
-typedef int64_t (*llvm_native_fn1)(int64_t, int64_t);
-typedef int64_t (*llvm_native_fn2)(int64_t, int64_t, int64_t);
-typedef int64_t (*llvm_native_fn3)(int64_t, int64_t, int64_t, int64_t);
-typedef int64_t (*llvm_native_fn4)(int64_t, int64_t, int64_t, int64_t,
-                                   int64_t);
-typedef int64_t (*llvm_native_fn5)(int64_t, int64_t, int64_t, int64_t,
-                                   int64_t, int64_t);
-typedef int64_t (*llvm_native_fn6)(int64_t, int64_t, int64_t, int64_t,
-                                   int64_t, int64_t, int64_t);
-
-VAROP(llvm_call_function, "llvm_call_function",
-      "`n `n `x... -> `x. Call an LLVM C ABI function with an environment"
-      " value followed by its Mudlle arguments. Supports up to six arguments.",
-      (value mfunction, value menv, struct vector *arguments),
-      OP_TRACE, "nnx*.")
-{
-  long function_address, env_value;
-  CHECK_TYPES(mfunction, CT_INT(function_address),
-              menv, CT_INT(env_value),
-              arguments, CT_ARGV(0, 6));
-  if (function_address == 0)
-    RUNTIME_ERROR(error_bad_value, "null LLVM function address");
-
-  int64_t fnargs[6];
-  size_t nargs = vector_len(arguments);
-  for (size_t i = 0; i < nargs; ++i)
-    fnargs[i] = (int64_t)(uintptr_t)arguments->data[i];
-  int64_t env = env_value;
-  int64_t result;
-  switch (nargs)
-    {
-    case 0: result = ((llvm_native_fn0)(uintptr_t)function_address)(env); break;
-    case 1: result = ((llvm_native_fn1)(uintptr_t)function_address)(env, fnargs[0]); break;
-    case 2: result = ((llvm_native_fn2)(uintptr_t)function_address)(env, fnargs[0], fnargs[1]); break;
-    case 3: result = ((llvm_native_fn3)(uintptr_t)function_address)(env, fnargs[0], fnargs[1], fnargs[2]); break;
-    case 4: result = ((llvm_native_fn4)(uintptr_t)function_address)(env, fnargs[0], fnargs[1], fnargs[2], fnargs[3]); break;
-    case 5: result = ((llvm_native_fn5)(uintptr_t)function_address)(env, fnargs[0], fnargs[1], fnargs[2], fnargs[3], fnargs[4]); break;
-    case 6: result = ((llvm_native_fn6)(uintptr_t)function_address)(env, fnargs[0], fnargs[1], fnargs[2], fnargs[3], fnargs[4], fnargs[5]); break;
-    default: abort();
-    }
-  return (value)(uintptr_t)result;
-}
 
 typedef int64_t (*llvm_native_entry)(int64_t, value *, int64_t);
 
@@ -1145,7 +1142,7 @@ int64_t llvm_call_global(int64_t raw_caller, int64_t raw_name,
   return (int64_t)(uintptr_t)result;
 }
 
-STATIC_STRING(llvm_function_closure_help,
+STATIC_STRING(llvm_ir_closure_help,
               "Calls an LLVM native function as a Mudlle closure.");
 
 /* Create a generated function closure with its lexical environment. */
@@ -1228,7 +1225,7 @@ value llvm_make_function_closure(int64_t address, int64_t nargs,
   data->stable = ncaptures == 0;
   struct closure *closure = make_mcallback_varargs_captured_sec(
     llvm_call_closure, llvm_free_callback, data, env,
-    "llvm_function_closure", GET_STATIC_STRING(llvm_function_closure_help),
+    "llvm_function_closure", GET_STATIC_STRING(llvm_ir_closure_help),
     __FILE__, __LINE__, parent_seclevel);
   closure->code->arguments = (struct vector *)arguments_metadata;
   closure->code->return_typeset = (typeset_t)return_typeset;
@@ -1309,10 +1306,10 @@ void llvm_variable_set(int64_t raw_variable, int64_t raw_value)
   ((struct variable *)v)->vvalue = (value)(uintptr_t)raw_value;
 }
 
-TYPEDOP(llvm_load_ir_closure, "llvm_load_ir_closure",
-        "`s `s `n `n `v `v -> `f. Compile LLVM IR, relocate globals, and wrap its entry point.",
-        (struct string *ir, struct string *symbol, value mnargs,
-         value mseclev, struct vector *runtime_data), OP_TRACE, "ssnnv.f")
+UNSAFEOP(llvm_load_ir_closure, "llvm_load_ir_closure",
+         "`s `s `n `n `v `v -> `f. Compile LLVM IR, relocate globals, and wrap its entry point.",
+         (struct string *ir, struct string *symbol, value mnargs,
+          value mseclev, struct vector *runtime_data), OP_TRACE, "ssnnv.f")
 {
   long nargs, seclev;
   CHECK_TYPES(ir, string,
@@ -1428,7 +1425,7 @@ TYPEDOP(llvm_load_ir_closure, "llvm_load_ir_closure",
       captures->data[0] = mconstants;
       struct closure *closure = make_mcallback_varargs_captured_sec(
         llvm_call_closure, llvm_free_callback, data, captures,
-        "llvm_load_ir_closure", GET_STATIC_STRING(llvm_function_closure_help),
+        "llvm_load_ir_closure", GET_STATIC_STRING(llvm_ir_closure_help),
         __FILE__, __LINE__, (seclev_t)seclev);
       UNGCPRO();
       return closure;
@@ -1449,60 +1446,13 @@ TYPEDOP(llvm_load_ir_closure, "llvm_load_ir_closure",
   captures->data[0] = mconstants;
   struct closure *closure = make_mcallback_varargs_captured_sec(
     llvm_call_closure, llvm_free_callback, data, captures,
-    "llvm_load_ir_closure", GET_STATIC_STRING(llvm_function_closure_help),
+    "llvm_load_ir_closure", GET_STATIC_STRING(llvm_ir_closure_help),
     __FILE__, __LINE__, (seclev_t)seclev);
   UNGCPRO();
   return closure;
 }
 
-TYPEDOP(llvm_function_closure, "llvm_function_closure",
-        "`n `n -> `f. Wrap an LLVM entry point and its arity as a Mudlle closure.",
-        (value mfunction, value mnargs), OP_TRACE, "nn.f")
-{
-  long address;
-  long nargs;
-  CHECK_TYPES(mfunction, CT_INT(address),
-              mnargs, CT_RANGE(nargs, 0, MAX_FUNCTION_ARGS));
-  if (address == 0)
-    RUNTIME_ERROR(error_bad_value, "null LLVM function address");
-
-  struct llvm_callback_data *data = malloc(sizeof *data);
-  if (data == NULL)
-    RUNTIME_ERROR(error_bad_value, "out of memory");
-  struct gcpro *old_gcpro = gcpro;
-  data->entry = (llvm_native_entry)(uintptr_t)address;
-  data->nargs = (size_t)nargs;
-  data->check_arity = true;
-  data->stable = false;
-  struct vector *constants = alloc_vector(0);
-  struct gcpro constants_root;
-  GCPROV(constants_root, constants);
-  struct vector *captures = alloc_vector(1);
-  struct gcpro captures_root;
-  GCPROV(captures_root, captures);
-  captures->data[0] = constants;
-  struct closure *closure = make_mcallback_varargs_captured_sec(
-    llvm_call_closure, llvm_free_callback, data, captures,
-    "llvm_function_closure", GET_STATIC_STRING(llvm_function_closure_help),
-    __FILE__, __LINE__, c_maxseclevel());
-  gcpro = old_gcpro;
-  return closure;
-}
-
-TYPEDOP(system_cmd, "system_cmd",
-        "`s -> `n. Executes shell command `s.",
-        (struct string *cmd),
-        OP_LEAF | OP_NOESCAPE | OP_NOALLOC, "s.n")
-{
-  CHECK_TYPES(cmd, string);
-  return makeint(system(cmd->str));
-}
-
 void llvm_init(void)
 {
-  DEFINE(system_cmd);
-  DEFINE(llvm_load_function);
   DEFINE(llvm_load_ir_closure);
-  DEFINE(llvm_call_function);
-  DEFINE(llvm_function_closure);
 }
