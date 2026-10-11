@@ -16,7 +16,10 @@ Linux Setup and Backend Validation
 ----------------------------------
 On Debian or Ubuntu, install the build tools and LLVM development files:
 
-  sudo apt install build-essential flex bison python3 libgmp-dev libreadline-dev llvm llvm-dev
+  sudo apt install build-essential flex bison perl libgmp-dev libreadline-dev llvm llvm-dev
+
+Python 3 is needed only for the optional benchmark and test scripts under
+`regression/`; the build itself uses Perl.
 
 The build detects LLVM through `llvm-config`; normal JIT execution does not
 need the LLVM command-line tools. Keep the LLVM headers, C API library, and

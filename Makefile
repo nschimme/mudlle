@@ -227,9 +227,9 @@ FORCE_LLVM_CACHE_ABI:
 
 LLVM_CACHE_ABI_GENERATED := $(OBJDEP) $(BUILTINDEPS) genconstdefs.h \
 	parser.tab.h lexer.c runtime/mudllecst.c
-runtime/llvm-cache-abi.h: FORCE_LLVM_CACHE_ABI $(srcdir)runtime/llvm-cache-abi.py $(srcdir)Makefile $(LLVM_CACHE_ABI_GENERATED)
+runtime/llvm-cache-abi.h: FORCE_LLVM_CACHE_ABI $(srcdir)runtime/llvm-cache-abi.pl $(srcdir)Makefile $(LLVM_CACHE_ABI_GENERATED)
 	@echo "Creating $@"
-	$(Q)python3 $(srcdir)runtime/llvm-cache-abi.py \
+	$(Q)perl $(srcdir)runtime/llvm-cache-abi.pl \
 	    --source-dir "$(srcdir)" --makefile "$(srcdir)Makefile" \
 	    --cflags="$(CFLAGS)" --cppflags="$(CPPFLAGS)" --output "$@"
 

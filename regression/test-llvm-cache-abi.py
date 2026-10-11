@@ -20,21 +20,15 @@
 
 """Tests for the LLVM native object cache ABI fingerprint generator."""
 
-import importlib.util
 import os
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-GENERATOR = ROOT / "runtime" / "llvm-cache-abi.py"
-sys.dont_write_bytecode = True
-SPEC = importlib.util.spec_from_file_location("llvm_cache_abi", GENERATOR)
-ABI = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(ABI)
+GENERATOR = ROOT / "runtime" / "llvm-cache-abi.pl"
 
 
 class CacheABITest(unittest.TestCase):
@@ -55,7 +49,15 @@ class CacheABITest(unittest.TestCase):
             (self.source_dir / relative).write_text(content, encoding="utf-8")
 
     def fingerprint(self, cflags="-O2", cppflags="-I."):
-        return ABI.digest(self.source_dir, self.makefile, cflags, cppflags)
+        output = self.runtime_dir / "fingerprint.h"
+        subprocess.run(["perl", str(GENERATOR),
+                        "--source-dir", str(self.source_dir),
+                        "--makefile", str(self.makefile),
+                        f"--cflags={cflags}", f"--cppflags={cppflags}",
+                        "--output", str(output)], check=True)
+        value = output.read_text(encoding="ascii")
+        output.unlink()
+        return value
 
     def test_sources_makefile_and_flags_change_fingerprint(self):
         baseline = self.fingerprint()
@@ -85,7 +87,7 @@ class CacheABITest(unittest.TestCase):
     def test_regeneration_preserves_mtime_when_content_is_unchanged(self):
         output = self.runtime_dir / "llvm-cache-abi.h"
         command = [
-            sys.executable, str(GENERATOR),
+            "perl", str(GENERATOR),
             "--source-dir", str(self.source_dir),
             "--makefile", str(self.makefile),
             "--cflags=-O2", "--cppflags=-I.",
