@@ -187,6 +187,7 @@ static void llvm_orc_register_absolute_symbols(LLVMOrcJITDylibRef dylib)
     LLVM_SYMBOL_ENTRY(llvm_vector_find),
     LLVM_SYMBOL_ENTRY(llvm_pair_car),
     LLVM_SYMBOL_ENTRY(llvm_pair_cdr),
+    LLVM_SYMBOL_ENTRY(llvm_cons),
     LLVM_SYMBOL_ENTRY(llvm_equal),
     LLVM_SYMBOL_ENTRY(llvm_build_vector),
     LLVM_SYMBOL_ENTRY(llvm_concat_strings),
@@ -642,6 +643,21 @@ int64_t llvm_pair_cdr(int64_t raw_pair)
   if (!TYPE(pair, pair))
     bad_type_error((value)pair, type_pair, -1);
   return (int64_t)(uintptr_t)pair->cdr;
+}
+
+/* Direct cons/pcons: arguments are by value and rooted by alloc_list. */
+int64_t llvm_cons(int64_t raw_car, int64_t raw_cdr, int64_t readonly);
+
+int64_t llvm_cons(int64_t raw_car, int64_t raw_cdr, int64_t readonly)
+{
+  value car = (value)(uintptr_t)raw_car, cdr = (value)(uintptr_t)raw_cdr;
+  struct list *p = alloc_list(car, cdr);
+  if (readonly)
+    {
+      unsigned imm = immutablep(car) && immutablep(cdr) ? OBJ_IMMUTABLE : 0;
+      p->o.flags |= OBJ_READONLY | imm;
+    }
+  return (int64_t)(uintptr_t)p;
 }
 
 int32_t llvm_predicate(int64_t raw_value, int64_t predicate)

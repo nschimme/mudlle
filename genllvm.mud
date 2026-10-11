@@ -1572,9 +1572,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               arg = llvm_read_var(car(args), w);
               tmp_seq = tmp_seq + 1;
               res = format("%%res_%d", tmp_seq);
-              helper = if (op == mc:b_car) "llvm_pair_car" else "llvm_pair_cdr";
-              writer:format(w, "  %s = call i64 @%s(i64 %s)\n",
-                            res, helper, arg);
+              writer:format(w,
+                "  %s = call i64 @mudlle_pair_field(i64 %s, i64 %d)\n",
+                res, arg, if (op == mc:b_car) 16 else 24);
               llvm_write_var(dest_var, res, w);
               exit<function> null;
             ];
@@ -1610,9 +1610,21 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               tmp_seq = tmp_seq + 1;
               result = format("%%vlength_%d", tmp_seq);
               writer:format(w,
-                "  %s = call i64 @llvm_object_length(i64 %s, i64 0)\n",
+                "  %s = call i64 @mudlle_vector_length(i64 %s)\n",
                 result, value);
               llvm_write_var(dest_var, result, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_cons || op == mc:b_pcons)
+            [
+              | a, b, res |
+              a = llvm_read_var(car(args), w);
+              b = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              res = format("%%cons_%d", tmp_seq);
+              writer:format(w, "  %s = call i64 @llvm_cons(i64 %s, i64 %s, i64 %d)\n",
+                            res, a, b, if (op == mc:b_pcons) 1 else 0);
+              llvm_write_var(dest_var, res, w);
               exit<function> null;
             ];
           if (op == mc:b_slength || op == mc:b_vlength
@@ -2191,6 +2203,54 @@ no:
   ret i32 0
 }
 """, type_vector);
+      // Pair access and vector length: tag and type test, then a direct load.
+      // Failures call the runtime helpers, which raise the usual diagnostics.
+      writer:format(w, """
+define internal i64 @mudlle_pair_field(i64 %%value, i64 %%offset) {
+entry:
+  %%tag = and i64 %%value, 1
+  %%even = icmp eq i64 %%tag, 0
+  %%nonnull = icmp ne i64 %%value, 0
+  %%pointer = and i1 %%even, %%nonnull
+  br i1 %%pointer, label %%header, label %%slow
+header:
+  %%object = inttoptr i64 %%value to ptr
+  %%typeptr = getelementptr i8, ptr %%object, i64 9
+  %%type = load i8, ptr %%typeptr, align 1
+  %%matches = icmp eq i8 %%type, %d
+  br i1 %%matches, label %%fast, label %%slow
+fast:
+  %%fieldptr = getelementptr i8, ptr %%object, i64 %%offset
+  %%field = load i64, ptr %%fieldptr, align 8
+  ret i64 %%field
+slow:
+  %%isdr = icmp eq i64 %%offset, 24
+  br i1 %%isdr, label %%slow_cdr, label %%slow_car
+slow_car:
+  %%c0 = call i64 @llvm_pair_car(i64 %%value)
+  ret i64 %%c0
+slow_cdr:
+  %%c1 = call i64 @llvm_pair_cdr(i64 %%value)
+  ret i64 %%c1
+}
+define internal i64 @mudlle_vector_length(i64 %%value) {
+entry:
+  %%matches = call i32 @mudlle_vector_matches(i64 %%value)
+  %%ok = icmp ne i32 %%matches, 0
+  br i1 %%ok, label %%fast, label %%slow
+fast:
+  %%object = inttoptr i64 %%value to ptr
+  %%size = load i64, ptr %%object, align 8
+  %%bytes = sub i64 %%size, 16
+  %%length = lshr i64 %%bytes, 3
+  %%shifted = shl i64 %%length, 1
+  %%tagged = or i64 %%shifted, 1
+  ret i64 %%tagged
+slow:
+  %%r = call i64 @llvm_object_length(i64 %%value, i64 0)
+  ret i64 %%r
+}
+""", type_pair);
       writer:format(w, """
 define internal void @mudlle_check_vector(i64 %%value, i64 %%expected) {
 entry:
@@ -2241,6 +2301,7 @@ done:
       writer:write_line(w, "declare i32 @llvm_predicate(i64, i64)\n");
       writer:write_line(w, "declare i32 @llvm_vector_find(i64, i64)\n");
       writer:write_line(w, "declare i64 @llvm_pair_car(i64)\n");
+      writer:write_line(w, "declare i64 @llvm_cons(i64, i64, i64)\n");
       writer:write_line(w, "declare i64 @llvm_pair_cdr(i64)\n");
       writer:write_line(w, "declare i32 @llvm_equal(i64, i64)\n");
       writer:write_line(w, "declare ptr @llvm_gc_roots_enter(ptr, i64, ptr)\n");
