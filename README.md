@@ -249,6 +249,20 @@ comparison.
 Full samples and provenance: `doc/benchmarks/2026-10-11-native-cache.json` and
 `doc/benchmarks/2026-10-11-arm64.json`.
 
+Interpreter comparison on Apple Silicon (LLVM 23.1.3), same loop as
+`regression/benchmark.mud` (50,000 iterations x 2,000 runs), three runs each,
+cache disabled. `regression/benchmark-interpreter.mud` runs the loop without
+the compiler:
+
+| Backend | CPU median (ms) | Speedup vs interpreter |
+|---------|-----------------|------------------------|
+| Interpreter | 3024 | 1x |
+| LLVM none | 283 | ~11x |
+| LLVM O2 | 63 | ~48x |
+
+This is one tight integer loop, a best case for compiled code rather than a
+general speed estimate.
+
 Reproduce kernel/cache measurements on Apple Silicon after building with
 Homebrew Bison, Flex, and LLVM:
 
