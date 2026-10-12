@@ -91,17 +91,17 @@ timed runs; the other kernels: 7 processes.
 
 | Workload | LLVM | x64 | LLVM / x64 |
 |----------|-----:|----:|-----------:|
-| Integer loop (50,000 x 2,000) | 39 | 88 | 0.44 |
-| Native list/vector conversion, width 257 | 27 | 37 | 0.73 |
-| Native list/vector conversion, width 32 | 18 | 22 | 0.82 |
-| Floating point (100,000 steps per call) | 119 | 138 | 0.86 |
-| Library list/vector round trip, width 32 (interpreted `misc.mud`) | 178 | 173 | 1.03 |
-| Bigint (20,000 steps per call) | 63 | 61 | 1.03 |
-| Mixed bigint/float | 41 | 39 | 1.05 |
+| Integer loop (50,000 x 2,000) | 42 | 93 | 0.45 |
+| Native list/vector conversion, width 257 | 27 | 35 | 0.77 |
+| Native list/vector conversion, width 32 | 17 | 21 | 0.81 |
+| Floating point (100,000 steps per call) | 115 | 136 | 0.85 |
+| Library list/vector round trip, width 32 (interpreted `misc.mud`) | 161 | 163 | 0.99 |
+| Bigint (20,000 steps per call) | 61 | 56 | 1.09 |
+| Mixed bigint/float | 44 | 37 | 1.19 |
 | Tables, 257 keys | 13 | 10 | 1.30 |
 | Tables, 32 keys | 12 | 9 | 1.33 |
 | Recursive local closure, `fib(27)` | 21 | 12 | 1.75 |
-| Local closure called in a loop (2,000,000 iterations per call) | 80 | 29 | 2.76 |
+| Local closure called in a loop (2,000,000 iterations per call) | 65 | 31 | 2.10 |
 
 Notes:
 
@@ -110,9 +110,10 @@ Notes:
   which run interpreted in both builds.
 - Float and bigint use the explicit `f*` / `bi*` primitives (what
   `#arith(f)` and `#arith(b)` expand to).
-- x64 inlines known local functions. LLVM calls statically known functions
-  (recursion and local function literals) directly but does not inline them,
-  which is the main remaining gap on call-heavy code.
+- LLVM calls statically known functions directly, inlines small ones
+  (`alwaysinline`) and caches shared closures in rooted per-function slots;
+  each call still builds a call frame and saves and restores the security
+  level, which is the main remaining gap on call-heavy code.
 - `cpu_ms` is `ctime()` summed over the timed calls: 5 calls per kernel (the
   integer loop is 2,000 calls); compilation and JIT startup are excluded. The
   startup cost of compiling the compiler under LLVM is not measured here.
