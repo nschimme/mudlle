@@ -47,6 +47,8 @@ or `-j8` to compile the compiler faster while retaining O2.
 
 On ARM64 and RISC-V the LLVM backend is the only compiler. Without LLVM the
 interpreter remains available.
+RISC-V has been tested only under qemu; see [`doc/riscv.md`](doc/riscv.md) for
+the status and a container recipe.
 
 Test (each build should print `SUCCESS`):
 

@@ -1,0 +1,12 @@
+# RISC-V (riscv64) build and test environment for mudlle.
+#
+# On a non-RISC-V host this needs qemu user-mode emulation registered with
+# binfmt_misc (Debian/Ubuntu: apt install qemu-user-static binfmt-support).
+# See doc/riscv.md.
+FROM docker.io/library/debian:trixie
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential flex bison perl libgmp-dev libreadline-dev \
+        llvm llvm-dev git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
