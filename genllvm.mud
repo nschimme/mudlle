@@ -714,18 +714,25 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                     entry_address, ifn[mc:c_fnumber]);
       args_index = llvm_constant_index(mc:function_closure_args(ifn));
       args_metadata = format("%%closure_args_%d", tmp);
-      writer:format(w,
-        "  %s = call i64 @llvm_constant_get(i64 %s, i64 %d)\n",
-        args_metadata, llvm_read_env(w), args_index);
-      writer:format(w,
-        "  %s = call i64 @%s(i64 %s, i64 %d, ptr %s,\
- i64 %d, i64 %d, i64 %s, i64 %s, i64 %d)\n",
-        res,
-        if (for_call && ncaptures == 0) "llvm_make_function_closure_for_call"
-        else "llvm_make_function_closure",
-        entry_address, llength(ifn[mc:c_ffullargs]), captures_ptr,
-        ncaptures, self_capture, llvm_read_env(w), args_metadata,
-        ifn[mc:c_freturn_typeset]);
+      if (for_call && ncaptures == 0)
+        // Looks up a shared closure in IR; only a miss reads the metadata.
+        writer:format(w,
+          "  %s = call i64 @mudlle_closure_for_call(i64 %s, i64 %s, i64 %d,\
+ i64 %d, i64 %d)\n",
+          res, llvm_read_env(w), entry_address, llength(ifn[mc:c_ffullargs]),
+          args_index, ifn[mc:c_freturn_typeset])
+      else
+        [
+          writer:format(w,
+            "  %s = call i64 @llvm_constant_get(i64 %s, i64 %d)\n",
+            args_metadata, llvm_read_env(w), args_index);
+          writer:format(w,
+            "  %s = call i64 @llvm_make_function_closure(i64 %s, i64 %d,\
+ ptr %s, i64 %d, i64 %d, i64 %s, i64 %s, i64 %d)\n",
+            res, entry_address, llength(ifn[mc:c_ffullargs]), captures_ptr,
+            ncaptures, self_capture, llvm_read_env(w), args_metadata,
+            ifn[mc:c_freturn_typeset]);
+        ];
       if (ncaptures != 0)
         [
           writer:format(w, "  call void @mudlle_roots_leave(ptr %s)\n",
@@ -2530,6 +2537,51 @@ entry:
   store i8 %%oldlvl, ptr @internal_seclevel, align 1
   store i8 %%oldvalid, ptr @seclevel_valid, align 1
   ret i64 %%res
+}
+""");
+      // Shared capture-free closure for an immediate call: the same direct-mapped
+      // cache as llvm_make_function_closure_for_call, probed without a call.
+      writer:write_line(w, "@llvm_call_closure_cache = external global ptr\n");
+      writer:format(w, """
+define internal i64 @mudlle_closure_for_call(i64 %%env, i64 %%address, i64 %%nargs, i64 %%argsindex, i64 %%rettypes) {
+entry:
+  %%envp = inttoptr i64 %%env to ptr
+  %%v1slot = getelementptr inbounds i8, ptr %%envp, i64 32
+  %%v1 = load ptr, ptr %%v1slot, align 8
+  %%cache = load ptr, ptr @llvm_call_closure_cache, align 8
+  %%havev = icmp ne ptr %%v1, null
+  %%havec = icmp ne ptr %%cache, null
+  %%usable = and i1 %%havev, %%havec
+  br i1 %%usable, label %%look, label %%slow
+look:
+  %%cslot = getelementptr inbounds i8, ptr %%v1, i64 16
+  %%cs = load i64, ptr %%cslot, align 8
+  %%a4 = lshr i64 %%address, 4
+  %%c4 = lshr i64 %%cs, 4
+  %%h = xor i64 %%a4, %%c4
+  %%slotno = and i64 %%h, 63
+  %%off = mul i64 %%slotno, 24
+  %%base = getelementptr inbounds i8, ptr %%cache, i64 16
+  %%cent = getelementptr inbounds i8, ptr %%base, i64 %%off
+  %%e0 = load i64, ptr %%cent, align 8
+  %%e1p = getelementptr inbounds i8, ptr %%cent, i64 8
+  %%e1 = load i64, ptr %%e1p, align 8
+  %%e2p = getelementptr inbounds i8, ptr %%cent, i64 16
+  %%e2 = load i64, ptr %%e2p, align 8
+  %%tagged = shl i64 %%address, 1
+  %%want = or i64 %%tagged, 1
+  %%m0 = icmp eq i64 %%e0, %%want
+  %%m1 = icmp eq i64 %%e1, %%cs
+  %%m2 = icmp ne i64 %%e2, 0
+  %%m01 = and i1 %%m0, %%m1
+  %%hit = and i1 %%m01, %%m2
+  br i1 %%hit, label %%done, label %%slow
+done:
+  ret i64 %%e2
+slow:
+  %%md = call i64 @llvm_constant_get(i64 %%env, i64 %%argsindex)
+  %%cl = call i64 @llvm_make_function_closure_for_call(i64 %%address, i64 %%nargs, ptr null, i64 0, i64 -1, i64 %%env, i64 %%md, i64 %%rettypes)
+  ret i64 %%cl
 }
 """);
       // Writable heap object: pointer tag, then the read-only flag bit. The

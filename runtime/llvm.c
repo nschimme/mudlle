@@ -184,15 +184,23 @@ _Static_assert(sizeof (struct call_stack_mudlle) == 56
                && offsetof(struct call_stack_mudlle, offset) == 52,
                "generated IR hardcodes struct call_stack_mudlle");
 _Static_assert(offsetof(struct closure, code) == 16
+               && offsetof(struct closure, variables) == 24
+               && offsetof(struct variable, vvalue) == 16
+               && offsetof(struct vector, data) == 16
                && offsetof(struct code, seclevel) == 58
                && sizeof (seclev_t) == 1 && sizeof (seclevel_valid) == 1,
                "generated IR hardcodes closure/code layout");
+
+extern struct vector *llvm_call_closure_cache;
 
 static void llvm_orc_register_absolute_symbols(LLVMOrcJITDylibRef dylib)
 {
   LLVMOrcCSymbolMapPair symbols[] = {
     { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "internal_xcount"),
       { (LLVMOrcExecutorAddress)(uintptr_t)&internal_xcount,
+        { LLVMJITSymbolGenericFlagsExported, 0 } } },
+    { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "llvm_call_closure_cache"),
+      { (LLVMOrcExecutorAddress)(uintptr_t)&llvm_call_closure_cache,
         { LLVMJITSymbolGenericFlagsExported, 0 } } },
     { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "call_stack"),
       { (LLVMOrcExecutorAddress)(uintptr_t)&call_stack,
@@ -1507,7 +1515,9 @@ value llvm_make_function_closure(int64_t address, int64_t nargs,
 /* A capture-free closure that is only called at once has no observable
    identity, so one per (code address, enclosing constants) is shared. */
 #define LLVM_CALL_CLOSURE_CACHE_SIZE 64
-static struct vector *llvm_call_closure_cache;
+_Static_assert(LLVM_CALL_CLOSURE_CACHE_SIZE == 64,
+               "mudlle_closure_for_call in genllvm.mud masks with 63");
+struct vector *llvm_call_closure_cache;
 
 value llvm_make_function_closure_for_call(
   int64_t address, int64_t nargs, value *captures, int64_t ncaptures,
@@ -1533,7 +1543,7 @@ value llvm_make_function_closure_for_call(
                                       self_capture, parent_env,
                                       raw_arguments, return_typeset);
   size_t slot = (((uintptr_t)address >> 4) ^ ((uintptr_t)constants >> 4))
-    % LLVM_CALL_CLOSURE_CACHE_SIZE;
+    & (LLVM_CALL_CLOSURE_CACHE_SIZE - 1);
   value *entry = &llvm_call_closure_cache->data[3 * slot];
   if (entry[0] == makeint(address) && entry[1] == constants && entry[2] != NULL)
     return entry[2];
@@ -1546,7 +1556,7 @@ value llvm_make_function_closure_for_call(
   struct gcpro closure_root;
   GCPROV(closure_root, closure);
   slot = (((uintptr_t)address >> 4) ^ ((uintptr_t)constants >> 4))
-    % LLVM_CALL_CLOSURE_CACHE_SIZE;
+    & (LLVM_CALL_CLOSURE_CACHE_SIZE - 1);
   entry = &llvm_call_closure_cache->data[3 * slot];
   entry[0] = makeint(address);
   entry[1] = constants;
