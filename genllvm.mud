@@ -50,7 +50,8 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
     llvm_function_may_allocate?, llvm_allocate_slots, llvm_slot_number,
     slot_indices, llvm_instruction_may_allocate?, root_slot_indices, nonallocating_ops, nonallocating_branches, vector_find_required,
     llvm_inline_max_size, closure_cache_fns, closure_cache_seen,
-    float_internal, float_doubles, float_consts, llvm_float_call_op,
+    float_internal, float_doubles, float_consts, known_args_max,
+    llvm_float_call_op,
     llvm_find_float_temps |
 
   llvm_inline_max_size = 3500;
@@ -59,6 +60,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
   float_internal = make_table();
   float_doubles = make_table();
   float_consts = null;
+  known_args_max = 0;
   tmp_seq = 0;
   globals_seen = make_table();
   current_ifn = null;
@@ -1185,6 +1187,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       w = writer:new_string();
       closure_cache_fns = null;
       closure_cache_seen = make_table();
+      known_args_max = 0;
       if (pair?(ifn[mc:c_fvalue])) mc:flatten_blocks(ifn);
       llvm_find_float_temps(ifn);
       fname = format("fn_%d", ifn[mc:c_fnumber]);
@@ -1262,6 +1265,14 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                       | cargs, cvar, cifn |
                       cargs = ins[mc:i_cargs];
                       cvar = car(cargs);
+                      if ((cvar[mc:v_class] == mc:v_function
+                           && llvm_exact_arity?(cvar[mc:v_fvalue],
+                                                llength(cdr(cargs))))
+                          || (cvar[mc:v_class] == mc:v_closure
+                              && cvar[mc:v_cparent] == mc:myself
+                              && llvm_exact_arity?(ifn, llength(cdr(cargs)))))
+                        known_args_max = max(known_args_max,
+                                             llength(cdr(cargs)));
                       if (cvar[mc:v_class] == mc:v_function)
                         [
                           cifn = cvar[mc:v_fvalue];
@@ -1349,6 +1360,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                           slot_ptr);
             root_index = root_index + 1;
           ], closure_cache_fns);
+          if (known_args_max > 0)
+            writer:format(w, "  %%known_args = alloca [%d x i64]\n",
+                          known_args_max);
           root_slots_data = format("%%root_slots_data_%d", ifn[mc:c_fnumber]);
           root_records_data = format("%%root_records_data_%d",
                                      ifn[mc:c_fnumber]);
@@ -2175,7 +2189,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
             root_slots, root_records, root_token, root_slot_ptr,
             root_slots_data, root_records_data, arg_count,
             arg_slot, root_index, call_id, secure_call, floatop, floatres, floatunary,
-            direct_fn, self_call, chain, chain_internal, fop |
+            direct_fn, self_call, chain, chain_internal, fop, static_args |
           dest_var = ins[mc:i_cdest];
           call_args = ins[mc:i_cargs];
           fn_var = car(call_args);
@@ -2395,10 +2409,15 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               // forwards it), so the caller registers no roots for it. The
               // arguments are read from the caller's rooted locals, and the
               // callee closure is not held across an allocation.
+              // The argument array is one static alloca per function, so the
+              // loop body needs no stack save/restore.
+              static_args = arg_count > 0 && known_args_max >= arg_count;
               stack_mark = format("%%call_stack_%d", call_id);
-              arg_array = format("%%call_values_%d", call_id);
-              writer:format(w, "  %s = call ptr @llvm.stacksave()\n",
-                            stack_mark);
+              arg_array = if (static_args) "%known_args"
+                          else format("%%call_values_%d", call_id);
+              if (!static_args)
+                writer:format(w, "  %s = call ptr @llvm.stacksave()\n",
+                              stack_mark);
               if (self_call)
                 cname = llvm_read_env(w)
               else if (closure_cache_seen[itoa(direct_fn)] != null)
@@ -2427,8 +2446,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                 arg_ptr = "null"
               else
                 [
-                  writer:format(w, "  %s = alloca [%d x i64]\n", arg_array,
-                                arg_count);
+                  if (!static_args)
+                    writer:format(w, "  %s = alloca [%d x i64]\n", arg_array,
+                                  arg_count);
                   arg_index = 0;
                   lforeach(fn (arg) [
                     | value_slot, value_str |
@@ -2449,8 +2469,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                 "  %s = call i64 @mudlle_call_known(i64 %s, ptr @fn_%d,\
  ptr %s, i64 %d)\n",
                 res, cname, direct_fn, arg_ptr, arg_count);
-              writer:format(w,
-                "  call void @llvm.stackrestore(ptr %s)\n", stack_mark);
+              if (!static_args)
+                writer:format(w,
+                  "  call void @llvm.stackrestore(ptr %s)\n", stack_mark);
             ]
           else
           [
