@@ -24,8 +24,16 @@
  * afterward, outside the timer. No fast-math tolerance hides bigint errors. */
 [
   | compile, close, check, reference, kernel, expected, result, start, elapsed,
-    iteration, runs |
-  runs = 5;
+    iteration, runs, timed_calls, timed_calls_env |
+  timed_calls = 5;
+  timed_calls_env = getenv("MUDLLE_BENCH_TIMED_CALLS");
+  if (timed_calls_env) [
+    timed_calls = atoi(timed_calls_env);
+    if (!integer?(timed_calls) || timed_calls < 1 || timed_calls > 1000
+        || !string_equal?(format("%d", timed_calls), timed_calls_env))
+      error(error_bad_value);
+  ];
+  runs = timed_calls;
   compile = fn (source, name) [ | tree, linked |
     tree = mudlle_parse(source, name, false);
     linked = mc:linkrun(mc:compile(tree, false, 1, mc:source_code(source)), 1, true);

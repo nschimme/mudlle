@@ -31,7 +31,8 @@ use POSIX qw(uname WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
 use Time::HiRes qw(time);
 
 our @EXPORT_OK = qw(slurp spew sha256_file sha256_hex median round6 host_info
-                    to_json run_command run_timed child_cpu);
+                    to_json run_command run_timed child_cpu
+                    sample_summary paired_log_ratio_summary);
 
 sub slurp {
     my ($path) = @_;
@@ -57,6 +58,64 @@ sub median {
     my $n = @sorted;
     return $sorted[$n >> 1] if $n % 2;
     return ($sorted[$n / 2 - 1] + $sorted[$n / 2]) / 2;
+}
+
+sub sample_summary {
+    my ($values) = @_;
+    @$values or die "sample_summary requires at least one value\n";
+    my $med = median(@$values);
+    return {
+        n => scalar(@$values), min => (sort { $a <=> $b } @$values)[0],
+        max => (sort { $b <=> $a } @$values)[0], median => $med,
+        mad => median(map { abs($_ - $med) } @$values),
+    };
+}
+
+# Summarize round-matched LLVM/x64 timings. Positive samples are represented
+# as log ratios so reciprocal changes are symmetric. Non-positive pairs are
+# counted and excluded rather than divided by zero. Bootstrap resampling uses
+# a local Park-Miller generator so reports are deterministic across Perl runs.
+sub paired_log_ratio_summary {
+    my ($llvm, $x64, %opt) = @_;
+    @$llvm == @$x64 && @$llvm or die "paired samples must have equal nonzero length\n";
+    my $resamples = $opt{resamples} // 5000;
+    my $seed = $opt{seed} // 20261012;
+    $resamples > 0 or die "resamples must be positive\n";
+    my (@logs, $zero_pairs);
+    $zero_pairs = 0;
+    for my $i (0 .. $#$llvm) {
+        if ($llvm->[$i] <= 0 || $x64->[$i] <= 0) {
+            ++$zero_pairs;
+            next;
+        }
+        push @logs, log($llvm->[$i] / $x64->[$i]);
+    }
+    my $result = {
+        rounds => scalar(@$llvm), valid_pairs => scalar(@logs),
+        zero_or_nonpositive_pairs => $zero_pairs,
+        bootstrap_resamples => 0, bootstrap_seed => 0 + $seed,
+    };
+    return $result unless @logs;
+    my $observed = median(@logs);
+    my @boot;
+    my $state = $seed % 2147483647;
+    $state = 1 if $state <= 0;
+    for (1 .. $resamples) {
+        my @draw;
+        for (1 .. @logs) {
+            $state = (48271 * $state) % 2147483647;
+            push @draw, $logs[$state % @logs];
+        }
+        push @boot, median(@draw);
+    }
+    @boot = sort { $a <=> $b } @boot;
+    my $lo = $boot[int(0.025 * ($resamples - 1))];
+    my $hi = $boot[int(0.975 * ($resamples - 1))];
+    $result->{median_log_ratio} = $observed;
+    $result->{median_ratio} = exp($observed);
+    $result->{bootstrap_resamples} = $resamples;
+    $result->{bootstrap_95pct_ci_ratio} = [ exp($lo), exp($hi) ];
+    return $result;
 }
 
 sub round6 { return 0 + sprintf('%.6f', $_[0]) }

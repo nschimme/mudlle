@@ -185,7 +185,9 @@ EOS
     # The exact same source refers to globals at different offsets when
     # their registration order changes. Each ordering must miss once and
     # then hit its own correctly relocated object.
-    my $source = 'fn () cache_global_a * 100 + cache_global_b';
+    # Include fixed primitive calls (arities 0 through 3): their direct-call
+    # offsets must also be relocated when a descriptor is linked elsewhere.
+    my $source = 'fn () [ | t, k | t = make_ctable(); k = itoa(cache_global_b); table_set!(t, k, cache_global_a); table_ref(t, k) * 100 + cache_global_b ]';
     my $descriptor_path = "$base/global-relocation.obj";
     my $producer = <<"EOS";
 [

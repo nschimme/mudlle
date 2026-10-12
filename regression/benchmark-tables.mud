@@ -24,7 +24,16 @@
  * Collection stress runs before timing and checks a child shared by all
  * payloads and the table itself. Timed calls check exact independent sums. */
 [
-  | compile, make_case, kernel, run_case, case32, case257 |
+  | compile, make_case, kernel, run_case, case32, case257,
+    timed_calls, timed_calls_env |
+  timed_calls = 5;
+  timed_calls_env = getenv("MUDLLE_BENCH_TIMED_CALLS");
+  if (timed_calls_env) [
+    timed_calls = atoi(timed_calls_env);
+    if (!integer?(timed_calls) || timed_calls < 1 || timed_calls > 1000
+        || !string_equal?(format("%d", timed_calls), timed_calls_env))
+      error(error_bad_value);
+  ];
   compile = fn (source, name) [ | tree, linked |
     tree = mudlle_parse(source, name, false);
     linked = mc:linkrun(mc:compile(tree, false, 1, mc:source_code(source)), 1, true);
@@ -183,7 +192,7 @@
     vector(lookup_sum, replace_sum, repeat_sum, iteration_sum, entry_count,
            child[0], child[1], shared_count)
   ]""", "table-mixed-keys.mud");
-  run_case = fn (data) [
+  run_case = fn (data, timed_calls) [
     | keys, symbols, original, replacement, reinsertion, child, shared_key,
       base_sum, third_sum, rounds, n, expected, result, iteration, elapsed,
       start, timed_runs |
@@ -198,7 +207,7 @@
     result = kernel(keys, symbols, original, replacement, reinsertion,
                     child, shared_key, rounds, true);
     assert(equal?(result, expected));
-    iteration = 0; elapsed = 0; timed_runs = 5;
+    iteration = 0; elapsed = 0; timed_runs = timed_calls;
     while (iteration < timed_runs) [
       start = ctime();
       result = kernel(keys, symbols, original, replacement, reinsertion,
@@ -213,7 +222,7 @@
   ];
   case32 = make_case(32, 256);
   case257 = make_case(257, 32);
-  run_case(case32);
-  run_case(case257);
+  run_case(case32, timed_calls);
+  run_case(case257, timed_calls);
   display("benchmark-tables-success\n");
 ];

@@ -23,8 +23,17 @@
  * fib: self-recursive local closure. closure-loop: a loop calling a small
  * local function. Results are checked outside the timers. */
 [
-  | compile, fib, calls, runs, iteration, elapsed, start, result |
-  runs = 5;
+  | compile, fib, calls, runs, iteration, elapsed, start, result,
+    timed_calls, timed_calls_env |
+  timed_calls = 5;
+  timed_calls_env = getenv("MUDLLE_BENCH_TIMED_CALLS");
+  if (timed_calls_env) [
+    timed_calls = atoi(timed_calls_env);
+    if (!integer?(timed_calls) || timed_calls < 1 || timed_calls > 1000
+        || !string_equal?(format("%d", timed_calls), timed_calls_env))
+      error(error_bad_value);
+  ];
+  runs = timed_calls;
   compile = fn (source, name) [ | tree, linked |
     tree = mudlle_parse(source, name, false);
     linked = mc:linkrun(mc:compile(tree, false, 1, mc:source_code(source)), 1, true);
@@ -55,5 +64,5 @@
   ];
   display(format("backend=%s workload=calls-closure-loop work=2000000 runs=%d cpu_ms=%d checksum=%w\n",
                  mc:archname, runs, elapsed, result));
-  display("SUCCESS\n");
+  display("benchmark-calls-success\nSUCCESS\n");
 ];

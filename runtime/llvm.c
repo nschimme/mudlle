@@ -192,6 +192,16 @@ _Static_assert(offsetof(struct closure, code) == 16
                && offsetof(struct code, seclevel) == 58
                && sizeof (seclev_t) == 1 && sizeof (seclevel_valid) == 1,
                "generated IR hardcodes closure/code layout");
+_Static_assert(offsetof(struct primitive, op) == 16
+               && offsetof(struct prim_op, op) == 16,
+               "generated IR hardcodes primitive function pointer layout");
+_Static_assert(MAX_PRIMITIVE_ARGS == 5,
+               "update direct primitive relocation patterns for new arities");
+_Static_assert(offsetof(struct symbol, name) == 16
+               && offsetof(struct symbol, data) == 24,
+               "generated IR hardcodes symbol field offsets");
+/* PROFILE_CALL_COUNT adds a field before nargs; expose the actual offset. */
+static const int64_t llvm_primitive_nargs_offset = offsetof(struct prim_op, nargs);
 
 extern struct vector *llvm_call_closure_cache;
 
@@ -212,6 +222,12 @@ static void llvm_orc_register_absolute_symbols(LLVMOrcJITDylibRef dylib)
         { LLVMJITSymbolGenericFlagsExported, 0 } } },
     { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "seclevel_valid"),
       { (LLVMOrcExecutorAddress)(uintptr_t)&seclevel_valid,
+        { LLVMJITSymbolGenericFlagsExported, 0 } } },
+    { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "llvm_primitive_nargs_offset"),
+      { (LLVMOrcExecutorAddress)(uintptr_t)&llvm_primitive_nargs_offset,
+        { LLVMJITSymbolGenericFlagsExported, 0 } } },
+    { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "env_values"),
+      { (LLVMOrcExecutorAddress)(uintptr_t)&env_values,
         { LLVMJITSymbolGenericFlagsExported, 0 } } },
     { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "gcpro"),
       { (LLVMOrcExecutorAddress)(uintptr_t)&gcpro,
@@ -1535,13 +1551,28 @@ value llvm_make_function_closure_for_call(
   int64_t self_capture, int64_t parent_env, int64_t raw_arguments,
   int64_t return_typeset)
 {
+  /* Capturing closures are not shared. Delegate before any allocation so
+     the constructor can protect its inputs in one place. */
+  if (ncaptures != 0)
+    return llvm_make_function_closure(address, nargs, captures, ncaptures,
+                                      self_capture, parent_env,
+                                      raw_arguments, return_typeset);
+
+  struct gcpro *old_gcpro = gcpro;
+  value rooted_parent = (value)(uintptr_t)parent_env;
+  value rooted_arguments = (value)(uintptr_t)raw_arguments;
+  struct gcpro parent_root, arguments_root;
+  GCPROV(parent_root, rooted_parent);
+  GCPROV(arguments_root, rooted_arguments);
   if (llvm_call_closure_cache == NULL)
     {
-      /* may collect: do it before reading any heap pointer */
+      /* The first cache allocation can move either input. */
       llvm_call_closure_cache
         = alloc_vector(3 * LLVM_CALL_CLOSURE_CACHE_SIZE);
       staticpro(&llvm_call_closure_cache);
     }
+  parent_env = (int64_t)(uintptr_t)rooted_parent;
+  raw_arguments = (int64_t)(uintptr_t)rooted_arguments;
   struct closure *parent = (struct closure *)(uintptr_t)parent_env;
   value constants = NULL;
   if (ncaptures == 0 && TYPE(parent, closure)
@@ -1550,14 +1581,22 @@ value llvm_make_function_closure_for_call(
       && TYPE(parent->variables[1], variable))
     constants = parent->variables[1]->vvalue;
   if (constants == NULL || !TYPE(constants, vector))
-    return llvm_make_function_closure(address, nargs, captures, ncaptures,
+    {
+      value closure = llvm_make_function_closure(address, nargs, captures, ncaptures,
                                       self_capture, parent_env,
                                       raw_arguments, return_typeset);
+      gcpro = old_gcpro;
+      return closure;
+    }
   size_t slot = (((uintptr_t)address >> 4) ^ ((uintptr_t)constants >> 4))
     & (LLVM_CALL_CLOSURE_CACHE_SIZE - 1);
   value *entry = &llvm_call_closure_cache->data[3 * slot];
   if (entry[0] == makeint(address) && entry[1] == constants && entry[2] != NULL)
-    return entry[2];
+    {
+      value closure = entry[2];
+      gcpro = old_gcpro;
+      return closure;
+    }
 
   struct gcpro constants_root;
   GCPROV(constants_root, constants);
@@ -1572,8 +1611,7 @@ value llvm_make_function_closure_for_call(
   entry[0] = makeint(address);
   entry[1] = constants;
   entry[2] = closure;
-  UNGCPROV(closure_root);
-  UNGCPROV(constants_root);
+  gcpro = old_gcpro;
   return closure;
 }
 
@@ -1699,7 +1737,13 @@ UNSAFEOP(llvm_load_ir_closure, "llvm_load_ir_closure",
         "@llvm_check_global_read(i64 ",
         "@llvm_global_write(i64 ",
         "@llvm_check_global_write(i64 ",
-        "@llvm_call_global_constant(i64 "
+        "@llvm_call_global_constant(i64 ",
+        "@mudlle_call_primitive_0(i64 ",
+        "@mudlle_call_primitive_1(i64 ",
+        "@mudlle_call_primitive_2(i64 ",
+        "@mudlle_call_primitive_3(i64 ",
+        "@mudlle_call_primitive_4(i64 ",
+        "@mudlle_call_primitive_5(i64 "
       };
       struct strbuf output;
       sb_init(&output);

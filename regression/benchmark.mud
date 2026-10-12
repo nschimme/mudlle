@@ -24,7 +24,7 @@
  * Load xc.mud first so mc:compile selects the active backend.
  */
 [
-  | source, tree, prelinked, linked, kernel, runs, work, start, elapsed, i |
+  | source, tree, prelinked, linked, kernel, runs, work, start, elapsed, i, result |
   source = "fn (n) [ | sum, i | sum = 0; i = 0; while (i < n) [ sum = iadd(sum, i); i = iadd(i, 1); ]; sum ]";
   tree = mudlle_parse(source, "benchmark-kernel.mud", false);
   prelinked = mc:compile(tree, false, 1, mc:source_code(source));
@@ -40,8 +40,10 @@
 
   start = ctime();
   i = 0;
-  while (i < runs) [ kernel(work); i = i + 1; ];
+  while (i < runs) [ result = kernel(work); i = i + 1; ];
   elapsed = ctime() - start;
-  display(format("backend=%s workload=loop-sum work=%d runs=%d cpu_ms=%d\n",
-                 mc:archname, work, runs, elapsed));
+  assert(result == 1249975000);
+  display(format("backend=%s workload=loop-sum work=%d runs=%d cpu_ms=%d checksum=%w\n",
+                 mc:archname, work, runs, elapsed, result));
+  display("benchmark-integer-success\n");
 ];

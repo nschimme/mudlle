@@ -43,16 +43,17 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
     llvm_args_immutable?,
     llvm_emit_vector, llvm_emit_concat, llvm_emit_builtin,
     llvm_emit_binary_builtin, llvm_emit_ref, llvm_emit_set, llvm_exact_arity?,
+    llvm_scalar_numeric_leaf?,
     llvm_read_var_storage, llvm_read_env,
     llvm_emit_rooted_arguments, llvm_emit_copying_arguments,
     llvm_constant_values, llvm_global_relocation_values,
-    function_roots_required,
-    llvm_function_may_allocate?, llvm_allocate_slots, llvm_slot_number,
+    function_roots_required, function_root_scope_required,
+    llvm_function_needs_roots?, llvm_allocate_slots, llvm_slot_number,
     slot_indices, llvm_instruction_may_allocate?, root_slot_indices, nonallocating_ops, nonallocating_branches, vector_find_required,
     llvm_inline_max_size, closure_cache_fns, closure_cache_seen,
     float_internal, float_doubles, float_consts, known_args_max,
     llvm_float_call_op,
-    llvm_find_float_temps |
+    llvm_find_float_temps, primitive_arities |
 
   llvm_inline_max_size = 3500;
   closure_cache_fns = null;
@@ -65,6 +66,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
   globals_seen = make_table();
   current_ifn = null;
   function_roots_required = false;
+  function_root_scope_required = false;
   slot_indices = make_table();
   root_slot_indices = null;
   capture_indices = make_table();
@@ -77,7 +79,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
   nonallocating_ops = list(mc:b_iadd, mc:b_bitand, mc:b_bitor, mc:b_bitxor,
                   mc:b_shift_left, mc:b_shift_right, mc:b_bitnot,
                   mc:b_logical_xor, mc:b_assign, mc:b_funcarg,
-                  mc:b_car, mc:b_cdr);
+                  mc:b_car, mc:b_cdr, mc:b_vlength);
   nonallocating_branches = list(mc:branch_never, mc:branch_always,
                        mc:branch_true, mc:branch_false,
                        mc:branch_eq, mc:branch_ne,
@@ -98,7 +100,8 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
   llvm_allocate_slots = fn (ifn)
     [
       | vars, neighbors, add_edges, all, args, color, live_roots, entry_allocates, immediate_vars, immediate_ops,
-        root_variables |
+        root_variables, assigned_vars, checked_args, entry_open, argument_origins,
+        scalar_candidates, scalar_proof, changed, scalar_returns_valid |
       slot_indices = make_table();
       root_slot_indices = null;
       if (!pair?(ifn[mc:c_fvalue])) exit<function> null;
@@ -109,11 +112,17 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       all = mc:new_varset(ifn);
       live_roots = mc:new_varset(ifn);
       immediate_vars = make_table();
+      assigned_vars = make_table();
+      checked_args = make_table();
+      argument_origins = make_table();
+      lforeach(fn (fa) [
+        argument_origins[itoa(fa[0][0][mc:v_number])] = fa[0][0][mc:v_number];
+      ],ifn[mc:c_ffullargs]);
       immediate_ops = list(mc:b_iadd, mc:b_bitand, mc:b_bitor, mc:b_bitxor,
                            mc:b_shift_left, mc:b_shift_right, mc:b_bitnot,
                            mc:b_logical_xor, mc:b_logical_not,
                            mc:b_eq, mc:b_ne, mc:b_lt, mc:b_le,
-                           mc:b_gt, mc:b_ge);
+                           mc:b_gt, mc:b_ge, mc:b_vlength);
       entry_allocates = ifn[mc:c_fnargs_var]
         || ifn[mc:c_farginfo][mc:arginfo_vararg]
         || lexists?(fn (v) v[mc:v_indirect], vars)
@@ -135,16 +144,12 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
           ins = il[mc:il_ins];
           if (ins != null) [
             dest = mc:defined_var(ins);
-            if (dest && (ins[mc:i_class] != mc:i_compute
-                || (!lexists?(fn (op) op == ins[mc:i_aop], immediate_ops)
-                    && !(ins[mc:i_aop] == mc:b_assign
-                         && car(ins[mc:i_aargs])[mc:v_class] == mc:v_constant
-                         && (integer?(car(ins[mc:i_aargs])[mc:v_kvalue])
-                             || car(ins[mc:i_aargs])[mc:v_kvalue] == null)))))
-              immediate_vars[itoa(dest[mc:v_number])] = false;
+            if (dest) assigned_vars[itoa(dest[mc:v_number])] = true;
             // This optional instruction has a destination outside defined_var.
             if (ins[mc:i_class] == mc:i_maybe_sconcat)
-              immediate_vars[itoa(ins[mc:i_scdest][mc:v_number])] = false;
+              [
+                assigned_vars[itoa(ins[mc:i_scdest][mc:v_number])] = true;
+              ];
           ];
           add_edges(live_in);
           add_edges(live_out);
@@ -154,12 +159,216 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
           null
         ], null, graph_node_get(node));
       ], cdr(ifn[mc:c_fvalue]));
+      // A never-assigned argument checked as an integer in the entry block
+      // before any allocation cannot become a heap pointer at later safepoints.
+      // Restrict this to checks the generator really emits, not merely inferred
+      // types. Indirect arguments and allocating entry setup remain rooted.
+      entry_open = !entry_allocates;
+      dforeach(fn (il) [
+        | ins, class, op, args, types, checks, typed_comparison, dest |
+        ins = il[mc:il_ins];
+        if (entry_open && ins != null) [
+          class = ins[mc:i_class];
+          if (llvm_instruction_may_allocate?(ins))
+            entry_open = false
+          else [
+            dest = mc:defined_var(ins);
+            if (dest) [
+              if (class == mc:i_compute && ins[mc:i_aop] == mc:b_assign
+                  && car(ins[mc:i_aargs])[mc:v_class] == mc:v_local
+                  && !car(ins[mc:i_aargs])[mc:v_indirect])
+                argument_origins[itoa(dest[mc:v_number])] =
+                  argument_origins[itoa(car(ins[mc:i_aargs])[mc:v_number])]
+              else
+                argument_origins[itoa(dest[mc:v_number])] = null;
+            ];
+            checks = null;
+            typed_comparison = false;
+            if (class == mc:i_branch) [
+              op = ins[mc:i_bop];
+              if (op == mc:branch_lt || op == mc:branch_le
+                  || op == mc:branch_gt || op == mc:branch_ge) [
+                checks = ins[mc:i_bargs];
+                types = ins[mc:i_btypes];
+                typed_comparison = llvm_integer_comparison?(types);
+              ];
+            ] else if (class == mc:i_compute) [
+              op = ins[mc:i_aop];
+              if (op == mc:b_iadd || op == mc:b_bitand || op == mc:b_bitor
+                  || op == mc:b_bitxor || op == mc:b_shift_left
+                  || op == mc:b_shift_right || op == mc:b_bitnot)
+                checks = ins[mc:i_aargs];
+            ] else if (class == mc:i_trap && ins[mc:i_top] == mc:trap_type) [
+              args = ins[mc:i_targs];
+              if (cadr(args)[mc:v_class] == mc:v_constant
+                  && cadr(args)[mc:v_kvalue] == type_integer)
+                checks = list(car(args));
+            ];
+            lforeach(fn (v) [
+              | origin |
+              origin = argument_origins[itoa(v[mc:v_number])];
+              if ((!typed_comparison || (car(types) & ~itype_integer) != 0)
+                  && v[mc:v_class] == mc:v_local && !v[mc:v_indirect]
+                  && origin != null)
+                checked_args[itoa(origin)] = true;
+              if (typed_comparison) types = cdr(types);
+            ], checks);
+            // A check later in the block does not dominate code after a
+            // control-flow boundary. Inspect the boundary's own checks first.
+            if (class == mc:i_branch || class == mc:i_return
+                || (class == mc:i_trap
+                    && (ins[mc:i_top] == mc:trap_always
+                        || mc:trap_is_unreachable?(ins))))
+              entry_open = false;
+          ];
+        ];
+      ], graph_node_get(car(ifn[mc:c_fvalue]))[mc:f_ilist]);
+      // Reclassify definitions after collecting entry argument proofs. A
+      // numeric operation on certified integer arguments/constants returns an
+      // integer (or raises); it cannot leave a heap value in its destination.
+      lforeach(fn (v) immediate_vars[itoa(v[mc:v_number])] = true,vars);
+      graph_nodes_apply(fn (node) [
+        dforeach(fn (il) [
+          | ins, dest, scalar, op, types |
+          ins = il[mc:il_ins];
+          if (ins != null) [
+            dest = mc:defined_var(ins);
+            scalar = false;
+            if (ins[mc:i_class] == mc:i_compute) [
+              op = ins[mc:i_aop];
+              types = ins[mc:i_atypes];
+              scalar = lexists?(fn (x) x == op,immediate_ops)
+                || (op == mc:b_assign
+                    && car(ins[mc:i_aargs])[mc:v_class] == mc:v_constant
+                    && (integer?(car(ins[mc:i_aargs])[mc:v_kvalue])
+                        || car(ins[mc:i_aargs])[mc:v_kvalue] == null))
+                || (lexists?(fn (x) x == op,
+                      list(mc:b_add,mc:b_subtract,mc:b_multiply,
+                           mc:b_divide,mc:b_remainder,mc:b_negate))
+                    && ((types && llength(types) == llength(ins[mc:i_aargs])
+                         && !lexists?(fn(t) t == 0 || (t & ~itype_integer) != 0,
+                                      types))
+                        || !lexists?(fn(v) [
+                             if(v[mc:v_class] == mc:v_constant)
+                               !integer?(v[mc:v_kvalue])
+                             else
+                               !(v[mc:v_class] == mc:v_local
+                                 && !v[mc:v_indirect]
+                                 && checked_args[itoa(v[mc:v_number])] == true
+                                 && assigned_vars[itoa(v[mc:v_number])] == null)
+                           ],ins[mc:i_aargs])));
+            ];
+            if (dest && !scalar) immediate_vars[itoa(dest[mc:v_number])] = false;
+            if (ins[mc:i_class] == mc:i_maybe_sconcat)
+              immediate_vars[itoa(ins[mc:i_scdest][mc:v_number])] = false;
+          ];
+        ],graph_node_get(node)[mc:f_ilist]);
+      ],cdr(ifn[mc:c_fvalue]));
       // All arguments are loaded at entry, before the first instruction.
       args = mc:new_varset(ifn);
       lforeach(fn (fa) [
         set_bit!(args, fa[0][0][mc:v_number]);
-        immediate_vars[itoa(fa[0][0][mc:v_number])] = false;
+        immediate_vars[itoa(fa[0][0][mc:v_number])] =
+          checked_args[itoa(fa[0][0][mc:v_number])] == true
+          && assigned_vars[itoa(fa[0][0][mc:v_number])] == null;
       ], ifn[mc:c_ffullargs]);
+
+      // A second, stronger proof is deliberately separate from the legacy
+      // immediate-value heuristic above. Locals start scalar because entry
+      // initializes their slots to tagged zero. Arguments need a dominating
+      // emitted integer check and must never be assigned. Then monotonically
+      // remove locals with any definition that can produce a heap value.
+      // Exact self calls are accepted only when every normal return value is
+      // itself proven scalar, giving an induction over finite returns.
+      scalar_candidates = make_table();
+      lforeach(fn (v) [
+        scalar_candidates[itoa(v[mc:v_number])] = !entry_allocates
+          && !v[mc:v_indirect];
+      ], vars);
+      lforeach(fn (fa) [
+        | av |
+        av = fa[0][0];
+        scalar_candidates[itoa(av[mc:v_number])] = !entry_allocates
+          && !av[mc:v_indirect]
+          && checked_args[itoa(av[mc:v_number])] == true
+          && assigned_vars[itoa(av[mc:v_number])] == null;
+      ], ifn[mc:c_ffullargs]);
+      scalar_proof = fn (v)
+        if (v[mc:v_class] == mc:v_constant)
+          integer?(v[mc:v_kvalue]) || v[mc:v_kvalue] == null
+        else
+          v[mc:v_class] == mc:v_local && !v[mc:v_indirect]
+            && scalar_candidates[itoa(v[mc:v_number])] == true;
+      changed = true;
+      while (changed) [
+        changed = false;
+        graph_nodes_apply(fn (node) [
+          dforeach(fn (il) [
+            | ins, dest, safe, op, cargs |
+            ins = il[mc:il_ins];
+            if (ins != null) [
+              dest = mc:defined_var(ins);
+              if (dest && dest[mc:v_class] == mc:v_local
+                  && !dest[mc:v_indirect]
+                  && scalar_candidates[itoa(dest[mc:v_number])] == true) [
+                safe = false;
+                if (ins[mc:i_class] == mc:i_compute) [
+                  op = ins[mc:i_aop];
+                  cargs = ins[mc:i_aargs];
+                  safe = op == mc:b_assign
+                    && scalar_proof(car(cargs));
+                  if (lexists?(fn (x) x == op, immediate_ops))
+                    safe = true;
+                  if (op == mc:b_add || op == mc:b_subtract
+                      || op == mc:b_multiply)
+                    safe = llength(cargs) == 2
+                      && !lexists?(fn (v) !scalar_proof(v), cargs);
+                ] else if (ins[mc:i_class] == mc:i_call) [
+                  cargs = ins[mc:i_cargs];
+                  if (car(cargs)[mc:v_class] == mc:v_closure
+                      && car(cargs)[mc:v_cparent] == mc:myself
+                      && llvm_exact_arity?(ifn, llength(cdr(cargs)))) [
+                    // The final whole-function return check validates this
+                    // coinductive self-call assumption once per function.
+                    safe = true;
+                  ] else if (car(cargs)[mc:v_class] == mc:v_function
+                             && llvm_exact_arity?(car(cargs)[mc:v_fvalue],
+                                                  llength(cdr(cargs)))
+                             && llvm_scalar_numeric_leaf?(car(cargs)[mc:v_fvalue])
+                             && !lexists?(fn (v) !scalar_proof(v),
+                                          cdr(cargs))) [
+                    safe = true;
+                  ];
+                ];
+                if (!safe) [
+                  scalar_candidates[itoa(dest[mc:v_number])] = false;
+                  changed = true;
+                ];
+              ];
+              // maybe_sconcat has a destination outside defined_var.
+              if (ins[mc:i_class] == mc:i_maybe_sconcat
+                  && ins[mc:i_scdest]
+                  && scalar_candidates[itoa(ins[mc:i_scdest][mc:v_number])]
+                     == true) [
+                scalar_candidates[itoa(ins[mc:i_scdest][mc:v_number])] = false;
+                changed = true;
+              ];
+            ];
+          ], graph_node_get(node)[mc:f_ilist]);
+        ], cdr(ifn[mc:c_fvalue]));
+      ];
+      // Reject the proof as a whole if any return can expose a non-scalar.
+      scalar_returns_valid = true;
+      graph_nodes_apply(fn (node) [
+        dforeach(fn (il) [
+          | ins |
+          ins = il[mc:il_ins];
+          if (ins != null && ins[mc:i_class] == mc:i_return
+              && !scalar_proof(ins[mc:i_rvalue]))
+            scalar_returns_valid = false;
+        ], graph_node_get(node)[mc:f_ilist]);
+      ], cdr(ifn[mc:c_fvalue]));
+      if (!scalar_returns_valid) scalar_candidates = null;
       if (ifn[mc:c_fnargs_var])
         set_bit!(args, ifn[mc:c_fnargs_var][mc:vl_var][mc:v_number]);
       add_edges(args);
@@ -175,7 +384,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
         root_variables[itoa(v[mc:v_number])] = entry_allocates
           || v[mc:v_indirect]
           || (bit_set?(live_roots, v[mc:v_number])
-              && !immediate_vars[itoa(v[mc:v_number])]);
+              && !immediate_vars[itoa(v[mc:v_number])]
+              && !(scalar_candidates != null
+                   && scalar_candidates[itoa(v[mc:v_number])] == true));
       ], vars);
       lforeach(fn (v) [
         | used |
@@ -434,9 +645,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       false
     ];
 
-  llvm_function_may_allocate? = fn (ifn)
+  llvm_function_needs_roots? = fn (ifn)
     [
-      | scan, ins |
+      | scan, ins, next_ins, op, branches |
       if (ifn[mc:c_fnargs_var]
           || ifn[mc:c_farginfo][mc:arginfo_vararg]
           || lexists?(fn (v) v[mc:v_indirect], ifn[mc:c_flocals])
@@ -445,10 +656,36 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       if (pair?(ifn[mc:c_fvalue])) mc:flatten_blocks(ifn);
       scan = ifn[mc:c_fvalue];
       if (!vector?(scan)) exit<function> true;
+      branches = false;
       loop [
         ins = dget(scan)[mc:il_ins];
         if (ins != null && llvm_instruction_may_allocate?(ins))
-          exit<function> true;
+          [
+            // A final numeric builtin consumes its arguments before it
+            // allocates. llvm_call_global roots any allocating fallback's
+            // parameters, and nothing in this function is read afterwards
+            // except the returned value. The call_llvm frame still owns the
+            // closure and original arguments for collection/backtraces.
+            // Keep this limited to audited numeric helpers and straight-line
+            // code: other builtins can read their input buffers after GC.
+            next_ins = dget(dnext(scan))[mc:il_ins];
+            op = if (ins[mc:i_class] == mc:i_compute) ins[mc:i_aop] else null;
+            if (!branches && op != null
+                && lexists?(fn (v) v == op,
+                     list(mc:b_add, mc:b_subtract, mc:b_multiply,
+                          mc:b_divide, mc:b_remainder, mc:b_negate))
+                && !lexists?(fn (v) v[mc:v_class] == mc:v_function,
+                             ins[mc:i_aargs])
+                && ins[mc:i_adest][mc:v_class] == mc:v_local
+                && !ins[mc:i_adest][mc:v_indirect]
+                && next_ins != null && next_ins[mc:i_class] == mc:i_return
+                && next_ins[mc:i_rvalue] == ins[mc:i_adest]
+                && dnext(dnext(scan)) == ifn[mc:c_fvalue])
+              exit<function> false;
+            exit<function> true;
+          ];
+        if (ins != null && ins[mc:i_class] == mc:i_branch)
+          branches = true;
         scan = dnext(scan);
         if (scan == ifn[mc:c_fvalue]) exit false;
       ]
@@ -714,6 +951,74 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       info[mc:arginfo_nargs] == count
         && info[mc:arginfo_noptargs] == 0
         && !info[mc:arginfo_vararg]
+    ];
+
+  // Prove only a tiny, straight-line direct numeric leaf: one arithmetic
+  // compute over formal arguments or integer/null constants, then return that
+  // compute's local result. Its scalar inputs either produce an integer or
+  // raise; this helper is used only for direct calls with scalar inputs.
+  llvm_scalar_numeric_leaf? = fn (ifn)
+    [
+      | formals, cvalue, graph, blocks, valid, compute, returned, ins, op,
+        args, dest, formal_map |
+      if (ifn[mc:c_fnargs_var] || ifn[mc:c_farginfo][mc:arginfo_vararg]
+          || llength(ifn[mc:c_fclosure]) != 0
+          || lexists?(fn (v) v[mc:v_indirect], ifn[mc:c_flocals])
+          || lexists?(fn (fa) fa[0][0][mc:v_indirect],
+                      ifn[mc:c_ffullargs]))
+        exit<function> false;
+      formals = ifn[mc:c_ffullargs];
+      formal_map = make_table();
+      lforeach(fn (fa)
+        formal_map[itoa(fa[0][0][mc:v_number])] = true, formals);
+      cvalue = ifn[mc:c_fvalue];
+      // A compiled function is IR text paired with metadata, not a flow graph.
+      if (pair?(cvalue) && string?(car(cvalue))) exit<function> false;
+      blocks = 0;
+      valid = true;
+      compute = null;
+      returned = null;
+      ins = fn (il)
+        if (il[mc:il_ins] != null) [
+          | current, class |
+          current = il[mc:il_ins];
+          class = current[mc:i_class];
+          if (class == mc:i_compute && compute == null && returned == null)
+            compute = current
+          else if (class == mc:i_return && compute != null && returned == null)
+            returned = current
+          else
+            valid = false;
+        ];
+      if (pair?(cvalue) && vector?(cdr(cvalue))) [
+        graph = cdr(cvalue);
+        graph_nodes_apply(fn (node) [
+          blocks = blocks + 1;
+          dforeach(ins, graph_node_get(node)[mc:f_ilist]);
+        ], graph);
+      ] else if (vector?(cvalue)) [
+        blocks = 1;
+        dforeach(ins, cvalue);
+      ] else
+        exit<function> false;
+      if (!valid || blocks != 1 || compute == null || returned == null
+          || returned[mc:i_rvalue] != compute[mc:i_adest])
+        exit<function> false;
+      op = compute[mc:i_aop];
+      args = compute[mc:i_aargs];
+      dest = compute[mc:i_adest];
+      if (!lexists?(fn (x) x == op,
+                    list(mc:b_add, mc:b_subtract, mc:b_multiply,
+                         mc:b_divide, mc:b_remainder, mc:b_negate))
+          || dest[mc:v_class] != mc:v_local || dest[mc:v_indirect]
+          || llength(args) != (if (op == mc:b_negate) 1 else 2))
+        exit<function> false;
+      !lexists?(fn (v)
+        !(if (v[mc:v_class] == mc:v_constant)
+            integer?(v[mc:v_kvalue]) || v[mc:v_kvalue] == null
+          else
+            v[mc:v_class] == mc:v_local && !v[mc:v_indirect]
+              && formal_map[itoa(v[mc:v_number])] == true), args)
     ];
 
   // for_call: the closure is created only to be called at once, so a
@@ -1181,9 +1486,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       | fname, args, vars_seen, root_vars_seen, add_var, w, code, root_vars,
         root_count, root_slots, root_records, root_slots_data,
         root_records_data,
-        env_slot_ptr,
         root_token, root_index, arg_no, scan, il, ins, defvar, args_seen |
 
+      function_root_scope_required = false;
       w = writer:new_string();
       closure_cache_fns = null;
       closure_cache_seen = make_table();
@@ -1310,73 +1615,72 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
 
       // Keep Mudlle values in local slots visible to the garbage collector.
       // The incoming closure environment can move during any allocating
-      // helper call, so keep it in the same GC-visible root set as locals.
+      // helper call; its call_llvm frame supplies the updated environment.
       if (function_roots_required)
         [
-          root_count = llength(root_vars) + 1 + llength(closure_cache_fns);
-          root_token = format("%%roots_token_%d", ifn[mc:c_fnumber]);
-          writer:format(w, "  %%env_slot_%d = alloca i64\n",
-                        ifn[mc:c_fnumber]);
-          writer:format(w, "  store i64 %%env, ptr %%env_slot_%d\n",
-                        ifn[mc:c_fnumber]);
-          root_slots = format("%%root_slots_%d", ifn[mc:c_fnumber]);
-          root_records = format("%%root_records_%d", ifn[mc:c_fnumber]);
-          writer:format(w, "  %s = alloca [%d x ptr]\n",
-                        root_slots, root_count);
-          writer:format(w, "  %s = alloca [%d x { ptr, ptr }]\n",
-                        root_records, root_count);
-          root_index = 0;
-          env_slot_ptr = format("%%root_slot_ptr_%d_%d",
-                                ifn[mc:c_fnumber], root_index);
+          root_count = llength(root_vars) + llength(closure_cache_fns);
+          // The active call_llvm frame already roots our closure. Read it
+          // through that stable stack slot after allocations instead of
+          // maintaining a duplicate gcpro record for the environment.
           writer:format(w,
-            "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64 %d\n",
-            env_slot_ptr, root_count, root_slots, root_index);
-          writer:format(w, "  store ptr %%env_slot_%d, ptr %s\n",
-                        ifn[mc:c_fnumber], env_slot_ptr);
-          root_index = root_index + 1;
-          lforeach(fn (root_var) [
-            | slot_ptr |
-            slot_ptr = format("%%root_slot_ptr_%d_%d",
-                              ifn[mc:c_fnumber], root_index);
-            writer:format(w,
-              "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64\
- %d\n",
-              slot_ptr, root_count, root_slots, root_index);
-            writer:format(w, "  store ptr %%slot_%d, ptr %s\n",
-                          llvm_slot_number(root_var), slot_ptr);
-            root_index = root_index + 1;
-          ], root_vars);
-          lforeach(fn (cfn) [
-            | slot_ptr |
-            slot_ptr = format("%%root_slot_ptr_%d_%d",
-                              ifn[mc:c_fnumber], root_index);
-            writer:format(w, "  %%ccache_%d = alloca i64\n", cfn);
-            writer:format(w, "  store i64 1, ptr %%ccache_%d\n", cfn);
-            writer:format(w,
-              "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64\
- %d\n",
-              slot_ptr, root_count, root_slots, root_index);
-            writer:format(w, "  store ptr %%ccache_%d, ptr %s\n", cfn,
-                          slot_ptr);
-            root_index = root_index + 1;
-          ], closure_cache_fns);
+            "  %%env_frame_%d = load ptr, ptr @call_stack, align 8\n\
+  %%env_slot_%d = getelementptr inbounds i8, ptr %%env_frame_%d, i64 16\n",
+            ifn[mc:c_fnumber], ifn[mc:c_fnumber], ifn[mc:c_fnumber]);
           if (known_args_max > 0)
             writer:format(w, "  %%known_args = alloca [%d x i64]\n",
                           known_args_max);
-          root_slots_data = format("%%root_slots_data_%d", ifn[mc:c_fnumber]);
-          root_records_data = format("%%root_records_data_%d",
-                                     ifn[mc:c_fnumber]);
-          writer:format(w,
-            "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64 0\n",
-            root_slots_data, root_count, root_slots);
-          writer:format(w,
-            "  %s = getelementptr inbounds [%d x { ptr, ptr }], ptr %s, i64 0,\
- i64 0\n",
-            root_records_data, root_count, root_records);
-          writer:format(w,
-            "  %s = call ptr @mudlle_roots_enter(ptr %s,\
+          function_root_scope_required = root_count != 0;
+          if (function_root_scope_required)
+            [
+              root_token = format("%%roots_token_%d", ifn[mc:c_fnumber]);
+              root_slots = format("%%root_slots_%d", ifn[mc:c_fnumber]);
+              root_records = format("%%root_records_%d", ifn[mc:c_fnumber]);
+              writer:format(w, "  %s = alloca [%d x ptr]\n",
+                            root_slots, root_count);
+              writer:format(w, "  %s = alloca [%d x { ptr, ptr }]\n",
+                            root_records, root_count);
+              root_index = 0;
+              lforeach(fn (root_var) [
+                | slot_ptr |
+                slot_ptr = format("%%root_slot_ptr_%d_%d",
+                                  ifn[mc:c_fnumber], root_index);
+                writer:format(w,
+                  "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64\
+ %d\n",
+                  slot_ptr, root_count, root_slots, root_index);
+                writer:format(w, "  store ptr %%slot_%d, ptr %s\n",
+                              llvm_slot_number(root_var), slot_ptr);
+                root_index = root_index + 1;
+              ], root_vars);
+              lforeach(fn (cfn) [
+                | slot_ptr |
+                slot_ptr = format("%%root_slot_ptr_%d_%d",
+                                  ifn[mc:c_fnumber], root_index);
+                writer:format(w, "  %%ccache_%d = alloca i64\n", cfn);
+                writer:format(w, "  store i64 1, ptr %%ccache_%d\n", cfn);
+                writer:format(w,
+                  "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64\
+ %d\n",
+                  slot_ptr, root_count, root_slots, root_index);
+                writer:format(w, "  store ptr %%ccache_%d, ptr %s\n", cfn,
+                              slot_ptr);
+                root_index = root_index + 1;
+              ], closure_cache_fns);
+              root_slots_data = format("%%root_slots_data_%d", ifn[mc:c_fnumber]);
+              root_records_data = format("%%root_records_data_%d",
+                                         ifn[mc:c_fnumber]);
+              writer:format(w,
+                "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64 0\n",
+                root_slots_data, root_count, root_slots);
+              writer:format(w,
+                "  %s = getelementptr inbounds [%d x { ptr, ptr }], ptr %s,\
+ i64 0, i64 0\n",
+                root_records_data, root_count, root_records);
+              writer:format(w,
+                "  %s = call ptr @mudlle_roots_enter(ptr %s,\
  i64 %d, ptr %s)\n",
-            root_token, root_slots_data, root_count, root_records_data);
+                root_token, root_slots_data, root_count, root_records_data);
+            ];
         ];
 
       // Load arguments only after local slots have been registered as roots.
@@ -1423,10 +1727,10 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       // Float literals used by raw-double arithmetic are fetched once.
       lforeach(fn (idx) [
         writer:format(w,
-          "  %%fcv_%d = call i64 @llvm_constant_get(i64 %%env, i64 %d)\n\
+          "  %%fcv_%d = call i64 @llvm_constant_get(i64 %s, i64 %d)\n\
   %%fct_%d = call { double, i1 } @mudlle_try_double(i64 %%fcv_%d)\n\
   %%fconst_%d = extractvalue { double, i1 } %%fct_%d, 0\n",
-          idx, idx, idx, idx, idx, idx);
+          idx, llvm_read_env(w), idx, idx, idx, idx, idx);
       ], float_consts);
 
       // Box variables whose address escapes into a closure. Arguments retain
@@ -1514,7 +1818,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       current_ifn = ifn;
       llvm_allocate_slots(ifn);
       if (pair?(ifn[mc:c_fvalue])) mc:flatten_blocks(ifn);
-      function_roots_required = llvm_function_may_allocate?(ifn);
+      function_roots_required = llvm_function_needs_roots?(ifn);
       capture_indices = make_table();
       cidx = 0;
       lforeach(fn (cvar) [
@@ -1898,6 +2202,33 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                 "  %s = call i64 @mudlle_vector_length(i64 %s)\n",
                 result, value);
               llvm_write_var(dest_var, result, w);
+              exit<function> null;
+            ];
+          if ((op == mc:b_symbol_name || op == mc:b_symbol_get)
+              && !lexists?(fn (v) v[mc:v_class] == mc:v_function,args))
+            [
+              | value, id, fast, slow, result |
+              value = llvm_read_var(car(args),w);
+              tmp_seq = tmp_seq+1;
+              id = tmp_seq;
+              fast = format("%%symbol_fast_%d",id);
+              writer:format(w,
+                "  %%symbol_type_%d = call i32 @mudlle_has_type(i64 %s, i64 %d)\n\
+  %%symbol_ok_%d = icmp ne i32 %%symbol_type_%d, 0\n\
+  br i1 %%symbol_ok_%d, label %%symbol_load_%d, label %%symbol_slow_%d\nsymbol_load_%d:\n\
+  %%symbol_obj_%d = inttoptr i64 %s to ptr\n\
+  %%symbol_slot_%d = getelementptr inbounds i8, ptr %%symbol_obj_%d, i64 %d\n\
+  %s = load i64, ptr %%symbol_slot_%d, align 8\n\
+  br label %%symbol_join_%d\nsymbol_slow_%d:\n",
+                id,value,type_symbol,id,id,id,id,id,id,id,value,id,id,
+                if(op == mc:b_symbol_name) 16 else 24,fast,id,id,id);
+              slow = llvm_emit_builtin(op,args,w);
+              result = format("%%symbol_result_%d",id);
+              writer:format(w,
+                "  br label %%symbol_join_%d\nsymbol_join_%d:\n\
+  %s = phi i64 [ %s, %%symbol_load_%d ], [ %s, %%symbol_slow_%d ]\n",
+                id,id,result,fast,id,slow,id);
+              llvm_write_var(dest_var,result,w);
               exit<function> null;
             ];
           if (op == mc:b_cons || op == mc:b_pcons)
@@ -2347,14 +2678,47 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
             [
               // A constant global callee is read by the runtime after the
               // arguments are copied; primitives need no generated roots.
-              | copied |
-              copied = llvm_emit_copying_arguments(call_args, "gcall", w);
-              writer:format(w,
-                "  %s = call i64 @llvm_call_global_constant(i64 %d, i64 %s,\
+              | copied, primitive, direct_primitive, values, index |
+              primitive = global_value(fn_var[mc:v_goffset]);
+              direct_primitive = typeof(primitive) == type_primitive
+                && primitive_nargs(primitive) == arg_count;
+              // Only closure materialization needs a temporary rooted buffer
+              // while reading arguments. Ordinary arguments stay in SSA values
+              // and go directly to the primitive's native calling convention.
+              copied = if (!direct_primitive
+                           || lexists?(fn (v) v[mc:v_class] == mc:v_function,
+                                       call_args))
+                         llvm_emit_copying_arguments(call_args, "gcall", w)
+                       else null;
+              if (direct_primitive) [
+                primitive_arities[itoa(arg_count)] = true;
+                index = 0;
+                values = lmap(fn (arg) [
+                  | slot, value |
+                  if (copied == null)
+                    value = llvm_read_var(arg,w)
+                  else [
+                    slot = format("%%gcall_direct_slot_%d_%d",call_id,index);
+                    value = format("%%gcall_direct_arg_%d_%d",call_id,index);
+                    writer:format(w,
+                      "  %s = getelementptr inbounds i64, ptr %s, i64 %d\n\
+  %s = load i64, ptr %s, align 8\n",
+                      slot,copied[0],index,value,slot);
+                  ];
+                  index = index+1;
+                  value
+                ],call_args);
+                writer:format(w,
+                  "  %s = call i64 @mudlle_call_primitive_%d(i64 %d, i64 %s",
+                  res,arg_count,fn_var[mc:v_goffset],llvm_read_env(w));
+                lforeach(fn (value) writer:format(w,", i64 %s",value),values);
+                writer:write_line(w,")");
+              ] else
+                writer:format(w,
+                  "  %s = call i64 @llvm_call_global_constant(i64 %d, i64 %s,\
  ptr %s, i64 %d)\n",
-                res, fn_var[mc:v_goffset], llvm_read_env(w), copied[0],
-                copied[3]);
-              if (copied[3] != 0)
+                  res,fn_var[mc:v_goffset],llvm_read_env(w),copied[0],copied[3]);
+              if (copied != null && copied[3] != 0)
                 [
                   if (!string_equal?(copied[2], "null"))
                     writer:format(w, "  call void @mudlle_roots_leave(ptr %s)\n",
@@ -2587,7 +2951,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
         [
           | rval |
           rval = llvm_read_var(ins[mc:i_rvalue], w);
-          if (function_roots_required)
+          if (function_root_scope_required)
             writer:format(w,
               "  call void @mudlle_roots_leave(ptr %%roots_token_%d)\n",
               current_ifn[mc:c_fnumber]);
@@ -2667,6 +3031,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
     [
       | created_w |
       vector_find_required = false;
+      primitive_arities = make_table();
       globals_seen = make_table();
       llvm_constant_list = null;
       llvm_constant_values = null;
@@ -2848,7 +3213,7 @@ done:
       writer:write_line(w, "@internal_seclevel = external global i8\n");
       writer:write_line(w, "@seclevel_valid = external global i8\n");
       writer:format(w, """
-define internal i64 @mudlle_call_known(i64 %%callee, ptr %%target, ptr %%argv, i64 %%nargs) {
+define internal i64 @mudlle_call_known(i64 %%callee, ptr %%target, ptr %%argv, i64 %%nargs) alwaysinline {
 entry:
   %%frame = alloca [7 x i64], align 8
   %%cobj = inttoptr i64 %%callee to ptr
@@ -3113,6 +3478,81 @@ done:
       writer:write_line(w, "declare void @llvm.stackrestore(ptr)\n");
 
       lforeach(fn (ifn) gen_function(ifn, w), fns);
+      // Like x64's fixed primitive calls, pass values directly to the native
+      // function pointer. Retain the global helper for relocated globals that
+      // are no longer the expected plain primitive. Argument slots are owned
+      // by the caller just as on the existing global-constant path.
+      writer:write_line(w, "@llvm_primitive_nargs_offset = external constant i64");
+      writer:write_line(w, "@env_values = external global ptr");
+      table_foreach(fn (@<arity = _>) [
+        | n, i |
+        n = atoi(arity);
+        writer:format(w,"define internal i64 @mudlle_call_primitive_%d(i64 %%offset, i64 %%caller",n);
+        i = 0;
+        while (i < n) [
+          writer:format(w,", i64 %%a_%d",i);
+          i = i+1;
+        ];
+        writer:format(w, """
+) alwaysinline {
+entry:
+  %%values = load ptr, ptr @env_values, align 8
+  %%size = load i64, ptr %%values, align 8
+  %%words = lshr i64 %%size, 3
+  %%length = sub i64 %%words, 2
+  %%inrange = icmp ult i64 %%offset, %%length
+  br i1 %%inrange, label %%global, label %%fallback
+global:
+  %%data = getelementptr inbounds i8, ptr %%values, i64 16
+  %%slot = getelementptr inbounds i64, ptr %%data, i64 %%offset
+  %%fn = load i64, ptr %%slot, align 8
+  %%tag = and i64 %%fn, 1
+  %%pointer = icmp eq i64 %%tag, 0
+  %%nonnull = icmp ne i64 %%fn, 0
+  %%object = and i1 %%pointer, %%nonnull
+  br i1 %%object, label %%type, label %%fallback
+type:
+  %%obj = inttoptr i64 %%fn to ptr
+  %%ts = getelementptr inbounds i8, ptr %%obj, i64 9
+  %%t = load i8, ptr %%ts, align 1
+  %%plain = icmp eq i8 %%t, %d
+  br i1 %%plain, label %%arity, label %%fallback
+arity:
+  %%ops = getelementptr inbounds i8, ptr %%obj, i64 16
+  %%op = load ptr, ptr %%ops, align 8
+  %%noff = load i64, ptr @llvm_primitive_nargs_offset, align 8
+  %%ns = getelementptr inbounds i8, ptr %%op, i64 %%noff
+  %%n = load i16, ptr %%ns, align 2
+  %%exact = icmp eq i16 %%n, %d
+  br i1 %%exact, label %%direct, label %%fallback
+direct:
+  %%targetslot = getelementptr inbounds i8, ptr %%op, i64 16
+  %%target = load ptr, ptr %%targetslot, align 8
+""", type_primitive,n);
+        writer:write(w, "  %result = call i64 %target(");
+        i = 0;
+        while (i < n) [
+          if (i > 0) writer:write(w, ", ");
+          writer:format(w, "i64 %%a_%d", i);
+          i = i+1;
+        ];
+        writer:write_line(w, ")");
+        writer:write_line(w, """
+  ret i64 %result
+fallback:
+""");
+        if (n > 0) [
+          writer:format(w,"  %%mark = call ptr @llvm.stacksave()\n  %%argv = alloca [%d x i64], align 8\n",n);
+          i = 0;
+          while (i < n) [
+            writer:format(w,"  %%as_%d = getelementptr inbounds i64, ptr %%argv, i64 %d\n  store i64 %%a_%d, ptr %%as_%d, align 8\n",i,i,i,i);
+            i = i+1;
+          ];
+        ];
+        writer:format(w,"  %%generic = call i64 @llvm_call_global_constant(i64 %%offset, i64 %%caller, ptr %s, i64 %d)\n",if (n > 0) "%argv" else "null",n);
+        if (n > 0) writer:write_line(w,"  call void @llvm.stackrestore(ptr %mark)");
+        writer:write_line(w,"  ret i64 %generic\n}\n");
+      ], primitive_arities);
       // A bounded, call-free OR reduction gives LLVM a real SIMD opportunity
       // without changing language-loop accounting. Stop after each 32-word
       // chunk, retaining short-circuit behavior between chunks and in the tail.

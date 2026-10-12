@@ -25,7 +25,8 @@
 
 [
   | compile, chain, split, unary, usplit, mixed, mixed_split, same?, args,
-    a, b, c, err, i, bigs, nan, inf, lit, lit_split |
+    a, b, c, err, i, bigs, nan, inf, lit, lit_split, vararg_lit,
+    vararg_values, vararg_count |
   compile = fn (source, name) [ | tree, prelinked, linked |
     tree = mudlle_parse(source, name, false);
     prelinked = mc:compile(tree, false, 1, mc:source_code(source));
@@ -54,6 +55,8 @@
                 "llvm-float-lit.mud");
   lit_split = compile("fn (a) [ | t1, t2, t3, t4, t5 | t1 = fmul(a, 0.5); t2 = fdiv(3, a); t3 = fmul(0.5, 4611686018427387903); t4 = fadd(-7, t3); t5 = fsub(t2, t4); fadd(t1, t5) ]",
                       "llvm-float-lit-split.mud");
+  vararg_lit = compile("fn (a, rest...) if (vlength(rest) >= 0) fadd(a, 1.25) else 0",
+                       "llvm-float-varargs.mud");
 
   same? = fn (x, y) equal?(x, y)
     || (equal?(format("%w", x), "nan") && equal?(format("%w", y), "nan"));
@@ -75,6 +78,18 @@
 
   lforeach(fn (x) assert(same?(lit(x), lit_split(x))),
            list(1.5, 2, -3, 0.001, 1e100, bigs, 0, 0.0));
+
+  // Vararg-vector allocation can move the active closure before its float
+  // constants are loaded. Exercise varying argument counts and collection.
+  i = 0;
+  while (i < 200) [
+    vararg_count = 64 + (i % 137);
+    vararg_values = make_vector(vararg_count);
+    vararg_values[0] = 3.5;
+    assert(same?(apply(vararg_lit, vararg_values), 4.75));
+    if (i % 8 == 0) garbage_collect(0);
+    i = i + 1;
+  ];
 
   // bad operands report the usual error from inside a chain
   err = trap_error(fn () chain("x", 1, 2), fn (n) n, call_trace_off, null);

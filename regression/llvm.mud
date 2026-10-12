@@ -83,9 +83,10 @@ test_genllvm = fn (string code_str)
   assert(string_search(ir, "call void @llvm_check_type") >= 0);
   assert(string_search(ir, "call void @llvm_loop_slow_path()") >= 0);
   assert(string_search(ir, "call void @llvm_loop_check()") >= 0);
-  assert(string_search(ir, "store i64 %env, ptr %env_slot_") >= 0);
+  assert(string_search(ir, "getelementptr inbounds i8, ptr %env_frame_") >= 0);
   assert(string_search(ir, "= call ptr @mudlle_roots_enter(ptr %root_slots_data_") >= 0);
-  assert(string_search(ir, "alloca [4 x ptr]") >= 0);
+  // The unchecked loop limit remains rooted; numeric locals stay private.
+  assert(string_search(ir, "alloca [1 x ptr]") >= 0);
   display("genllvm test 3 passed\n");
 ];
 
@@ -206,9 +207,10 @@ display("Testing LLVM mc:compile pipeline...\n");
   source = "fn (n) [ | i, sum, scratch | i=0; sum=0; while(i<n) [ scratch=vector(i); garbage_collect(0); sum=iadd(sum,scratch[0]); i=iadd(i,1); ]; sum ]";
   tree = mudlle_parse(source, "test-live-roots.mud", false);
   ir = mc:compile_llvm(tree, 1, mc:source_code(source));
-  // Environment, incoming n, and the slot shared by scratch/temporaries.
+  // Incoming n and the slot shared by scratch/temporaries. The environment
+  // is already rooted by the call_llvm frame.
   // The integer-only induction and sum slots must not escape to the collector.
-  assert(string_search(ir, "%root_slots_1 = alloca [3 x ptr]") >= 0);
+  assert(string_search(ir, "%root_slots_1 = alloca [2 x ptr]") >= 0);
   tree = mudlle_parse(source, "test-live-roots.mud", false);
   prelinked = mc:compile(tree, false, 1, mc:source_code(source));
   linked = mc:linkrun(prelinked, 1, true);

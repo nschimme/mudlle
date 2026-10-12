@@ -24,8 +24,9 @@ fetch are emitted inline in each function's entry sequence; the runtime
 routines remain as error and profiler paths. Before flattening the
 control-flow graph, the backend computes variables live at potentially
 collecting instructions. It conservatively recognizes integer/null-only
-locals from all their definitions; incoming arguments and indirect cells
-remain potentially heap-valued. A physical slot is published only when its
+locals from all their definitions. Incoming arguments remain potentially
+heap-valued unless a dominating emitted integer check proves a never-written
+direct argument scalar; indirect cells remain rooted. A physical slot is published only when its
 values need protection. GC-visible and private slots use separate coloring
 classes, so nonoverlapping heap/scalar lifetimes cannot accidentally make a
 private scalar slot escape. Entry allocation (varargs or boxing) keeps the
@@ -322,7 +323,7 @@ by `mc:linkrun`.
   - Untagging: `ashr i64 %val, 1`
   - Boolean `false`: `1` (tagged 0)
   - Boolean `true`: `3` (tagged 1)
-- **Local/Temporary Variables**: Stored in 64-bit stack slots (`alloca i64`) in the function entry block. The generator uses the compiler's liveness analysis to share slots between locals whose lifetimes do not overlap. Indirect variables keep exclusive slots because their storage cells are initialized at entry and can escape into closures. Slot zero is reserved for discarded values. Reads and writes use `load i64` and `store i64`. In functions that cannot allocate, LLVM can promote these slots into SSA values and `phi` nodes. Allocating functions publish the slots and closure environment as GC roots.
+- **Local/Temporary Variables**: Stored in 64-bit stack slots (`alloca i64`) in the function entry block. The generator uses liveness analysis to share slots between locals whose lifetimes do not overlap. Indirect variables keep exclusive slots because their cells can escape into closures. Slot zero is reserved for discarded values. GC-visible and private scalar slots use separate storage classes, so LLVM can promote private slots into SSA values and `phi` nodes even in allocating functions. Heap values live at safepoints remain rooted.
 
 ### Native calls and garbage collection
 
@@ -338,6 +339,41 @@ actual arguments to GC and call-trace handling. Native entry preserves stack,
 interrupt, arity, minimum security level, and maximum security level checks.
 `compiled?()` recognizes these frames.
 
+Allocating functions reload their closure through the active frame's `fn`
+field after safepoints. The collector already forwards that field, so no
+duplicate local environment root is needed. A function with no rooted local
+slots or cached closures emits no local root scope; its call frame remains.
+Entry-time vararg allocation also uses that forwarded closure when loading
+float constants. The shared closure cache roots the parent closure and argument
+metadata before allocating its initial storage.
+
+Never-written direct arguments can remain private when an emitted integer
+check dominates all safepoints. The proof only examines the entry prefix,
+stopping at the first allocation or control-flow boundary; inferred formal
+types alone do not qualify. Scalar definitions include integer arithmetic
+and vector lengths. A fixed-point proof also follows scalar copies and
+integer/null arithmetic. Exact self-call results qualify only if every normal
+return is scalar under that assumption, by induction over finite recursive
+returns. Direct numeric leaf calls also qualify when all supplied arguments
+are scalar and the capture-free callee consists only of the arithmetic
+operation and return. Any heap return rejects the recursive proof. Heap arguments and
+locals live across recursive calls retain their roots, and indirect locals
+or allocating argument setup retain the conservative entry treatment.
+
+Fixed-arity plain primitive constants use an `alwaysinline`
+`mudlle_call_primitive_N` helper. It resolves the relocated global, checks the
+type and arity, loads the native function pointer and passes the arguments by
+value, following x64's primitive calling convention. Ordinary calls keep the
+current security state; primitive wrappers perform their own security checks,
+as on x64. A changed global, secure primitive or arity mismatch falls back to
+`llvm_call_global_constant`; the existing argument-buffer ownership rules
+apply to both paths. The runtime exposes the `prim_op.nargs` offset because
+`PROFILE_CALL_COUNT` changes that layout. Primitive pointer layouts have build
+assertions, and serialized descriptors relocate the new helper's offsets.
+Ordinary arguments remain SSA values; closure materialization uses a rooted
+temporary buffer. Symbol name and value reads check the object type and load
+the field directly, with the runtime path retaining the usual type errors.
+
 #### Known-function calls
 
 A call to a known function literal, or a self-recursive call, with exactly the
@@ -351,10 +387,25 @@ or `seclevel_valid`: `llvm_call_value`, `llvm_call_global` and
 `llvm_call_global_constant` set the level from the calling closure's own code
 before any primitive can read it and restore it afterwards, so a known callee
 (same module, same level) observes the right level. Small callees are inlined
-by LLVM (see below).
+by LLVM (see below). The known-call helper is also `alwaysinline`, so a small
+callee can be optimized in its caller rather than inside an outlined helper.
+
+Straight-line functions whose only allocating instruction is a final numeric
+builtin immediately followed by returning its result omit their local root
+records. This is limited to the audited `+`, `-`, `*`, `/`, `%` and unary
+negation helpers, with a direct local destination and no function
+materialization or indirect locals. A captured destination retains roots because
+writing it may read the closure after allocation. The
+runtime consumes/protects the input values before allocation, and generated
+code reads only the returned result afterwards. The closure and original
+arguments remain visible through the `call_llvm` frame. This does not remove
+call frames or permit pointers to survive an allocation without protection;
+see `doc/gc.md` and the allocating string-concatenation regression in
+`regression/llvm-fast-paths.mud`.
 
 The frame sets `offset` to -2, meaning it owns its argument array: the caller
-copies the arguments into a stack `alloca` (reclaimed with `stackrestore`),
+copies the arguments into a shared function-local stack buffer when possible
+(otherwise a temporary `alloca` reclaimed with `stackrestore`),
 registers no per-argument roots, and does not hold the callee closure across an
 allocation. The collector (`forward_roots` in `alloc.c`) forwards
 `native_args[0..nargs)` for `call_llvm` frames with offset -2, so backtraces stay
