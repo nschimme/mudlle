@@ -80,28 +80,28 @@ compatibility rules are described in `doc/llvm-backend.md`.
 Benchmarks
 ----------
 Host: AMD Ryzen 9 7940HS, Linux 7.0.14, GCC 14.2.0, LLVM 19.1.7, single
-threaded. LLVM runs `default<O2>`. The host was shared: load average was 5 to 6
+threaded. LLVM runs `default<O2>`. The host was shared: load average was 5 to 7
 during the runs, so treat differences under about 10% as noise.
 
 Median CPU milliseconds per kernel (see below), lower is better; ratio is
 LLVM / x64. Both backends are built from the same commit. Each kernel is
 compiled and linked before its timer starts, and every result is checked
 against an independent reference. Rich suite: 9 fresh-process rounds of 5
-timed runs; the other kernels: 7 processes.
+timed runs; the other kernels: 9 processes, alternating backends.
 
 | Workload | LLVM | x64 | LLVM / x64 |
 |----------|-----:|----:|-----------:|
-| Integer loop (50,000 x 2,000) | 42 | 93 | 0.45 |
-| Native list/vector conversion, width 257 | 27 | 35 | 0.77 |
-| Native list/vector conversion, width 32 | 17 | 21 | 0.81 |
-| Floating point (100,000 steps per call) | 115 | 136 | 0.85 |
-| Library list/vector round trip, width 32 (interpreted `misc.mud`) | 161 | 163 | 0.99 |
-| Bigint (20,000 steps per call) | 61 | 56 | 1.09 |
-| Mixed bigint/float | 44 | 37 | 1.19 |
+| Floating point (100,000 steps per call) | 35 | 136 | 0.26 |
+| Integer loop (50,000 x 2,000) | 42 | 90 | 0.47 |
+| Native list/vector conversion, width 257 | 28 | 34 | 0.82 |
+| Native list/vector conversion, width 32 | 19 | 20 | 0.95 |
+| Mixed bigint/float | 43 | 44 | 0.98 |
+| Library list/vector round trip, width 32 (interpreted `misc.mud`) | 166 | 163 | 1.02 |
+| Bigint (20,000 steps per call) | 69 | 62 | 1.11 |
 | Tables, 257 keys | 13 | 10 | 1.30 |
 | Tables, 32 keys | 12 | 9 | 1.33 |
-| Recursive local closure, `fib(27)` | 21 | 12 | 1.75 |
-| Local closure called in a loop (2,000,000 iterations per call) | 65 | 31 | 2.10 |
+| Recursive local closure, `fib(27)` | 21 | 11 | 1.91 |
+| Local closure called in a loop (2,000,000 iterations per call) | 62 | 30 | 2.07 |
 
 Notes:
 
@@ -109,7 +109,9 @@ Notes:
   children, and run native loops; the library row calls the library closures,
   which run interpreted in both builds.
 - Float and bigint use the explicit `f*` / `bi*` primitives (what
-  `#arith(f)` and `#arith(b)` expand to).
+  `#arith(f)` and `#arith(b)` expand to); nested `fadd`/`fsub`/`fmul`/`fdiv`/`fneg`/`fabs`/`fsqrt`
+  stay unboxed within a basic block. Bigint and mixed bigint/float are
+  interleaved-run medians because the rich suite differed by over 10%.
 - LLVM calls statically known functions directly, inlines small ones
   (`alwaysinline`) and caches shared closures in rooted per-function slots;
   each call still builds a call frame and saves and restores the security
