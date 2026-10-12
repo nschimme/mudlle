@@ -214,7 +214,10 @@ defines ts_tokenize, ts_parse_string
                     [
                       get_char(); get_char(); // consume '${'
                       tokens = make_tok("op_add", "+", line, col, pos) . tokens;
+                      tokens = make_tok("identifier", "format", line, col, pos) . tokens;
                       tokens = make_tok("lparen", "(", line, col, pos) . tokens;
+                      tokens = make_tok("string", "%s", line, col, pos) . tokens;
+                      tokens = make_tok("comma", ",", line, col, pos) . tokens;
 
                       | brace_depth |
                       brace_depth = 1;
@@ -528,7 +531,21 @@ defines ts_tokenize, ts_parse_string
           tok = cur_tok();
           loc = tok[2];
 
-          if (match_tok("number")) make_const(loc, tok[1])
+          if (match_tok("op_sub"))
+            [
+              | sub_expr |
+              sub_expr = parse_primary();
+              make_builtin(loc, mc:b_negate, list(sub_expr))
+            ]
+          else if (match_tok("op_add"))
+            parse_primary()
+          else if (match_tok("op_not"))
+            [
+              | not_expr |
+              not_expr = parse_primary();
+              make_builtin(loc, mc:b_eq, list(not_expr, make_const(loc, false)))
+            ]
+          else if (match_tok("number")) make_const(loc, tok[1])
           else if (match_tok("string") || match_tok("template_literal")) make_const(loc, tok[1])
           else if (match_tok("keyword_true")) make_const(loc, true)
           else if (match_tok("keyword_false")) make_const(loc, false)
