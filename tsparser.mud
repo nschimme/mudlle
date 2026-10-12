@@ -51,6 +51,7 @@ defines ts_tokenize, ts_parse_string
   keywords_tab["type"] = "keyword_type";
   keywords_tab["interface"] = "keyword_interface";
   keywords_tab["typeof"] = "keyword_typeof";
+  keywords_tab["export"] = "keyword_export";
 
   ts_type_to_typeset = fn (name)
     [
@@ -972,13 +973,18 @@ defines ts_tokenize, ts_parse_string
 
       parse_expr = fn () parse_assign();
 
+      | top_defines, has_exports |
+      top_defines = null;
+      has_exports = false;
+
       // Statement list parser collecting block-scoped local variables and statement components
       parse_stmt_list = fn (string end_token)
         [
-          | block_loc, block_locals, block_seq |
+          | block_loc, block_locals, block_seq, top_level |
           block_loc = tok_loc();
           block_locals = null;
           block_seq = null;
+          top_level = string_cmp(end_token, "eof") == 0;
 
           if (string_cmp(end_token, "rbrace") == 0)
             match_tok("lbrace");
@@ -989,8 +995,94 @@ defines ts_tokenize, ts_parse_string
               tok = cur_tok();
               loc = tok[2];
 
+              // Export Statement: export function ... | export let/const/var ... | export { ... }
+              if (match_tok("keyword_export"))
+                [
+                  has_exports = true;
+                  | exp_tok |
+                  exp_tok = cur_tok();
+                  if (string_cmp(exp_tok[0], "keyword_function") == 0)
+                    [
+                      consume_tok(); // function
+                      | fn_name, params, ret_type, body_s, closure_comp |
+                      fn_name = cur_tok()[1];
+                      consume_tok(); // fn name
+                      if (string_cmp(cur_tok()[0], "op_lt") == 0)
+                        [
+                          consume_tok();
+                          while (string_cmp(cur_tok()[0], "op_gt") != 0 && string_cmp(cur_tok()[0], "eof") != 0)
+                            consume_tok();
+                          match_tok("op_gt");
+                        ];
+                      match_tok("lparen");
+                      params = null;
+                      if (string_cmp(cur_tok()[0], "rparen") != 0)
+                        [
+                          loop
+                            [
+                              | p_tok, p_loc, p_type |
+                              p_tok = cur_tok();
+                              p_loc = p_tok[2];
+                              if (string_cmp(p_tok[0], "identifier") == 0)
+                                [
+                                  consume_tok();
+                                  p_type = parse_type();
+                                  params = vector(vector(format("%s", p_tok[1]), p_type, p_loc), null, null, null, null) . params;
+                                ];
+                              if (!match_tok("comma")) exit null;
+                            ]
+                        ];
+                      match_tok("rparen");
+                      ret_type = parse_type();
+                      body_s = parse_stmt_list("rbrace");
+
+                      top_defines = format("%s", fn_name) . top_defines;
+                      closure_comp = make_closure(loc, ret_type, null, lreverse!(params), body_s, fn_name);
+                      block_seq = make_assign(loc, fn_name, closure_comp) . block_seq;
+                    ]
+                  else if (string_cmp(exp_tok[0], "keyword_let") == 0 || string_cmp(exp_tok[0], "keyword_const") == 0 || string_cmp(exp_tok[0], "keyword_var") == 0)
+                    [
+                      consume_tok();
+                      loop
+                        [
+                          | v_tok, v_name, v_loc, v_type, val_expr |
+                          v_tok = cur_tok();
+                          v_loc = v_tok[2];
+                          if (string_cmp(v_tok[0], "identifier") == 0)
+                            [
+                              consume_tok();
+                              v_name = v_tok[1];
+                              v_type = parse_type();
+                              top_defines = format("%s", v_name) . top_defines;
+
+                              if (match_tok("op_assign"))
+                                [
+                                  val_expr = parse_expr();
+                                  block_seq = make_assign(v_loc, v_name, val_expr) . block_seq;
+                                ];
+                            ];
+                          if (!match_tok("comma")) exit null;
+                        ];
+                      match_tok("semicolon");
+                    ]
+                  else if (match_tok("lbrace"))
+                    [
+                      loop
+                        [
+                          | e_id |
+                          if (string_cmp(cur_tok()[0], "identifier") == 0)
+                            [
+                              e_id = consume_tok()[1];
+                              top_defines = format("%s", e_id) . top_defines;
+                            ];
+                          if (!match_tok("comma")) exit null;
+                        ];
+                      match_tok("rbrace");
+                      if (match_tok("semicolon")) null;
+                    ]
+                ]
               // Variable Declaration: let / const / var x = expr
-              if (string_cmp(tok[0], "keyword_let") == 0 || string_cmp(tok[0], "keyword_const") == 0 || string_cmp(tok[0], "keyword_var") == 0)
+              else if (string_cmp(tok[0], "keyword_let") == 0 || string_cmp(tok[0], "keyword_const") == 0 || string_cmp(tok[0], "keyword_var") == 0)
                 [
                   consume_tok();
                   loop
@@ -1003,8 +1095,10 @@ defines ts_tokenize, ts_parse_string
                           consume_tok();
                           v_name = v_tok[1];
                           v_type = parse_type();
-                          if (string_cmp(end_token, "eof") != 0)
-                            block_locals = vector(format("%s", v_name), v_type, v_loc) . block_locals;
+                          if (!top_level || has_exports)
+                            block_locals = vector(format("%s", v_name), v_type, v_loc) . block_locals
+                          else
+                            top_defines = format("%s", v_name) . top_defines;
 
                           if (match_tok("op_assign"))
                             [
@@ -1198,8 +1292,10 @@ defines ts_tokenize, ts_parse_string
                   ret_type = parse_type();
                   body_s = parse_stmt_list("rbrace");
 
-                  if (string_cmp(end_token, "eof") != 0)
-                    block_locals = vector(format("%s", fn_name), TYPESET_ANY, loc) . block_locals;
+                  if (!top_level || has_exports)
+                    block_locals = vector(format("%s", fn_name), TYPESET_ANY, loc) . block_locals
+                  else
+                    top_defines = format("%s", fn_name) . top_defines;
 
                   closure_comp = make_closure(loc, ret_type, null, lreverse!(params), body_s, fn_name);
                   block_seq = make_assign(loc, fn_name, closure_comp) . block_seq;

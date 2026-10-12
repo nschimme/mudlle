@@ -23,19 +23,20 @@
 
 // Representation: d = [buffer_vector, head_index, count, capacity]
 
-function deque_new(): vector {
+export function deque_new(): vector {
   let cap: number = 8;
   return [make_vector(cap), 0, 0, cap];
 };
 
-function deque_size(d: vector): number {
+export function deque_size(d: vector): number {
   return d[2];
 };
 
-function deque_is_empty(d: vector): boolean {
+export function deque_is_empty(d: vector): boolean {
   return d[2] == 0;
 };
 
+// Private internal helper function - unexported to prevent global namespace pollution
 function deque_resize(d: vector): void {
   let old_buf: vector = d[0];
   let head: number = d[1];
@@ -54,7 +55,7 @@ function deque_resize(d: vector): void {
   d[3] = new_cap;
 };
 
-function deque_push_back(d: vector, val: any): void {
+export function deque_push_back(d: vector, val: any): void {
   let count: number = d[2];
   let cap: number = d[3];
   if (count == cap) {
@@ -68,7 +69,7 @@ function deque_push_back(d: vector, val: any): void {
   d[2] = count + 1;
 };
 
-function deque_push_front(d: vector, val: any): void {
+export function deque_push_front(d: vector, val: any): void {
   let count: number = d[2];
   let cap: number = d[3];
   if (count == cap) {
@@ -84,7 +85,7 @@ function deque_push_front(d: vector, val: any): void {
   d[2] = count + 1;
 };
 
-function deque_pop_front(d: vector): any {
+export function deque_pop_front(d: vector): any {
   let count: number = d[2];
   if (count == 0) {
     return null;
@@ -99,7 +100,7 @@ function deque_pop_front(d: vector): any {
   return val;
 };
 
-function deque_pop_back(d: vector): any {
+export function deque_pop_back(d: vector): any {
   let count: number = d[2];
   if (count == 0) {
     return null;
@@ -114,7 +115,7 @@ function deque_pop_back(d: vector): any {
   return val;
 };
 
-function deque_peek_front(d: vector): any {
+export function deque_peek_front(d: vector): any {
   let count: number = d[2];
   if (count == 0) {
     return null;
@@ -124,7 +125,7 @@ function deque_peek_front(d: vector): any {
   return buf[head];
 };
 
-function deque_peek_back(d: vector): any {
+export function deque_peek_back(d: vector): any {
   let count: number = d[2];
   if (count == 0) {
     return null;
@@ -137,7 +138,7 @@ function deque_peek_back(d: vector): any {
 };
 
 // O(N) Sliding Window Maximum using Monotonic Deque
-function sliding_window_max(arr: vector, k: number): vector {
+export function sliding_window_max(arr: vector, k: number): vector {
   let n: number = vlength(arr);
   if (n == 0 || k <= 0) {
     return make_vector(0);
@@ -171,7 +172,7 @@ function sliding_window_max(arr: vector, k: number): vector {
 };
 
 // O(V + E) Shortest Path BFS using Deque
-function bfs_shortest_path(graph: object, start: string, target: string): number {
+export function bfs_shortest_path(graph: object, start: string, target: string): number {
   if (string_cmp(start, target) == 0) {
     return 0;
   };
