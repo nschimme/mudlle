@@ -2819,8 +2819,10 @@ done:
       // callee is a closure of the same module, so it has the caller's
       // security level, its arity is known, and no callability checks are
       // needed. Builds the same call_llvm frame as llvm_invoke_closure (layouts
-      // are checked in runtime/llvm.c) and keeps the seclevel bookkeeping of
-      // llvm_call_value.
+      // are checked in runtime/llvm.c). It leaves internal_seclevel alone:
+      // llvm_call_value, llvm_call_global and llvm_call_global_constant set
+      // it from the calling closure's own code before a primitive can read
+      // it, and restore it afterwards (regression/llvm-known-call-seclevel.mud).
       writer:write_line(w, "@call_stack = external global ptr\n");
       writer:write_line(w, "@internal_seclevel = external global i8\n");
       writer:write_line(w, "@seclevel_valid = external global i8\n");
@@ -2831,12 +2833,6 @@ entry:
   %%cobj = inttoptr i64 %%callee to ptr
   %%codeslot = getelementptr inbounds i8, ptr %%cobj, i64 16
   %%code = load i64, ptr %%codeslot, align 8
-  %%codep = inttoptr i64 %%code to ptr
-  %%lvlslot = getelementptr inbounds i8, ptr %%codep, i64 58
-  %%lvl = load i8, ptr %%lvlslot, align 1
-  %%oldlvl = load i8, ptr @internal_seclevel, align 1
-  %%oldvalid = load i8, ptr @seclevel_valid, align 1
-  store i8 %%lvl, ptr @internal_seclevel, align 1
   %%top = load ptr, ptr @call_stack, align 8
   store ptr %%top, ptr %%frame, align 8
   %%f1 = getelementptr inbounds i64, ptr %%frame, i64 1
@@ -2856,8 +2852,6 @@ entry:
   store ptr %%frame, ptr @call_stack, align 8
   %%res = call i64 %%target(i64 %%callee, ptr %%argv, i64 %%nargs)
   store ptr %%top, ptr @call_stack, align 8
-  store i8 %%oldlvl, ptr @internal_seclevel, align 1
-  store i8 %%oldvalid, ptr @seclevel_valid, align 1
   ret i64 %%res
 }
 """);

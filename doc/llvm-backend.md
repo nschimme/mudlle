@@ -346,8 +346,12 @@ callee's fixed argument count (no optional or variable arguments;
 target, argv, nargs)` instead of `llvm_call_value`. The callee has the caller's
 security level and a known arity, so callability checks are skipped.
 `mudlle_call_known` builds the same `call_llvm` frame as `llvm_invoke_closure`
-inline, saves and restores `internal_seclevel` / `seclevel_valid`, and calls
-the function directly. LLVM does not inline these calls.
+inline and calls the function directly. It does not touch `internal_seclevel`
+or `seclevel_valid`: `llvm_call_value`, `llvm_call_global` and
+`llvm_call_global_constant` set the level from the calling closure's own code
+before any primitive can read it and restore it afterwards, so a known callee
+(same module, same level) observes the right level. Small callees are inlined
+by LLVM (see below).
 
 The frame sets `offset` to -2, meaning it owns its argument array: the caller
 copies the arguments into a stack `alloca` (reclaimed with `stackrestore`),

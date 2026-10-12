@@ -114,8 +114,8 @@ Notes:
   interleaved-run medians because the rich suite differed by over 10%.
 - LLVM calls statically known functions directly, inlines small ones
   (`alwaysinline`) and caches shared closures in rooted per-function slots;
-  each call still builds a call frame and saves and restores the security
-  level, which is the main remaining gap on call-heavy code.
+  each call still builds a call frame and passes arguments through memory,
+  which is the main remaining gap on call-heavy code.
 - `cpu_ms` is `ctime()` summed over the timed calls: 5 calls per kernel (the
   integer loop is 2,000 calls); compilation and JIT startup are excluded. The
   startup cost of compiling the compiler under LLVM is not measured here.
