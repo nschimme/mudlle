@@ -80,28 +80,28 @@ compatibility rules are described in `doc/llvm-backend.md`.
 Benchmarks
 ----------
 Host: AMD Ryzen 9 7940HS, Linux 7.0.14, GCC 14.2.0, LLVM 19.1.7, single
-threaded. LLVM runs `default<O2>`. The host was shared: load average was 5 to 7
-throughout, so treat differences under about 10% as noise.
+threaded. LLVM runs `default<O2>`. The host was shared: load average was 4 to 7
+during the runs, so treat differences under about 10% as noise.
 
-Median CPU milliseconds per kernel (see below), lower is better; ratio is LLVM / x64. Both backends
-are built from the same commit. Each kernel is compiled and linked before its
-timer starts, and every result is checked against an independent reference.
-Rich suite: 9 fresh-process rounds of 5 timed runs; the other kernels: 7
-processes.
+Median CPU milliseconds per kernel (see below), lower is better; ratio is
+LLVM / x64. Both backends are built from the same commit. Each kernel is
+compiled and linked before its timer starts, and every result is checked
+against an independent reference. Rich suite: 9 fresh-process rounds of 5
+timed runs; the other kernels: 7 processes.
 
 | Workload | LLVM | x64 | LLVM / x64 |
 |----------|-----:|----:|-----------:|
-| Integer loop (50,000 x 2,000) | 42 | 93 | 0.45 |
-| Native list/vector conversion, width 257 | 30 | 39 | 0.77 |
-| Native list/vector conversion, width 32 | 21 | 24 | 0.88 |
-| Floating point (100,000 steps per call) | 126 | 142 | 0.89 |
-| Library list/vector round trip, width 32 (interpreted `misc.mud`) | 182 | 179 | 1.02 |
-| Bigint (20,000 steps per call) | 65 | 62 | 1.05 |
-| Mixed bigint/float | 46 | 41 | 1.12 |
+| Integer loop (50,000 x 2,000) | 41 | 89 | 0.46 |
+| Native list/vector conversion, width 257 | 29 | 35 | 0.83 |
+| Native list/vector conversion, width 32 | 19 | 22 | 0.86 |
+| Floating point (100,000 steps per call) | 116 | 128 | 0.91 |
+| Library list/vector round trip, width 32 (interpreted `misc.mud`) | 165 | 164 | 1.01 |
+| Bigint (20,000 steps per call) | 61 | 60 | 1.02 |
+| Mixed bigint/float | 39 | 38 | 1.03 |
 | Tables, 257 keys | 14 | 10 | 1.40 |
-| Tables, 32 keys | 13 | 9 | 1.44 |
-| Recursive local closure, `fib(27)` | 46 | 11 | 4.18 |
-| Local closure called in a loop (2,000,000 iterations per call) | 195 | 31 | 6.29 |
+| Tables, 32 keys | 12 | 8 | 1.50 |
+| Recursive local closure, `fib(27)` | 22 | 12 | 1.83 |
+| Local closure called in a loop (2,000,000 iterations per call) | 91 | 27 | 3.37 |
 
 Notes:
 
@@ -110,8 +110,9 @@ Notes:
   which run interpreted in both builds.
 - Float and bigint use the explicit `f*` / `bi*` primitives (what
   `#arith(f)` and `#arith(b)` expand to).
-- x64 inlines known local functions; LLVM still calls them through the
-  runtime, which is the main remaining gap.
+- x64 inlines known local functions. LLVM calls statically known functions
+  (recursion and local function literals) directly but does not inline them,
+  which is the main remaining gap on call-heavy code.
 - `cpu_ms` is `ctime()` summed over the timed calls: 5 calls per kernel (the
   integer loop is 2,000 calls); compilation and JIT startup are excluded. The
   startup cost of compiling the compiler under LLVM is not measured here.
