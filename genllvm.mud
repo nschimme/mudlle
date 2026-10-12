@@ -2110,6 +2110,66 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               llvm_write_var(dest_var, res, w);
               exit<function> null;
             ];
+          // A call to a known function with exactly this many fixed
+          // arguments, or a direct recursive call (the callee is the
+          // running closure), needs no callability checks.
+          direct_fn = null;
+          self_call = false;
+          if (called_ifn != null
+              && llvm_exact_arity?(called_ifn, arg_count))
+            direct_fn = called_ifn[mc:c_fnumber]
+          else if (called_ifn == null
+                   && fn_var[mc:v_class] == mc:v_closure
+                   && fn_var[mc:v_cparent] == mc:myself
+                   && llvm_exact_arity?(current_ifn, arg_count))
+            [
+              direct_fn = current_ifn[mc:c_fnumber];
+              self_call = true;
+            ];
+          if (direct_fn != null)
+            [
+              // The call frame owns the argument array (the collector
+              // forwards it), so the caller registers no roots for it. The
+              // arguments are read from the caller's rooted locals, and the
+              // callee closure is not held across an allocation.
+              stack_mark = format("%%call_stack_%d", call_id);
+              arg_array = format("%%call_values_%d", call_id);
+              writer:format(w, "  %s = call ptr @llvm.stacksave()\n",
+                            stack_mark);
+              cname = if (self_call)
+                llvm_read_env(w)
+              else
+                llvm_emit_closure(called_ifn, w, true);
+              if (arg_count == 0)
+                arg_ptr = "null"
+              else
+                [
+                  writer:format(w, "  %s = alloca [%d x i64]\n", arg_array,
+                                arg_count);
+                  arg_index = 0;
+                  lforeach(fn (arg) [
+                    | value_slot, value_str |
+                    value_str = llvm_read_var(arg, w);
+                    value_slot = format("%%call_value_slot_%d_%d", call_id,
+                                        arg_index);
+                    writer:format(w,
+                      "  %s = getelementptr inbounds [%d x i64], ptr %s, i64\
+ 0, i64 %d\n",
+                      value_slot, arg_count, arg_array, arg_index);
+                    writer:format(w, "  store i64 %s, ptr %s\n", value_str,
+                                  value_slot);
+                    arg_index = arg_index + 1;
+                  ], call_args);
+                  arg_ptr = format("%%call_value_slot_%d_0", call_id);
+                ];
+              writer:format(w,
+                "  %s = call i64 @mudlle_call_known(i64 %s, ptr @fn_%d,\
+ ptr %s, i64 %d)\n",
+                res, cname, direct_fn, arg_ptr, arg_count);
+              writer:format(w,
+                "  call void @llvm.stackrestore(ptr %s)\n", stack_mark);
+            ]
+          else
           [
               root_count = arg_count + 1;
               arg_array = format("%%call_values_%d", call_id);
@@ -2161,28 +2221,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
  i64 %d, ptr %s)\n",
                 root_token, root_slots_data, root_count, root_records_data);
 
-              // A call to a known function with exactly this many fixed
-              // arguments, or a direct recursive call (the callee is the
-              // running closure), needs no callability checks.
-              direct_fn = null;
-              self_call = false;
-              if (called_ifn != null
-                  && llvm_exact_arity?(called_ifn, arg_count))
-                direct_fn = called_ifn[mc:c_fnumber]
-              else if (called_ifn == null
-                       && fn_var[mc:v_class] == mc:v_closure
-                       && fn_var[mc:v_cparent] == mc:myself
-                       && llvm_exact_arity?(current_ifn, arg_count))
-                [
-                  direct_fn = current_ifn[mc:c_fnumber];
-                  self_call = true;
-                ];
-              cname = if (self_call)
-                llvm_read_env(w)
-              else if (called_ifn != null)
-                llvm_emit_closure(called_ifn, w, true)
-              else
-                llvm_read_var(fn_var, w);
+              cname = llvm_read_var(fn_var, w);
               arg_slot = format("%%call_value_slot_%d_0", call_id);
               writer:format(w, "  store i64 %s, ptr %s\n", cname, arg_slot);
               arg_index = 0;
@@ -2529,7 +2568,7 @@ entry:
   %%argi = ptrtoint ptr %%argv to i64
   store i64 %%argi, ptr %%f5, align 8
   %%f6 = getelementptr inbounds i64, ptr %%frame, i64 6
-  %%nargsoff = or i64 %%nargs, -4294967296
+  %%nargsoff = or i64 %%nargs, -8589934592
   store i64 %%nargsoff, ptr %%f6, align 8
   store ptr %%frame, ptr @call_stack, align 8
   %%res = call i64 %%target(i64 %%callee, ptr %%argv, i64 %%nargs)

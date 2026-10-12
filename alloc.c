@@ -648,6 +648,12 @@ static void forward_roots(void)
             special_forward(&mstk->fn);
             special_forward(&mstk->code);
             special_forward(&mstk->locals);
+            /* Frames pushed inline by generated direct calls (offset -2)
+               own their argument array; others have it rooted by the
+               caller. */
+            if (stk->type == call_llvm && mstk->offset == -2)
+              for (int i = 0; i < mstk->nargs; ++i)
+                special_forward(&mstk->native_args[i]);
             continue;
           }
 
