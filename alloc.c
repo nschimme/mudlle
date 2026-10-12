@@ -424,7 +424,11 @@ static void *alloc_gc_block(size_t size)
       mudlle_log("alloc_gc_block(): out of memory");
       abort();
     }
+#ifdef MUDLLE_USE_LLVM
+  if (mprotect(b, size, PROT_READ | PROT_WRITE) != 0)
+#else
   if (mprotect(b, size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+#endif
     perror("mprotect()");
   return b;
 }

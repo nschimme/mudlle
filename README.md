@@ -99,7 +99,29 @@ Negative is faster on LLVM; the interval is a bootstrapped 95% CI.
 Nine of eleven workloads have a lower LLVM median (floating point -80%,
 integer loops -55%); library list/vector conversion and bigint primitives are
 2% slower, and the closure loop is within noise. This is an unpaired same-host
-comparison on x86-64 only; no ARM64, RISC-V or LLVM 14 results exist.
+comparison on x86-64 only. ARM64 was measured against the interpreter on
+macOS 27.0 ARM64 (Apple Clang 21, LLVM 23.1.3, O2). Values are
+median CPU milliseconds over three fresh-process rounds per backend; negative
+is faster for LLVM. Workloads, iteration counts, timed calls, and result checks
+match the amd64 suite. The interpreter executes the same kernel bodies as
+interpreted closures.
+
+| Workload | LLVM ms | Interpreter ms | CPU time vs interpreter | 95% interval |
+|----------|--------:|---------------:|------------------------:|-------------:|
+| Floating point primitives (100,000 steps) | 485 | 13,158 | -96.3% | -96.3% to -96.3% |
+| Integer loop (50,000 steps; 2,000 calls) | 63 | 6,746 | -99.1% | -99.1% to -99.1% |
+| Native list/vector conversion, width 32 | 423 | 9,284 | -95.4% | -95.5% to -95.4% |
+| Native list/vector conversion, width 257 | 619 | 13,490 | -95.4% | -95.4% to -95.4% |
+| Mixed bigint/float (20,000 steps) | 998 | 2,125 | -53.0% | -53.3% to -53.0% |
+| Tables, 32 keys | 614 | 2,354 | -73.9% | -74.0% to -73.7% |
+| Recursive local closure, `fib(27)` | 188 | 4,894 | -96.2% | -96.2% to -96.2% |
+| Tables, 257 keys | 679 | 2,374 | -71.4% | -71.5% to -71.3% |
+| Local closure loop (2,000,000 iterations) | 476 | 21,385 | -97.8% | -97.8% to -97.8% |
+| Library list/vector round trip, width 32 | 7,919 | 1,054 | +650.6% | +649.9% to +654.0% |
+| Bigint primitives (20,000 steps) | 1,707 | 2,423 | -29.6% | -29.7% to -29.5% |
+
+The intervals are paired bootstrap 95% intervals from these three rounds, so
+they are coarse. RISC-V and LLVM 14 results are unavailable.
 Methodology and reproduction: [`doc/benchmark.md`](doc/benchmark.md).
 
 

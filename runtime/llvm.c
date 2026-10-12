@@ -1611,7 +1611,8 @@ value llvm_make_function_closure_for_call(
   size_t slot = (((uintptr_t)address >> 4) ^ ((uintptr_t)constants >> 4))
     & (LLVM_CALL_CLOSURE_CACHE_SIZE - 1);
   value *entry = &llvm_call_closure_cache->data[3 * slot];
-  if (entry[0] == makeint(address) && entry[1] == constants && entry[2] != NULL)
+  value address_key = makeint((unsigned long)(uintptr_t)address);
+  if (entry[0] == address_key && entry[1] == constants && entry[2] != NULL)
     {
       value closure = entry[2];
       gcpro = old_gcpro;
@@ -1628,7 +1629,7 @@ value llvm_make_function_closure_for_call(
   slot = (((uintptr_t)address >> 4) ^ ((uintptr_t)constants >> 4))
     & (LLVM_CALL_CLOSURE_CACHE_SIZE - 1);
   entry = &llvm_call_closure_cache->data[3 * slot];
-  entry[0] = makeint(address);
+  entry[0] = address_key;
   entry[1] = constants;
   entry[2] = closure;
   gcpro = old_gcpro;
