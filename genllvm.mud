@@ -48,8 +48,10 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
     llvm_constant_values, llvm_global_relocation_values,
     function_roots_required,
     llvm_function_may_allocate?, llvm_allocate_slots, llvm_slot_number,
-    slot_indices, llvm_instruction_may_allocate?, root_slot_indices, nonallocating_ops, nonallocating_branches, vector_find_required |
+    slot_indices, llvm_instruction_may_allocate?, root_slot_indices, nonallocating_ops, nonallocating_branches, vector_find_required,
+    llvm_inline_max_size |
 
+  llvm_inline_max_size = 3500;
   tmp_seq = 0;
   globals_seen = make_table();
   current_ifn = null;
@@ -1342,7 +1344,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
 
   gen_function = fn (ifn, w)
     [
-      | code, fval, scan, il, fname, cidx |
+      | code, fval, scan, il, fname, cidx, ir, hpos |
       if (pair?(ifn[mc:c_fvalue]) && string?(car(ifn[mc:c_fvalue]))
           && string_search(car(ifn[mc:c_fvalue]), "define i64") >= 0)
         [
@@ -1374,7 +1376,19 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               if (scan == fval) exit 0
             ]
         ];
-      writer:write(w, car(llvm:assemble(code)));
+      ir = car(llvm:assemble(code));
+      // Small functions are internal and always inlined, so statically known
+      // callers see their bodies; entry_N below keeps the exported bridge.
+      hpos = string_search(ir, ") {\n");
+      if (slength(ir) <= llvm_inline_max_size && hpos > 0)
+        [
+          writer:write(w, "define internal i64 @");
+          writer:write(w, substring(ir, 12, hpos - 11));
+          writer:write(w, " alwaysinline {\n");
+          writer:write(w, substring(ir, hpos + 4, slength(ir) - hpos - 4));
+        ]
+      else
+        writer:write(w, ir);
 
       // Export the native argument-vector ABI to the runtime closure bridge.
       fname = format("entry_%d", ifn[mc:c_fnumber]);

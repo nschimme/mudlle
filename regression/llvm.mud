@@ -62,7 +62,7 @@ test_genllvm = fn (string code_str)
     ir = mc:gen_llvm_ir(tree);
     assert(string?(ir) && slength(ir) > 0);
     assert(string_search(ir, "target datalayout") < 0);
-    assert(string_search(ir, "define i64 @fn_") >= 0);
+    assert(string_search(ir, "i64 @fn_") >= 0);
     assert(string_search(ir, "alloca i64") >= 0);
     assert(string_search(ir, "ret i64") >= 0);
     ir
@@ -192,7 +192,7 @@ display("Testing LLVM mc:compile pipeline...\n");
   tree = mudlle_parse(source, "test-scalar-roots.mud", false);
   ir = mc:compile_llvm(tree, 1, mc:source_code(source));
   assert(string?(ir));
-  fn_start = string_search(ir, "define i64 @fn_1(");
+  fn_start = string_search(ir, "i64 @fn_1(");
   entry_start = string_search_offset(ir, fn_start, "define i64 @entry_1(");
   assert(fn_start >= 0 && entry_start > fn_start);
   fn_ir = substring(ir, fn_start, entry_start - fn_start);
@@ -246,7 +246,7 @@ display("Testing LLVM mc:compile pipeline...\n");
   source = "fn (a, rest...) a";
   tree = mudlle_parse(source, "test-varargs-roots.mud", false);
   ir = mc:compile_llvm(tree, 1, mc:source_code(source));
-  fn_start = string_search(ir, "define i64 @fn_1(");
+  fn_start = string_search(ir, "i64 @fn_1(");
   entry_start = string_search_offset(ir, fn_start, "define i64 @entry_1(");
   assert(fn_start >= 0 && entry_start > fn_start);
   fn_ir = substring(ir, fn_start, entry_start - fn_start);
