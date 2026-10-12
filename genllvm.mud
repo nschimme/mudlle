@@ -42,7 +42,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
     llvm_check_comparison_types, llvm_check_typed_integer_args,
     llvm_args_immutable?,
     llvm_emit_vector, llvm_emit_concat, llvm_emit_builtin,
-    llvm_emit_binary_builtin, llvm_emit_ref, llvm_emit_set,
+    llvm_emit_binary_builtin, llvm_emit_ref, llvm_emit_set, llvm_exact_arity?,
     llvm_read_var_storage, llvm_read_env,
     llvm_emit_rooted_arguments, llvm_emit_copying_arguments,
     llvm_constant_values, llvm_global_relocation_values,
@@ -602,6 +602,17 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
         "  %s = getelementptr [%d x i64], ptr %s, i64 0, i64 0\n",
         ptr, count, values);
       vector(ptr, mark, "null", count)
+    ];
+
+  // True if 'ifn' takes exactly 'count' fixed arguments, no optional or
+  // variable-length ones.
+  llvm_exact_arity? = fn (ifn, count)
+    [
+      | info |
+      info = ifn[mc:c_farginfo];
+      info[mc:arginfo_nargs] == count
+        && info[mc:arginfo_noptargs] == 0
+        && !info[mc:arginfo_vararg]
     ];
 
   // for_call: the closure is created only to be called at once, so a
@@ -1997,7 +2008,8 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
             arg_array, arg_ptr, arg_index, stack_mark, root_count,
             root_slots, root_records, root_token, root_slot_ptr,
             root_slots_data, root_records_data, arg_count,
-            arg_slot, root_index, call_id, secure_call, floatop, floatres, floatunary |
+            arg_slot, root_index, call_id, secure_call, floatop, floatres, floatunary,
+            direct_fn, self_call |
           dest_var = ins[mc:i_cdest];
           call_args = ins[mc:i_cargs];
           fn_var = car(call_args);
@@ -2142,7 +2154,25 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
  i64 %d, ptr %s)\n",
                 root_token, root_slots_data, root_count, root_records_data);
 
-              cname = if (called_ifn != null)
+              // A call to a known function with exactly this many fixed
+              // arguments, or a direct recursive call (the callee is the
+              // running closure), needs no callability checks.
+              direct_fn = null;
+              self_call = false;
+              if (called_ifn != null
+                  && llvm_exact_arity?(called_ifn, arg_count))
+                direct_fn = called_ifn[mc:c_fnumber]
+              else if (called_ifn == null
+                       && fn_var[mc:v_class] == mc:v_closure
+                       && fn_var[mc:v_cparent] == mc:myself
+                       && llvm_exact_arity?(current_ifn, arg_count))
+                [
+                  direct_fn = current_ifn[mc:c_fnumber];
+                  self_call = true;
+                ];
+              cname = if (self_call)
+                llvm_read_env(w)
+              else if (called_ifn != null)
                 llvm_emit_closure(called_ifn, w, true)
               else
                 llvm_read_var(fn_var, w);
@@ -2171,11 +2201,17 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
  i64 1\n",
                     arg_ptr, root_count, arg_array);
                 ];
-              writer:format(w,
-                "  %s = call i64 @llvm_call_value(i64 %s, i64 %s, ptr %s, i64\
- %d, i64 %d)\n",
-                res, llvm_read_env(w), cname, arg_ptr, arg_count,
-                if (secure_call) 1 else 0);
+              if (direct_fn != null)
+                writer:format(w,
+                  "  %s = call i64 @mudlle_call_known(i64 %s, ptr @fn_%d,\
+ ptr %s, i64 %d)\n",
+                  res, cname, direct_fn, arg_ptr, arg_count)
+              else
+                writer:format(w,
+                  "  %s = call i64 @llvm_call_value(i64 %s, i64 %s, ptr %s,\
+ i64 %d, i64 %d)\n",
+                  res, llvm_read_env(w), cname, arg_ptr, arg_count,
+                  if (secure_call) 1 else 0);
               writer:format(w,
                 "  call void @mudlle_roots_leave(ptr %s)\n", root_token);
               writer:format(w,
@@ -2448,6 +2484,52 @@ slow:
   ret void
 done:
   ret void
+}
+""");
+      // Direct call of a statically known LLVM function from LLVM code: the
+      // callee is a closure of the same module, so it has the caller's
+      // security level, its arity is known, and no callability checks are
+      // needed. Builds the same call_llvm frame as llvm_invoke_closure (layouts
+      // are checked in runtime/llvm.c) and keeps the seclevel bookkeeping of
+      // llvm_call_value.
+      writer:write_line(w, "@call_stack = external global ptr\n");
+      writer:write_line(w, "@internal_seclevel = external global i8\n");
+      writer:write_line(w, "@seclevel_valid = external global i8\n");
+      writer:format(w, """
+define internal i64 @mudlle_call_known(i64 %%callee, ptr %%target, ptr %%argv, i64 %%nargs) {
+entry:
+  %%frame = alloca [7 x i64], align 8
+  %%cobj = inttoptr i64 %%callee to ptr
+  %%codeslot = getelementptr inbounds i8, ptr %%cobj, i64 16
+  %%code = load i64, ptr %%codeslot, align 8
+  %%codep = inttoptr i64 %%code to ptr
+  %%lvlslot = getelementptr inbounds i8, ptr %%codep, i64 58
+  %%lvl = load i8, ptr %%lvlslot, align 1
+  %%oldlvl = load i8, ptr @internal_seclevel, align 1
+  %%oldvalid = load i8, ptr @seclevel_valid, align 1
+  store i8 %%lvl, ptr @internal_seclevel, align 1
+  %%top = load ptr, ptr @call_stack, align 8
+  store ptr %%top, ptr %%frame, align 8
+  %%f1 = getelementptr inbounds i64, ptr %%frame, i64 1
+  store i64 11, ptr %%f1, align 8
+  %%f2 = getelementptr inbounds i64, ptr %%frame, i64 2
+  store i64 %%callee, ptr %%f2, align 8
+  %%f3 = getelementptr inbounds i64, ptr %%frame, i64 3
+  store i64 %%code, ptr %%f3, align 8
+  %%f4 = getelementptr inbounds i64, ptr %%frame, i64 4
+  store i64 0, ptr %%f4, align 8
+  %%f5 = getelementptr inbounds i64, ptr %%frame, i64 5
+  %%argi = ptrtoint ptr %%argv to i64
+  store i64 %%argi, ptr %%f5, align 8
+  %%f6 = getelementptr inbounds i64, ptr %%frame, i64 6
+  %%nargsoff = or i64 %%nargs, -4294967296
+  store i64 %%nargsoff, ptr %%f6, align 8
+  store ptr %%frame, ptr @call_stack, align 8
+  %%res = call i64 %%target(i64 %%callee, ptr %%argv, i64 %%nargs)
+  store ptr %%top, ptr @call_stack, align 8
+  store i8 %%oldlvl, ptr @internal_seclevel, align 1
+  store i8 %%oldvalid, ptr @seclevel_valid, align 1
+  ret i64 %%res
 }
 """);
       // Writable heap object: pointer tag, then the read-only flag bit. The

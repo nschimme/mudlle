@@ -171,6 +171,12 @@ static ALWAYS_INLINE void set_seclevel(seclev_t seclevel)
   internal_seclevel = seclevel;
 }
 
+/* The maxseclevel a function of seclevel 'seclev' runs with */
+static inline seclev_t maxseclevel_for(seclev_t seclev)
+{
+  return seclev >= LEGACY_SECLEVEL ? MAX_SECLEVEL : seclev;
+}
+
 value seclevel_to_maxseclevel(seclev_t seclev);
 seclev_t get_effective_seclevel(void);
 

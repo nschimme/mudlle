@@ -169,11 +169,39 @@ static void llvm_unresolved_symbol_stub(void)
     { (LLVMOrcExecutorAddress)(uintptr_t)(fn), \
       { LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable, 0 } } }
 
+/* Generated code builds call_llvm frames inline and reads object headers and
+   closure/code fields at fixed offsets (see mudlle_call_known in genllvm.mud).
+   Break the build if any of these layouts change. */
+_Static_assert(call_llvm == 11, "generated IR hardcodes call_llvm");
+_Static_assert(sizeof (struct call_stack_mudlle) == 56
+               && offsetof(struct call_stack_mudlle, s.next) == 0
+               && offsetof(struct call_stack_mudlle, s.type) == 8
+               && offsetof(struct call_stack_mudlle, fn) == 16
+               && offsetof(struct call_stack_mudlle, code) == 24
+               && offsetof(struct call_stack_mudlle, locals) == 32
+               && offsetof(struct call_stack_mudlle, native_args) == 40
+               && offsetof(struct call_stack_mudlle, nargs) == 48
+               && offsetof(struct call_stack_mudlle, offset) == 52,
+               "generated IR hardcodes struct call_stack_mudlle");
+_Static_assert(offsetof(struct closure, code) == 16
+               && offsetof(struct code, seclevel) == 58
+               && sizeof (seclev_t) == 1 && sizeof (seclevel_valid) == 1,
+               "generated IR hardcodes closure/code layout");
+
 static void llvm_orc_register_absolute_symbols(LLVMOrcJITDylibRef dylib)
 {
   LLVMOrcCSymbolMapPair symbols[] = {
     { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "internal_xcount"),
       { (LLVMOrcExecutorAddress)(uintptr_t)&internal_xcount,
+        { LLVMJITSymbolGenericFlagsExported, 0 } } },
+    { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "call_stack"),
+      { (LLVMOrcExecutorAddress)(uintptr_t)&call_stack,
+        { LLVMJITSymbolGenericFlagsExported, 0 } } },
+    { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "internal_seclevel"),
+      { (LLVMOrcExecutorAddress)(uintptr_t)&internal_seclevel,
+        { LLVMJITSymbolGenericFlagsExported, 0 } } },
+    { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "seclevel_valid"),
+      { (LLVMOrcExecutorAddress)(uintptr_t)&seclevel_valid,
         { LLVMJITSymbolGenericFlagsExported, 0 } } },
     { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "gcpro"),
       { (LLVMOrcExecutorAddress)(uintptr_t)&gcpro,
@@ -989,8 +1017,8 @@ static value llvm_invoke_closure(struct llvm_callback_data *data,
                                  struct closure *closure,
                                  value *arguments, size_t nargs)
 {
+  /* The callee's inline entry sequence checks the stack limit. */
   check_allow_mudlle_call();
-  llvm_check_stack();
   check_interrupt();
   struct call_stack_mudlle frame = {
     .s = { .next = call_stack, .type = call_llvm },
@@ -1006,7 +1034,7 @@ static value llvm_invoke_closure(struct llvm_callback_data *data,
   seclev_t level = closure->code->seclevel;
   if (level < minlevel)
     runtime_error(error_security_violation);
-  seclev_t maximum = intval(seclevel_to_maxseclevel(level));
+  seclev_t maximum = maxseclevel_for(level);
   seclev_t old_maximum = c_maxseclevel();
   seclev_t old_trace = trace_seclevel();
   if (maximum < old_maximum)
