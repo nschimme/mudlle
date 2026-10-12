@@ -18,7 +18,8 @@ backend and an LLVM backend.
 
 EOF (Ctrl-D) or `quit()` exits. `doc/mudlle-intro.doc` and
 `doc/mudlle-ref.doc` are the introduction and reference;
-`doc/llvm-backend.md` documents the LLVM backend.
+`doc/llvm-backend.md` documents the LLVM backend, and
+`doc/llvm-backend-handoff.md` lists its open work and validation steps.
 
 
 Build
