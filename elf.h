@@ -6,7 +6,8 @@
 
 /* See https://www.uclibc.org/docs/elf-64-gen.pdf */
 
-#if defined __x86_64__ || defined __aarch64__
+#if defined __x86_64__ || defined __aarch64__ \
+    || (defined __riscv && __riscv_xlen == 64)
 typedef uint64_t elf_addr_t;
 #else
 #error Unsupported architecture
@@ -72,7 +73,8 @@ struct elf_file {
 enum {
   ELFCLASS32 = 1,
   ELFCLASS64 = 2,
-#if defined __x86_64__ || defined __aarch64__
+#if defined __x86_64__ || defined __aarch64__ \
+    || (defined __riscv && __riscv_xlen == 64)
   ELFCLASS = ELFCLASS64,
 #endif
 
@@ -91,11 +93,14 @@ enum {
   EM_386     = 3,
   EM_X86_64  = 62,
   EM_AARCH64 = 183,
+  EM_RISCV   = 243,
 
 #if defined __x86_64__
   EM_MACHINE = EM_X86_64,
 #elif defined __aarch64__
   EM_MACHINE = EM_AARCH64,
+#elif defined __riscv && __riscv_xlen == 64
+  EM_MACHINE = EM_RISCV,
 #else
 #error Unsupported architecture
 #endif

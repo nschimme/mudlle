@@ -130,7 +130,7 @@ OBJS := $(BUILTINS) $(SRC:%.c=%.$(OBJEXT))
 warnings := all missing-declarations missing-prototypes nested-externs	\
         shadow unused-macros write-strings
 
-ifeq ($(DARWIN),)
+ifeq ($(DARWIN)$(filter riscv%,$(shell uname -m)),)
 MARCH_NATIVE:=-march=native 
 else
 MARCH_NATIVE:=

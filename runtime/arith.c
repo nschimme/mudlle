@@ -255,6 +255,9 @@ EXT_TYPEDOP(bitand, "&", "`n1 `n2 -> `n3. Returns `n1 bitwise AND `n2.",
 #elif defined __aarch64__
  #define SHIFT_EXTRA_DOC \
     "On 64-bit ARM, only the 6 least significant bits of `n2 are used."
+#elif defined __riscv && __riscv_xlen == 64
+ #define SHIFT_EXTRA_DOC \
+    "On 64-bit RISC-V, only the 6 least significant bits of `n2 are used."
 #else
  #error Unsupported architecture
 #endif
