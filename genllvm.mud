@@ -50,13 +50,15 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
     llvm_function_may_allocate?, llvm_allocate_slots, llvm_slot_number,
     slot_indices, llvm_instruction_may_allocate?, root_slot_indices, nonallocating_ops, nonallocating_branches, vector_find_required,
     llvm_inline_max_size, closure_cache_fns, closure_cache_seen,
-    float_internal, float_doubles, llvm_float_call_op, llvm_find_float_temps |
+    float_internal, float_doubles, float_consts, llvm_float_call_op,
+    llvm_find_float_temps |
 
   llvm_inline_max_size = 3500;
   closure_cache_fns = null;
   closure_cache_seen = make_table();
   float_internal = make_table();
   float_doubles = make_table();
+  float_consts = null;
   tmp_seq = 0;
   globals_seen = make_table();
   current_ifn = null;
@@ -644,6 +646,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       | uses, defs, produced, consumed, block, scan, il, ins, dest, key |
       float_internal = make_table();
       float_doubles = make_table();
+      float_consts = null;
       if (!vector?(ifn[mc:c_fvalue])) exit<function> null;
       uses = make_table();
       defs = make_table();
@@ -681,7 +684,14 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               lforeach(fn (v) [
                 if (vector?(v) && v[mc:v_class] == mc:v_local
                     && slength(v[mc:v_name]) == 0)
-                  consumed[itoa(v[mc:v_number])] = block;
+                  consumed[itoa(v[mc:v_number])] = block
+                else if (v[mc:v_class] == mc:v_constant
+                         && float?(v[mc:v_kvalue]))
+                  [
+                    key = llvm_constant_index(v[mc:v_kvalue]);
+                    if (!memq(key, float_consts))
+                      float_consts = key . float_consts;
+                  ];
               ], cdr(ins[mc:i_cargs]));
           ];
         scan = dnext(scan);
@@ -1395,6 +1405,15 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
           writer:format(w, "  store i64 %s, ptr %%slot_%d\n",
                         tagged_nargs_value, nv);
         ];
+
+      // Float literals used by raw-double arithmetic are fetched once.
+      lforeach(fn (idx) [
+        writer:format(w,
+          "  %%fcv_%d = call i64 @llvm_constant_get(i64 %%env, i64 %d)\n\
+  %%fct_%d = call { double, i1 } @mudlle_try_double(i64 %%fcv_%d)\n\
+  %%fconst_%d = extractvalue { double, i1 } %%fct_%d, 0\n",
+          idx, idx, idx, idx, idx, idx);
+      ], float_consts);
 
       // Box variables whose address escapes into a closure. Arguments retain
       // their incoming value; other locals begin as null, like x64's allocator.
@@ -2214,7 +2233,20 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               allok = "true";
               dnames = null;
               lforeach(fn (a) [
-                dn = float_doubles[itoa(a[mc:v_number])];
+                dn = if (a[mc:v_class] == mc:v_constant)
+                  [
+                    if (float?(a[mc:v_kvalue]))
+                      format("%%fconst_%d", llvm_constant_index(a[mc:v_kvalue]))
+                    else if (integer?(a[mc:v_kvalue]))
+                      [
+                        writer:format(w,
+                          "  %%fl_ci_%d_%d = sitofp i64 %d to double\n",
+                          fid, k, a[mc:v_kvalue]);
+                        format("%%fl_ci_%d_%d", fid, k)
+                      ]
+                    else null
+                  ]
+                else float_doubles[itoa(a[mc:v_number])];
                 if (dn == null)
                   [
                     tname = format("%%fl_t_%d_%d", fid, k);
@@ -2262,7 +2294,8 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               // The generic call needs boxed operands.
               k = 0;
               lforeach(fn (a) [
-                if (float_doubles[itoa(a[mc:v_number])] != null)
+                if (a[mc:v_class] == mc:v_local
+                    && float_doubles[itoa(a[mc:v_number])] != null)
                   [
                     boxed = format("%%fl_bx_%d_%d", fid, k);
                     writer:format(w,

@@ -25,7 +25,7 @@
 
 [
   | compile, chain, split, unary, usplit, mixed, mixed_split, same?, args,
-    a, b, c, err, i, bigs, nan, inf |
+    a, b, c, err, i, bigs, nan, inf, lit, lit_split |
   compile = fn (source, name) [ | tree, prelinked, linked |
     tree = mudlle_parse(source, name, false);
     prelinked = mc:compile(tree, false, 1, mc:source_code(source));
@@ -49,6 +49,12 @@
   mixed_split = compile("fn (n, x) [ | i, v, t1, t2, t3 | i = 0; v = x; while (i < n) [ t1 = fmul(v, 0.5); t2 = fadd(v, 2.0); t3 = fdiv(1.0, t2); v = fadd(t1, t3); i = iadd(i, 1) ]; v ]",
                         "llvm-float-loop-split.mud");
 
+  // literal operands: floats, small/large/negative fixnums, shared constants
+  lit = compile("fn (a) fadd(fmul(a, 0.5), fsub(fdiv(3, a), fadd(-7, fmul(0.5, 4611686018427387903))))",
+                "llvm-float-lit.mud");
+  lit_split = compile("fn (a) [ | t1, t2, t3, t4, t5 | t1 = fmul(a, 0.5); t2 = fdiv(3, a); t3 = fmul(0.5, 4611686018427387903); t4 = fadd(-7, t3); t5 = fsub(t2, t4); fadd(t1, t5) ]",
+                      "llvm-float-lit-split.mud");
+
   same? = fn (x, y) equal?(x, y)
     || (equal?(format("%w", x), "nan") && equal?(format("%w", y), "nan"));
 
@@ -66,6 +72,9 @@
   ], args);
   lforeach(fn (x) assert(same?(mixed(40, x), mixed_split(40, x))),
            list(0.0, 1, 2.5, -7.25, bigs));
+
+  lforeach(fn (x) assert(same?(lit(x), lit_split(x))),
+           list(1.5, 2, -3, 0.001, 1e100, bigs, 0, 0.0));
 
   // bad operands report the usual error from inside a chain
   err = trap_error(fn () chain("x", 1, 2), fn (n) n, call_trace_off, null);
