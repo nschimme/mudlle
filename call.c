@@ -892,3 +892,27 @@ struct closure *make_mcallback_varargs_captured_sec(
   UNGCPRO();
   return closure;
 }
+
+struct closure *make_mcallback_varargs_captured_sec_cached(
+  mcallback_varargs_fn cb, weak_ref_free_fn cbfree, void *cbdata,
+  struct vector *captures, const char *funcname, struct string *help,
+  const char *filename, int line, seclev_t seclev, struct icode **icode_slot,
+  struct vector *arguments, typeset_t return_typeset)
+{
+  /* alloc_weak_ref may collect, so the cached code needs a root until the
+     callee takes over. */
+  struct icode *icode = *icode_slot;
+  GCPRO(captures, arguments, icode);
+  struct mcallback *c = (struct mcallback *)alloc_weak_ref(
+    type_private, sizeof (struct mcallback), cbdata, cbfree);
+  c->p.ptype = makeint(PRIVATE_MCALLBACK);
+  c->cb = NULL;
+  c->cb_varargs = cb;
+  c->cbdata = cbdata;
+  struct closure *closure = make_primitive_closure_varargs_captured_sec_cached(
+    c, funcname, help, filename, line, captures, seclev, &icode,
+    arguments, return_typeset);
+  *icode_slot = icode;
+  UNGCPRO();
+  return closure;
+}

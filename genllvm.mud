@@ -1758,7 +1758,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                 [
                   array = llvm_read_var(ins[mc:i_marray], w);
                   writer:format(w,
-                    "  call void @llvm_check_mutable(i64 %s)\n", array);
+                    "  call void @mudlle_check_mutable(i64 %s)\n", array);
                 ];
               value_str = llvm_read_var(ins[mc:i_mscalar], w);
               array = llvm_read_var(ins[mc:i_marray], w);
@@ -2359,6 +2359,30 @@ no:
   ret i32 0
 }
 """, type_vector);
+      // Writable heap object: pointer tag, then the read-only flag bit. The
+      // runtime check raises the diagnostics for everything else.
+      writer:format(w, """
+define internal void @mudlle_check_mutable(i64 %%value) {
+entry:
+  %%tag = and i64 %%value, 1
+  %%even = icmp eq i64 %%tag, 0
+  %%nonnull = icmp ne i64 %%value, 0
+  %%pointer = and i1 %%even, %%nonnull
+  br i1 %%pointer, label %%header, label %%slow
+header:
+  %%object = inttoptr i64 %%value to ptr
+  %%flagptr = getelementptr i8, ptr %%object, i64 10
+  %%flags = load i16, ptr %%flagptr, align 2
+  %%masked = and i16 %%flags, 1
+  %%writable = icmp eq i16 %%masked, 0
+  br i1 %%writable, label %%done, label %%slow
+slow:
+  call void @llvm_check_mutable(i64 %%value)
+  ret void
+done:
+  ret void
+}
+""");
       writer:format(w, """
 define internal i32 @mudlle_has_type(i64 %%value, i64 %%expected) {
 entry:

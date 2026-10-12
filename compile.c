@@ -881,69 +881,75 @@ static struct block *new_toplevel_codeblock(struct vlist *statics,
 static struct closure *make_primitive_closure_internal(
   struct mcallback *cb, const char *funcname, struct string *help,
   const char *filename, int line, bool varargs,
-  struct vector *captures, seclev_t seclev)
+  struct vector *captures, seclev_t seclev, struct icode **icode_slot,
+  struct vector *arguments, typeset_t return_typeset)
 {
   struct variable *cbvar = NULL;
-  struct icode *icode = NULL;
+  struct icode *icode = icode_slot ? *icode_slot : NULL;
   value callback = cb;
-  GCPRO(callback, cbvar, icode, captures);
+  GCPRO(callback, cbvar, icode, captures, arguments);
 
   assert(funcname != NULL);
   assert(help->o.garbage_type == garbage_static_string);
 
-  static struct table *scache = NULL;
-  if (scache == NULL)
-    {
-      staticpro(&scache);
-      scache = alloc_ctable(DEF_TABLE_SIZE);
-    }
-  init_string_cache(scache);
-
   cbvar = alloc_variable(callback);
 
-  const struct filename fname = {
-    .filename = filename,
-    .nicename = filename
-  };
-  const struct loc loc = {
-    .fname = &fname,
-    .line  = line,
-    .col   = 0
-  };
-  struct function_arg vararg = {
-    .typeset = TYPESET_ANY,
-    .is_optional = true,
-    .is_vararg = true
-  };
-  struct function_args fargs = { .nargs = 0 };
-  unsigned nlocals = 0;
-  if (varargs)
+  if (icode == NULL)
     {
-      fargs.args = fargs.last_arg = &vararg;
-      fargs.nargs = fargs.noptargs = 1;
-      nlocals = 2;
-    }
+      static struct table *scache = NULL;
+      if (scache == NULL)
+        {
+          staticpro(&scache);
+          scache = alloc_ctable(DEF_TABLE_SIZE);
+        }
+      init_string_cache(scache);
 
-  struct fncode *newfn = new_fncode(false, &loc);
-  if (varargs)
-    {
-      ins_constant(makeint(0), newfn);
-      ins_constant(makeint(0), newfn);
-      ins0(op_args_vararg, newfn);
-    }
-  else
-    ins1(op_args_fixed, 0, newfn);
-  ins0(op_pop_args, newfn);
-  ins_recall(vclass_closure, 0, newfn);
-  ins0(op_c_callback, newfn);
-  ins0(op_return, newfn);
-  assert(adjust_depth(0, newfn) == 1);
+      const struct filename fname = {
+        .filename = filename,
+        .nicename = filename
+      };
+      const struct loc loc = {
+        .fname = &fname,
+        .line  = line,
+        .col   = 0
+      };
+      struct function_arg vararg = {
+        .typeset = TYPESET_ANY,
+        .is_optional = true,
+        .is_vararg = true
+      };
+      struct function_args fargs = { .nargs = 0 };
+      unsigned nlocals = 0;
+      if (varargs)
+        {
+          fargs.args = fargs.last_arg = &vararg;
+          fargs.nargs = fargs.noptargs = 1;
+          nlocals = 2;
+        }
 
-  icode = generate_fncode(
-    newfn, help, NULL, &loc, make_arguments(&fargs), varargs, TYPESET_ANY,
-    seclev);
-  delete_fncode(newfn);
-  icode->nb_locals = nlocals;
+      struct fncode *newfn = new_fncode(false, &loc);
+      if (varargs)
+        {
+          ins_constant(makeint(0), newfn);
+          ins_constant(makeint(0), newfn);
+          ins0(op_args_vararg, newfn);
+        }
+      else
+        ins1(op_args_fixed, 0, newfn);
+      ins0(op_pop_args, newfn);
+      ins_recall(vclass_closure, 0, newfn);
+      ins0(op_c_callback, newfn);
+      ins0(op_return, newfn);
+      assert(adjust_depth(0, newfn) == 1);
+
+      icode = generate_fncode(
+        newfn, help, NULL, &loc,
+        arguments ? arguments : make_arguments(&fargs), varargs,
+        arguments ? return_typeset : TYPESET_ANY, seclev);
+      delete_fncode(newfn);
+      icode->nb_locals = nlocals;
+      free_string_cache();
+    }
 
   ulong ncaptures = captures ? vector_len(captures) : 0;
   struct closure *cl = alloc_closure_noinit(1 + ncaptures);
@@ -961,7 +967,8 @@ static struct closure *make_primitive_closure_internal(
   UNGCPROV(cl_root);
   UNGCPRO();
 
-  free_string_cache();
+  if (icode_slot)
+    *icode_slot = icode;
   return cl;
 }
 
@@ -970,7 +977,7 @@ struct closure *make_primitive_closure(
   const char *filename, int line)
 {
   return make_primitive_closure_internal(
-    cb, funcname, help, filename, line, false, NULL, MAX_SECLEVEL);
+    cb, funcname, help, filename, line, false, NULL, MAX_SECLEVEL, NULL, NULL, TYPESET_ANY);
 }
 
 struct closure *make_primitive_closure_varargs(
@@ -978,7 +985,7 @@ struct closure *make_primitive_closure_varargs(
   const char *filename, int line)
 {
   return make_primitive_closure_internal(
-    cb, funcname, help, filename, line, true, NULL, MAX_SECLEVEL);
+    cb, funcname, help, filename, line, true, NULL, MAX_SECLEVEL, NULL, NULL, TYPESET_ANY);
 }
 
 struct closure *make_primitive_closure_varargs_captured(
@@ -986,7 +993,7 @@ struct closure *make_primitive_closure_varargs_captured(
   const char *filename, int line, struct vector *captures)
 {
   return make_primitive_closure_internal(
-    cb, funcname, help, filename, line, true, captures, MAX_SECLEVEL);
+    cb, funcname, help, filename, line, true, captures, MAX_SECLEVEL, NULL, NULL, TYPESET_ANY);
 }
 
 struct closure *make_primitive_closure_varargs_captured_sec(
@@ -994,7 +1001,19 @@ struct closure *make_primitive_closure_varargs_captured_sec(
   const char *filename, int line, struct vector *captures, seclev_t seclev)
 {
   return make_primitive_closure_internal(
-    cb, funcname, help, filename, line, true, captures, seclev);
+    cb, funcname, help, filename, line, true, captures, seclev, NULL, NULL,
+    TYPESET_ANY);
+}
+
+struct closure *make_primitive_closure_varargs_captured_sec_cached(
+  struct mcallback *cb, const char *funcname, struct string *help,
+  const char *filename, int line, struct vector *captures, seclev_t seclev,
+  struct icode **icode_slot, struct vector *arguments,
+  typeset_t return_typeset)
+{
+  return make_primitive_closure_internal(
+    cb, funcname, help, filename, line, true, captures, seclev, icode_slot,
+    arguments, return_typeset);
 }
 
 struct closure *compile_code(struct mfile *f, seclev_t seclev)

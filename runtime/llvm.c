@@ -1343,6 +1343,9 @@ int64_t llvm_call_global(int64_t raw_caller, int64_t raw_name,
 STATIC_STRING(llvm_ir_closure_help,
               "Calls an LLVM native function as a Mudlle closure.");
 
+#define LLVM_ICODE_CACHE_SIZE 256
+static struct vector *llvm_icode_cache;
+
 /* Create a generated function closure with its lexical environment. */
 value llvm_make_function_closure(int64_t address, int64_t nargs,
                                  value *captures, int64_t ncaptures,
@@ -1421,12 +1424,27 @@ value llvm_make_function_closure(int64_t address, int64_t nargs,
   data->nargs = (size_t)nargs;
   data->check_arity = false;
   data->stable = ncaptures == 0;
-  struct closure *closure = make_mcallback_varargs_captured_sec(
+  /* The wrapper code depends only on the argument metadata, return typeset
+     and security level; reuse it instead of regenerating it per closure. */
+  if (llvm_icode_cache == NULL)
+    {
+      llvm_icode_cache = alloc_vector(LLVM_ICODE_CACHE_SIZE);
+      staticpro(&llvm_icode_cache);
+    }
+  size_t slot = ((uintptr_t)arguments_metadata >> 4) % LLVM_ICODE_CACHE_SIZE;
+  struct icode *icode = (struct icode *)llvm_icode_cache->data[slot];
+  if (icode != NULL
+      && (icode->code.arguments != (struct vector *)arguments_metadata
+          || icode->code.return_typeset != (typeset_t)return_typeset
+          || icode->code.seclevel != parent_seclevel))
+    icode = NULL;
+  struct closure *closure = make_mcallback_varargs_captured_sec_cached(
     llvm_call_closure, llvm_free_callback, data, env,
     "llvm_function_closure", GET_STATIC_STRING(llvm_ir_closure_help),
-    __FILE__, __LINE__, parent_seclevel);
-  closure->code->arguments = (struct vector *)arguments_metadata;
-  closure->code->return_typeset = (typeset_t)return_typeset;
+    __FILE__, __LINE__, parent_seclevel, &icode,
+    (struct vector *)arguments_metadata, (typeset_t)return_typeset);
+  slot = ((uintptr_t)arguments_metadata >> 4) % LLVM_ICODE_CACHE_SIZE;
+  llvm_icode_cache->data[slot] = (value)icode;
   struct gcpro closure_root;
   GCPROV(closure_root, closure);
   if (self_capture >= 0)

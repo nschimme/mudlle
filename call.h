@@ -242,6 +242,12 @@ struct closure *make_mcallback_varargs_captured_sec(
   mcallback_varargs_fn cb, void (*cbfree)(void *cbdata), void *cbdata,
   struct vector *captures, const char *funcname, struct string *help,
   const char *filename, int line, seclev_t seclev);
+struct icode;
+struct closure *make_mcallback_varargs_captured_sec_cached(
+  mcallback_varargs_fn cb, void (*cbfree)(void *cbdata), void *cbdata,
+  struct vector *captures, const char *funcname, struct string *help,
+  const char *filename, int line, seclev_t seclev, struct icode **icode_slot,
+  struct vector *arguments, typeset_t return_typeset);
 
 #define MAKE_MCALLBACK(cb, cbfree, cbarg, funcname, help)       \
   make_mcallback((cb), (cbfree), (cbarg), (funcname), (help),   \
