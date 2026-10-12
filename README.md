@@ -80,7 +80,7 @@ compatibility rules are described in `doc/llvm-backend.md`.
 Benchmarks
 ----------
 Host: AMD Ryzen 9 7940HS, Linux 7.0.14, GCC 14.2.0, LLVM 19.1.7, single
-threaded. LLVM runs `default<O2>`. The host was shared: load average was 5 to 7
+threaded. LLVM runs `default<O2>`. The host was shared: load average was 4 to 7
 during the runs, so treat differences under about 10% as noise.
 
 Median CPU milliseconds per kernel (see below), lower is better; ratio is
@@ -91,17 +91,17 @@ timed runs; the other kernels: 9 processes, alternating backends.
 
 | Workload | LLVM | x64 | LLVM / x64 |
 |----------|-----:|----:|-----------:|
-| Floating point (100,000 steps per call) | 35 | 136 | 0.26 |
-| Integer loop (50,000 x 2,000) | 42 | 90 | 0.47 |
-| Native list/vector conversion, width 257 | 28 | 34 | 0.82 |
-| Native list/vector conversion, width 32 | 19 | 20 | 0.95 |
-| Mixed bigint/float | 43 | 44 | 0.98 |
-| Library list/vector round trip, width 32 (interpreted `misc.mud`) | 166 | 163 | 1.02 |
-| Bigint (20,000 steps per call) | 69 | 62 | 1.11 |
-| Tables, 257 keys | 13 | 10 | 1.30 |
-| Tables, 32 keys | 12 | 9 | 1.33 |
-| Recursive local closure, `fib(27)` | 21 | 11 | 1.91 |
-| Local closure called in a loop (2,000,000 iterations per call) | 62 | 30 | 2.07 |
+| Floating point (100,000 steps per call) | 27 | 136 | 0.20 |
+| Integer loop (50,000 x 2,000) | 40 | 87 | 0.46 |
+| Native list/vector conversion, width 257 | 30 | 34 | 0.88 |
+| Native list/vector conversion, width 32 | 19 | 21 | 0.90 |
+| Mixed bigint/float | 39 | 41 | 0.95 |
+| Library list/vector round trip, width 32 (interpreted `misc.mud`) | 165 | 168 | 0.98 |
+| Bigint (20,000 steps per call) | 66 | 60 | 1.10 |
+| Tables, 257 keys | 14 | 10 | 1.40 |
+| Tables, 32 keys | 13 | 9 | 1.44 |
+| Recursive local closure, `fib(27)` | 17 | 11 | 1.55 |
+| Local closure called in a loop (2,000,000 iterations per call) | 46 | 29 | 1.59 |
 
 Notes:
 
