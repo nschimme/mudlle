@@ -49,9 +49,11 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
     function_roots_required,
     llvm_function_may_allocate?, llvm_allocate_slots, llvm_slot_number,
     slot_indices, llvm_instruction_may_allocate?, root_slot_indices, nonallocating_ops, nonallocating_branches, vector_find_required,
-    llvm_inline_max_size |
+    llvm_inline_max_size, closure_cache_fns, closure_cache_seen |
 
   llvm_inline_max_size = 3500;
+  closure_cache_fns = null;
+  closure_cache_seen = make_table();
   tmp_seq = 0;
   globals_seen = make_table();
   current_ifn = null;
@@ -1086,6 +1088,8 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
         root_token, root_index, arg_no, scan, il, ins, defvar, args_seen |
 
       w = writer:new_string();
+      closure_cache_fns = null;
+      closure_cache_seen = make_table();
       fname = format("fn_%d", ifn[mc:c_fnumber]);
       args = lmap(fn (fa) fa[0][0], ifn[mc:c_ffullargs]);
 
@@ -1155,6 +1159,27 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               ins = il[mc:il_ins];
               if (ins != null)
                 [
+                  if (function_roots_required
+                      && ins[mc:i_class] == mc:i_call)
+                    [
+                      | cargs, cvar, cifn |
+                      cargs = ins[mc:i_cargs];
+                      cvar = car(cargs);
+                      if (cvar[mc:v_class] == mc:v_function)
+                        [
+                          cifn = cvar[mc:v_fvalue];
+                          if (llvm_exact_arity?(cifn, llength(cdr(cargs)))
+                              && llength(cifn[mc:c_fclosure]) == 0
+                              && closure_cache_seen[itoa(cifn[mc:c_fnumber])]
+                                 == null)
+                            [
+                              closure_cache_seen[itoa(cifn[mc:c_fnumber])]
+                                = true;
+                              closure_cache_fns
+                                = cifn[mc:c_fnumber] . closure_cache_fns;
+                            ];
+                        ];
+                    ];
                   lforeach(add_var, mc:arguments(ins, null));
                   if (ins[mc:i_class] == mc:i_memory
                       && ins[mc:i_mop] == mc:memory_read)
@@ -1180,7 +1205,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       // helper call, so keep it in the same GC-visible root set as locals.
       if (function_roots_required)
         [
-          root_count = llength(root_vars) + 1;
+          root_count = llength(root_vars) + 1 + llength(closure_cache_fns);
           root_token = format("%%roots_token_%d", ifn[mc:c_fnumber]);
           writer:format(w, "  %%env_slot_%d = alloca i64\n",
                         ifn[mc:c_fnumber]);
@@ -1213,6 +1238,20 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                           llvm_slot_number(root_var), slot_ptr);
             root_index = root_index + 1;
           ], root_vars);
+          lforeach(fn (cfn) [
+            | slot_ptr |
+            slot_ptr = format("%%root_slot_ptr_%d_%d",
+                              ifn[mc:c_fnumber], root_index);
+            writer:format(w, "  %%ccache_%d = alloca i64\n", cfn);
+            writer:format(w, "  store i64 1, ptr %%ccache_%d\n", cfn);
+            writer:format(w,
+              "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64\
+ %d\n",
+              slot_ptr, root_count, root_slots, root_index);
+            writer:format(w, "  store ptr %%ccache_%d, ptr %s\n", cfn,
+                          slot_ptr);
+            root_index = root_index + 1;
+          ], closure_cache_fns);
           root_slots_data = format("%%root_slots_data_%d", ifn[mc:c_fnumber]);
           root_records_data = format("%%root_records_data_%d",
                                      ifn[mc:c_fnumber]);
@@ -2150,10 +2189,30 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               arg_array = format("%%call_values_%d", call_id);
               writer:format(w, "  %s = call ptr @llvm.stacksave()\n",
                             stack_mark);
-              cname = if (self_call)
-                llvm_read_env(w)
+              if (self_call)
+                cname = llvm_read_env(w)
+              else if (closure_cache_seen[itoa(direct_fn)] != null)
+                [
+                  // One shared closure per call site function and
+                  // invocation, kept in a rooted slot.
+                  | cc |
+                  cc = format("cc_%d", call_id);
+                  writer:format(w,
+                    "  %%%s_v = load i64, ptr %%ccache_%d\n\
+  %%%s_t = and i64 %%%s_v, 1\n\
+  %%%s_s = icmp ne i64 %%%s_t, 0\n\
+  br i1 %%%s_s, label %%%s_miss, label %%%s_hit\n%s_miss:\n",
+                    cc, direct_fn, cc, cc, cc, cc, cc, cc, cc, cc);
+                  cname = llvm_emit_closure(called_ifn, w, true);
+                  writer:format(w,
+                    "  store i64 %s, ptr %%ccache_%d\n\
+  br label %%%s_hit\n%s_hit:\n\
+  %%%s_c = load i64, ptr %%ccache_%d\n",
+                    cname, direct_fn, cc, cc, cc, direct_fn);
+                  cname = format("%%%s_c", cc);
+                ]
               else
-                llvm_emit_closure(called_ifn, w, true);
+                cname = llvm_emit_closure(called_ifn, w, true);
               if (arg_count == 0)
                 arg_ptr = "null"
               else

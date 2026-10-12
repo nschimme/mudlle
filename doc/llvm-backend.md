@@ -364,7 +364,11 @@ A capture-free function literal that is called at once has no observable
 identity, so one closure per (code address, enclosing constants) is shared in a
 direct-mapped 64-entry table (`llvm_call_closure_cache`). Generated code probes
 it inline (`mudlle_closure_for_call`, index masked with 63); only a miss fetches
-the argument metadata and calls `llvm_make_function_closure_for_call`. Other
+the argument metadata and calls `llvm_make_function_closure_for_call`. A function that makes several such calls keeps the closure for each
+capture-free known callee in a rooted `%ccache_N` slot, filled on first use per
+invocation, so later calls skip the probe. Small functions (IR up to
+`llvm_inline_max_size` characters) are `internal alwaysinline`, with `entry_N`
+as the exported bridge. Other
 closure creation shares the generated wrapper code per argument metadata,
 return typeset and security level (`llvm_make_function_closure`); closures with
 no native captures are readonly.
