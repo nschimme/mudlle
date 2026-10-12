@@ -31,26 +31,15 @@ reads mc:compile, mc:linkrun
     [
       if (filename == null) filename = "ts_eval.ts";
 
-      | parsed, cbody, lib_info, has_exp, lib_name, lib_class, inferred_name, dot |
+      | parsed, cbody, has_exp, lib_name, lib_class, dot |
       parsed = ts_parse_string(code, filename);
       cbody = parsed[0];
-      lib_info = parsed[1];
-      has_exp = parsed[2];
+      has_exp = parsed[1];
 
-      if (pair?(lib_info) && string?(car(lib_info)))
-        [
-          lib_name = car(lib_info);
-          lib_class = if (cdr(lib_info)) 1 else 0;
-        ]
-      else
-        [
-          inferred_name = basename(filename);
-          dot = string_index(inferred_name, ?.);
-          if (dot >= 0)
-            inferred_name = substring(inferred_name, 0, dot);
-          lib_name = inferred_name;
-          lib_class = if (has_exp) 1 else 0;
-        ];
+      lib_name = basename(filename);
+      dot = string_index(lib_name, ?.);
+      if (dot >= 0)
+        lib_name = substring(lib_name, 0, dot);
 
       indexed_vector(
         mc:m_class    . 0,

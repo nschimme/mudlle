@@ -52,9 +52,6 @@ defines ts_tokenize, ts_parse_string
   keywords_tab["interface"] = "keyword_interface";
   keywords_tab["typeof"] = "keyword_typeof";
   keywords_tab["export"] = "keyword_export";
-  keywords_tab["library"] = "keyword_library";
-  keywords_tab["module"] = "keyword_module";
-  keywords_tab["namespace"] = "keyword_namespace";
 
   ts_type_to_typeset = fn (name)
     [
@@ -976,10 +973,9 @@ defines ts_tokenize, ts_parse_string
 
       parse_expr = fn () parse_assign();
 
-      | top_defines, has_exports, module_libname |
+      | top_defines, has_exports |
       top_defines = null;
       has_exports = false;
-      module_libname = null;
 
       // Statement list parser collecting block-scoped local variables and statement components
       parse_stmt_list = fn (string end_token)
@@ -999,25 +995,8 @@ defines ts_tokenize, ts_parse_string
               tok = cur_tok();
               loc = tok[2];
 
-              // Library / Module / Namespace Statement
-              if (match_tok("keyword_library"))
-                [
-                  if (string_cmp(cur_tok()[0], "identifier") == 0)
-                    [
-                      module_libname = consume_tok()[1] . true;
-                    ];
-                  if (match_tok("semicolon")) null;
-                ]
-              else if (match_tok("keyword_module") || match_tok("keyword_namespace"))
-                [
-                  if (string_cmp(cur_tok()[0], "identifier") == 0)
-                    [
-                      module_libname = consume_tok()[1] . false;
-                    ];
-                  if (match_tok("semicolon")) null;
-                ]
               // Export Statement: export function ... | export let/const/var ... | export { ... }
-              else if (match_tok("keyword_export"))
+              if (match_tok("keyword_export"))
                 [
                   has_exports = true;
                   | exp_tok |
@@ -1348,7 +1327,7 @@ defines ts_tokenize, ts_parse_string
       // Top-level statements parsing
       | top_body |
       top_body = parse_stmt_list("eof");
-      vector(top_body, module_libname, has_exports)
+      vector(top_body, has_exports)
     ];
 
 ];
