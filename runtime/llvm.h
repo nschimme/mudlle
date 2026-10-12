@@ -79,6 +79,10 @@ LLVM_HELPER value llvm_make_function_closure(int64_t address, int64_t nargs,
                                              value *captures, int64_t ncaptures,
                                              int64_t self_capture, int64_t parent_env,
                                              int64_t arguments, int64_t return_typeset);
+LLVM_HELPER value llvm_make_function_closure_for_call(
+  int64_t address, int64_t nargs, value *captures, int64_t ncaptures,
+  int64_t self_capture, int64_t parent_env, int64_t arguments,
+  int64_t return_typeset);
 LLVM_HELPER value llvm_constant_get(int64_t menv, int64_t index);
 LLVM_HELPER value llvm_closure_capture_get(int64_t menv, int64_t index);
 LLVM_HELPER void llvm_closure_capture_set(int64_t menv, int64_t index, int64_t value);

@@ -84,7 +84,7 @@ test_genllvm = fn (string code_str)
   assert(string_search(ir, "call void @llvm_loop_slow_path()") >= 0);
   assert(string_search(ir, "call void @llvm_loop_check()") >= 0);
   assert(string_search(ir, "store i64 %env, ptr %env_slot_") >= 0);
-  assert(string_search(ir, "= call ptr @llvm_gc_roots_enter(ptr %root_slots_data_") >= 0);
+  assert(string_search(ir, "= call ptr @mudlle_roots_enter(ptr %root_slots_data_") >= 0);
   assert(string_search(ir, "alloca [4 x ptr]") >= 0);
   display("genllvm test 3 passed\n");
 ];
@@ -196,7 +196,7 @@ display("Testing LLVM mc:compile pipeline...\n");
   entry_start = string_search_offset(ir, fn_start, "define i64 @entry_1(");
   assert(fn_start >= 0 && entry_start > fn_start);
   fn_ir = substring(ir, fn_start, entry_start - fn_start);
-  assert(string_search(fn_ir, "llvm_gc_roots_enter") < 0);
+  assert(string_search(fn_ir, "mudlle_roots_enter") < 0);
   assert(string_search(fn_ir, "mudlle_check_integer_pair") >= 0);
   display("LLVM scalar loop root-elision IR test passed\n");
 ];
@@ -250,7 +250,7 @@ display("Testing LLVM mc:compile pipeline...\n");
   entry_start = string_search_offset(ir, fn_start, "define i64 @entry_1(");
   assert(fn_start >= 0 && entry_start > fn_start);
   fn_ir = substring(ir, fn_start, entry_start - fn_start);
-  assert(string_search(fn_ir, "llvm_gc_roots_enter") >= 0);
+  assert(string_search(fn_ir, "mudlle_roots_enter") >= 0);
   display("LLVM variadic argument test passed\n");
 ];
 

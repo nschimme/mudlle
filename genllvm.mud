@@ -241,7 +241,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
             ]
         ]
       else if (class == mc:v_function)
-        llvm_emit_closure(var[mc:v_fvalue], w)
+        llvm_emit_closure(var[mc:v_fvalue], w, false)
       else if (class == mc:v_closure)
         [
           | cidx, res |
@@ -550,7 +550,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
  i64 0\n",
             records_data, count, records_array);
           writer:format(w,
-            "  %s = call ptr @llvm_gc_roots_enter(ptr %s,\
+            "  %s = call ptr @mudlle_roots_enter(ptr %s,\
  i64 %d, ptr %s)\n",
             root_token, slots_data, count, records_data);
           i = 0;
@@ -604,7 +604,9 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       vector(ptr, mark, "null", count)
     ];
 
-  llvm_emit_closure = fn (ifn, w)
+  // for_call: the closure is created only to be called at once, so a
+  // capture-free one may be shared between evaluations.
+  llvm_emit_closure = fn (ifn, w, for_call)
     [
       | cvars, ncaptures, tmp, res, captures_array, captures_ptr,
         capture_index, parent_var, capture_value, parent_class, self_capture,
@@ -663,7 +665,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
  i64 0\n",
             root_records_data, ncaptures, root_records);
           writer:format(w,
-            "  %s = call ptr @llvm_gc_roots_enter(ptr %s,\
+            "  %s = call ptr @mudlle_roots_enter(ptr %s,\
  i64 %d, ptr %s)\n",
             root_token, root_slots_data, ncaptures, root_records_data);
           capture_index = 0;
@@ -705,14 +707,17 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
         "  %s = call i64 @llvm_constant_get(i64 %s, i64 %d)\n",
         args_metadata, llvm_read_env(w), args_index);
       writer:format(w,
-        "  %s = call i64 @llvm_make_function_closure(i64 %s, i64 %d, ptr %s,\
+        "  %s = call i64 @%s(i64 %s, i64 %d, ptr %s,\
  i64 %d, i64 %d, i64 %s, i64 %s, i64 %d)\n",
-        res, entry_address, llength(ifn[mc:c_ffullargs]), captures_ptr,
+        res,
+        if (for_call && ncaptures == 0) "llvm_make_function_closure_for_call"
+        else "llvm_make_function_closure",
+        entry_address, llength(ifn[mc:c_ffullargs]), captures_ptr,
         ncaptures, self_capture, llvm_read_env(w), args_metadata,
         ifn[mc:c_freturn_typeset]);
       if (ncaptures != 0)
         [
-          writer:format(w, "  call void @llvm_gc_roots_leave(ptr %s)\n",
+          writer:format(w, "  call void @mudlle_roots_leave(ptr %s)\n",
                         root_token);
           writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
                         stack_mark);
@@ -762,7 +767,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       if (count != 0)
         [
           if (!string_equal?(root_token, "null"))
-            writer:format(w, "  call void @llvm_gc_roots_leave(ptr %s)\n",
+            writer:format(w, "  call void @mudlle_roots_leave(ptr %s)\n",
                           root_token);
           writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
                         stack_mark);
@@ -785,7 +790,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
         result, ptr, count);
       if (count != 0)
         [
-          writer:format(w, "  call void @llvm_gc_roots_leave(ptr %s)\n",
+          writer:format(w, "  call void @mudlle_roots_leave(ptr %s)\n",
                         root_token);
           writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
                         stack_mark);
@@ -818,7 +823,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       if (count != 0)
         [
           if (!string_equal?(root_token, "null"))
-            writer:format(w, "  call void @llvm_gc_roots_leave(ptr %s)\n",
+            writer:format(w, "  call void @mudlle_roots_leave(ptr %s)\n",
                           root_token);
           writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
                         stack_mark);
@@ -1070,12 +1075,12 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       writer:write_line(w, ") {");
       writer:write_line(w, "entry:");
       writer:format(w,
-        "  call void @llvm_check_arity(i64 %%nargs, i64 %d, i64 %d)\n",
+        "  call void @mudlle_check_arity(i64 %%nargs, i64 %d, i64 %d)\n",
         ifn[mc:c_farginfo][mc:arginfo_nargs]
           - ifn[mc:c_farginfo][mc:arginfo_noptargs],
         if (ifn[mc:c_farginfo][mc:arginfo_vararg]) -1
         else ifn[mc:c_farginfo][mc:arginfo_nargs]);
-      writer:write_line(w, "  call void @llvm_loop_check()\n");
+      writer:write_line(w, "  call void @mudlle_function_entry()\n");
 
       // Collect all variables used in function
       vars_seen = make_table();
@@ -1199,7 +1204,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
  i64 0\n",
             root_records_data, root_count, root_records);
           writer:format(w,
-            "  %s = call ptr @llvm_gc_roots_enter(ptr %s,\
+            "  %s = call ptr @mudlle_roots_enter(ptr %s,\
  i64 %d, ptr %s)\n",
             root_token, root_slots_data, root_count, root_records_data);
         ];
@@ -1224,7 +1229,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
             // Each incoming load still needs its own LLVM SSA name.
             arg_value = format("%%argvalue_%d_%d", ifn[mc:c_fnumber], arg_no);
             writer:format(w,
-              "  %s = call i64 @llvm_argument_get(ptr %%argv, i64 %%nargs, i64\
+              "  %s = call i64 @mudlle_argument_get(ptr %%argv, i64 %%nargs, i64\
  %d)\n",
               arg_value, arg_no);
           ];
@@ -1669,7 +1674,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               tmp_seq = tmp_seq + 1;
               arg_value = format("%%funcarg_%d", tmp_seq);
               writer:format(w,
-                "  %s = call i64 @llvm_argument_get(ptr %%argv, i64 %%nargs,\
+                "  %s = call i64 @mudlle_argument_get(ptr %%argv, i64 %%nargs,\
  i64 %d)\n",
                 arg_value, arg_index);
               llvm_write_var(dest_var, arg_value, w);
@@ -2071,7 +2076,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
               if (copied[3] != 0)
                 [
                   if (!string_equal?(copied[2], "null"))
-                    writer:format(w, "  call void @llvm_gc_roots_leave(ptr %s)\n",
+                    writer:format(w, "  call void @mudlle_roots_leave(ptr %s)\n",
                                   copied[2]);
                   writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
                                 copied[1]);
@@ -2133,12 +2138,12 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
  i64 0, i64 0\n",
                 root_records_data, root_count, root_records);
               writer:format(w,
-                "  %s = call ptr @llvm_gc_roots_enter(ptr %s,\
+                "  %s = call ptr @mudlle_roots_enter(ptr %s,\
  i64 %d, ptr %s)\n",
                 root_token, root_slots_data, root_count, root_records_data);
 
               cname = if (called_ifn != null)
-                llvm_emit_closure(called_ifn, w)
+                llvm_emit_closure(called_ifn, w, true)
               else
                 llvm_read_var(fn_var, w);
               arg_slot = format("%%call_value_slot_%d_0", call_id);
@@ -2172,7 +2177,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                 res, llvm_read_env(w), cname, arg_ptr, arg_count,
                 if (secure_call) 1 else 0);
               writer:format(w,
-                "  call void @llvm_gc_roots_leave(ptr %s)\n", root_token);
+                "  call void @mudlle_roots_leave(ptr %s)\n", root_token);
               writer:format(w,
                 "  call void @llvm.stackrestore(ptr %s)\n", stack_mark);
             ];
@@ -2183,7 +2188,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
           | dest_var, ifn, res |
           dest_var = ins[mc:i_fdest];
           ifn = ins[mc:i_ffunction];
-          res = llvm_emit_closure(ifn, w);
+          res = llvm_emit_closure(ifn, w, false);
           llvm_write_var(dest_var, res, w);
         ]
       else if (class == mc:i_maybe_sconcat)
@@ -2198,7 +2203,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
           rval = llvm_read_var(ins[mc:i_rvalue], w);
           if (function_roots_required)
             writer:format(w,
-              "  call void @llvm_gc_roots_leave(ptr %%roots_token_%d)\n",
+              "  call void @mudlle_roots_leave(ptr %%roots_token_%d)\n",
               current_ifn[mc:c_fnumber]);
           writer:format(w, "  ret i64 %s\n", rval);
         ]
@@ -2359,6 +2364,92 @@ no:
   ret i32 0
 }
 """, type_vector);
+      // Root registration in IR: link one record per slot onto the runtime's
+      // gcpro chain exactly as llvm_gc_roots_enter does, so LLVM can inline
+      // it and unroll the loop for constant slot counts.
+      writer:write_line(w, "@gcpro = external global ptr\n");
+      writer:format(w, """
+define internal ptr @mudlle_roots_enter(ptr %%slots, i64 %%n, ptr %%records) {
+entry:
+  %%old = load ptr, ptr @gcpro, align 8
+  %%empty = icmp eq i64 %%n, 0
+  br i1 %%empty, label %%done, label %%loop
+loop:
+  %%i = phi i64 [ 0, %%entry ], [ %%next, %%loop ]
+  %%prev = phi ptr [ %%old, %%entry ], [ %%rec, %%loop ]
+  %%rec = getelementptr inbounds { ptr, ptr }, ptr %%records, i64 %%i
+  %%slotp = getelementptr inbounds ptr, ptr %%slots, i64 %%i
+  %%slot = load ptr, ptr %%slotp, align 8
+  store ptr %%prev, ptr %%rec, align 8
+  %%objp = getelementptr inbounds i8, ptr %%rec, i64 8
+  store ptr %%slot, ptr %%objp, align 8
+  %%next = add i64 %%i, 1
+  %%more = icmp ult i64 %%next, %%n
+  br i1 %%more, label %%loop, label %%fin
+fin:
+  store ptr %%rec, ptr @gcpro, align 8
+  br label %%done
+done:
+  ret ptr %%old
+}
+define internal void @mudlle_roots_leave(ptr %%old) {
+entry:
+  store ptr %%old, ptr @gcpro, align 8
+  ret void
+}
+""");
+      // Function entry in IR. The arity check, the loop budget with the stack
+      // limit, and the argument fetch only call the runtime to raise errors
+      // or service the profiler.
+      writer:write_line(w, "@mudlle_stack_limit = external global i64\n");
+      writer:format(w, """
+define internal void @mudlle_check_arity(i64 %%nargs, i64 %%min, i64 %%max) {
+entry:
+  %%low = icmp slt i64 %%nargs, %%min
+  %%hasmax = icmp sge i64 %%max, 0
+  %%high = icmp sgt i64 %%nargs, %%max
+  %%toomany = and i1 %%hasmax, %%high
+  %%bad = or i1 %%low, %%toomany
+  br i1 %%bad, label %%slow, label %%ok
+slow:
+  call void @llvm_check_arity(i64 %%nargs, i64 %%min, i64 %%max)
+  ret void
+ok:
+  ret void
+}
+define internal i64 @mudlle_argument_get(ptr %%argv, i64 %%nargs, i64 %%index) {
+entry:
+  %%inrange = icmp ult i64 %%index, %%nargs
+  %%present = icmp ne ptr %%argv, null
+  %%ok = and i1 %%inrange, %%present
+  br i1 %%ok, label %%load, label %%none
+load:
+  %%slot = getelementptr inbounds i64, ptr %%argv, i64 %%index
+  %%value = load i64, ptr %%slot, align 8
+  ret i64 %%value
+none:
+  ret i64 0
+}
+define internal void @mudlle_function_entry() {
+entry:
+  %%old = load atomic volatile i64, ptr @internal_xcount monotonic, align 8
+  %%budget = icmp sgt i64 %%old, 1
+  br i1 %%budget, label %%fast, label %%slow
+fast:
+  %%new = sub i64 %%old, 1
+  store atomic volatile i64 %%new, ptr @internal_xcount monotonic, align 8
+  %%sp = call ptr @llvm.stacksave()
+  %%spi = ptrtoint ptr %%sp to i64
+  %%limit = load i64, ptr @mudlle_stack_limit, align 8
+  %%room = icmp uge i64 %%spi, %%limit
+  br i1 %%room, label %%done, label %%slow
+slow:
+  call void @llvm_loop_check()
+  ret void
+done:
+  ret void
+}
+""");
       // Writable heap object: pointer tag, then the read-only flag bit. The
       // runtime check raises the diagnostics for everything else.
       writer:format(w, """
@@ -2501,6 +2592,7 @@ done:
       writer:write_line(w, "declare i32 @llvm_predicate(i64, i64)\n");
       writer:write_line(w, "declare i32 @llvm_vector_find(i64, i64)\n");
       writer:write_line(w, "declare i64 @llvm_pair_car(i64)\n");
+      writer:write_line(w, "declare i64 @llvm_make_function_closure_for_call(i64, i64, ptr, i64, i64, i64, i64, i64)\n");
       writer:write_line(w, "declare i64 @llvm_cons(i64, i64, i64)\n");
       writer:write_line(w, "declare i64 @llvm_float_binop(i64, i64, i64)\n");
       writer:write_line(w, "declare i64 @llvm_float_unop(i64, i64)\n");

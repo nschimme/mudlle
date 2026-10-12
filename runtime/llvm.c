@@ -175,6 +175,12 @@ static void llvm_orc_register_absolute_symbols(LLVMOrcJITDylibRef dylib)
     { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "internal_xcount"),
       { (LLVMOrcExecutorAddress)(uintptr_t)&internal_xcount,
         { LLVMJITSymbolGenericFlagsExported, 0 } } },
+    { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "gcpro"),
+      { (LLVMOrcExecutorAddress)(uintptr_t)&gcpro,
+        { LLVMJITSymbolGenericFlagsExported, 0 } } },
+    { LLVMOrcLLJITMangleAndIntern(llvm_orc_jit, "mudlle_stack_limit"),
+      { (LLVMOrcExecutorAddress)(uintptr_t)&mudlle_stack_limit,
+        { LLVMJITSymbolGenericFlagsExported, 0 } } },
     LLVM_SYMBOL_ENTRY(llvm_raise_error),
     LLVM_SYMBOL_ENTRY(llvm_loop_check),
     LLVM_SYMBOL_ENTRY(llvm_loop_slow_path),
@@ -189,6 +195,7 @@ static void llvm_orc_register_absolute_symbols(LLVMOrcJITDylibRef dylib)
     LLVM_SYMBOL_ENTRY(llvm_pair_car),
     LLVM_SYMBOL_ENTRY(llvm_pair_cdr),
     LLVM_SYMBOL_ENTRY(llvm_cons),
+    LLVM_SYMBOL_ENTRY(llvm_make_function_closure_for_call),
     LLVM_SYMBOL_ENTRY(llvm_float_binop),
     LLVM_SYMBOL_ENTRY(llvm_float_unop),
     LLVM_SYMBOL_ENTRY(llvm_equal),
@@ -1162,10 +1169,16 @@ value llvm_call_value(value caller, value function, value *arguments,
   seclev_t old_seclevel = internal_seclevel;
   bool old_seclevel_valid = seclevel_valid;
   set_seclevel(caller_seclevel);
-  if (secure_call)
-    llvm_check_callable(function, (long)nargs, caller_seclevel);
-  else
-    callable(function, (long)nargs);
+  /* An exact arity match is the first test closure_callable() makes. */
+  if (!(TYPE(function, closure)
+        && vector_len(((struct closure *)function)->code->arguments)
+             == (size_t)nargs))
+    {
+      if (secure_call)
+        llvm_check_callable(function, (long)nargs, caller_seclevel);
+      else
+        callable(function, (long)nargs);
+    }
   void *cbdata = NULL;
   value result;
   if (TYPE(function, primitive) || TYPE(function, secure))
@@ -1453,6 +1466,58 @@ value llvm_make_function_closure(int64_t address, int64_t nargs,
   if (ncaptures == 0)
     closure->o.flags |= OBJ_READONLY;
   gcpro = old_gcpro;
+  return closure;
+}
+
+/* A capture-free closure that is only called at once has no observable
+   identity, so one per (code address, enclosing constants) is shared. */
+#define LLVM_CALL_CLOSURE_CACHE_SIZE 64
+static struct vector *llvm_call_closure_cache;
+
+value llvm_make_function_closure_for_call(
+  int64_t address, int64_t nargs, value *captures, int64_t ncaptures,
+  int64_t self_capture, int64_t parent_env, int64_t raw_arguments,
+  int64_t return_typeset)
+{
+  if (llvm_call_closure_cache == NULL)
+    {
+      /* may collect: do it before reading any heap pointer */
+      llvm_call_closure_cache
+        = alloc_vector(3 * LLVM_CALL_CLOSURE_CACHE_SIZE);
+      staticpro(&llvm_call_closure_cache);
+    }
+  struct closure *parent = (struct closure *)(uintptr_t)parent_env;
+  value constants = NULL;
+  if (ncaptures == 0 && TYPE(parent, closure)
+      && (parent->o.size - offsetof(struct closure, variables))
+           / sizeof parent->variables[0] >= 2
+      && TYPE(parent->variables[1], variable))
+    constants = parent->variables[1]->vvalue;
+  if (constants == NULL || !TYPE(constants, vector))
+    return llvm_make_function_closure(address, nargs, captures, ncaptures,
+                                      self_capture, parent_env,
+                                      raw_arguments, return_typeset);
+  size_t slot = (((uintptr_t)address >> 4) ^ ((uintptr_t)constants >> 4))
+    % LLVM_CALL_CLOSURE_CACHE_SIZE;
+  value *entry = &llvm_call_closure_cache->data[3 * slot];
+  if (entry[0] == makeint(address) && entry[1] == constants && entry[2] != NULL)
+    return entry[2];
+
+  struct gcpro constants_root;
+  GCPROV(constants_root, constants);
+  value closure = llvm_make_function_closure(
+    address, nargs, captures, ncaptures, self_capture, parent_env,
+    raw_arguments, return_typeset);
+  struct gcpro closure_root;
+  GCPROV(closure_root, closure);
+  slot = (((uintptr_t)address >> 4) ^ ((uintptr_t)constants >> 4))
+    % LLVM_CALL_CLOSURE_CACHE_SIZE;
+  entry = &llvm_call_closure_cache->data[3 * slot];
+  entry[0] = makeint(address);
+  entry[1] = constants;
+  entry[2] = closure;
+  UNGCPROV(closure_root);
+  UNGCPROV(constants_root);
   return closure;
 }
 
