@@ -11,12 +11,17 @@ The LLVM backend emits LLVM IR for Mudlle functions. ORC LLJIT compiles and load
 IR verification runs at the input and output of optimization, rather than
 after every pass. `MUDLLE_LLVM_VERIFY_EACH=1` enables per-pass verification for
 debugging. `MUDLLE_LLVM_TIMING=1` reports compilation stages on object-cache
-misses. `MUDLLE_LLVM_OPT=fast` selects an experimental small scalar pipeline;
-O2 remains the default. The selected pipeline already participates in native
-object cache keys. Verification and timing settings do not change the code
-generation pipeline or require separate cache keys.
+misses. `MUDLLE_LLVM_OPT` selects the pipeline: `none`, `O0`, `O1`, `O2`
+(default), `O3`, or `fast` (an experimental small scalar pipeline); any other
+value is an error. The selected pipeline participates in native object cache
+keys. Verification and timing settings do not change the code generation
+pipeline or require separate cache keys. Cache variables are described under
+the persistent native object cache.
 
-Mudlle's generated code uses explicit GC root frames. Before flattening the
+Mudlle's generated code uses explicit GC root frames. Root registration
+(`gcpro` records), the arity check, the loop/stack-limit check and the argument
+fetch are emitted inline in each function's entry sequence; the runtime
+routines remain as error and profiler paths. Before flattening the
 control-flow graph, the backend computes variables live at potentially
 collecting instructions. It conservatively recognizes integer/null-only
 locals from all their definitions; incoming arguments and indirect cells
@@ -322,12 +327,73 @@ by `mc:linkrun`.
 ### Native calls and garbage collection
 
 Generated calls to LLVM closures use their native argument-vector ABI directly.
-Calls to interpreted closures and primitives use the normal Mudlle runtime.
-The generator roots argument slots before materializing values, and keeps those
-roots until the call returns. A `call_llvm` frame exposes the active closure,
-code metadata, and actual arguments to GC and call-trace handling. Native entry
-preserves stack, interrupt, arity, minimum security level, and maximum security
-level checks. `compiled?()` recognizes these frames.
+Calls to interpreted closures and primitives use the normal Mudlle runtime
+(`llvm_call_value`, which skips the generic callable check when a closure's
+arity matches exactly). Primitives and constant globals are called through
+`llvm_call_global` / `llvm_call_global_constant`, the latter without a
+generated root frame. For these generic calls the generator roots argument
+slots before materializing values, and keeps those roots until the call
+returns. A `call_llvm` frame exposes the active closure, code metadata, and
+actual arguments to GC and call-trace handling. Native entry preserves stack,
+interrupt, arity, minimum security level, and maximum security level checks.
+`compiled?()` recognizes these frames.
+
+#### Known-function calls
+
+A call to a known function literal, or a self-recursive call, with exactly the
+callee's fixed argument count (no optional or variable arguments;
+`llvm_exact_arity?`) goes through the internal `mudlle_call_known(callee,
+target, argv, nargs)` instead of `llvm_call_value`. The callee has the caller's
+security level and a known arity, so callability checks are skipped.
+`mudlle_call_known` builds the same `call_llvm` frame as `llvm_invoke_closure`
+inline, saves and restores `internal_seclevel` / `seclevel_valid`, and calls
+the function directly. LLVM does not inline these calls.
+
+The frame sets `offset` to -2, meaning it owns its argument array: the caller
+copies the arguments into a stack `alloca` (reclaimed with `stackrestore`),
+registers no per-argument roots, and does not hold the callee closure across an
+allocation. The collector (`forward_roots` in `alloc.c`) forwards
+`native_args[0..nargs)` for `call_llvm` frames with offset -2, so backtraces stay
+valid after a collection. Frames created by `llvm_invoke_closure` have their
+arguments rooted by the caller. The native stack budget, not a call count,
+bounds recursion.
+
+#### Shared closures for immediate calls
+
+A capture-free function literal that is called at once has no observable
+identity, so one closure per (code address, enclosing constants) is shared in a
+direct-mapped 64-entry table (`llvm_call_closure_cache`). Generated code probes
+it inline (`mudlle_closure_for_call`, index masked with 63); only a miss fetches
+the argument metadata and calls `llvm_make_function_closure_for_call`. Other
+closure creation shares the generated wrapper code per argument metadata,
+return typeset and security level (`llvm_make_function_closure`); closures with
+no native captures are readonly.
+
+#### Inline fast paths
+
+Emitted inline, with the runtime helper kept as the error path: `car`, `cdr`,
+`vlength`, vector element loads and stores (also `set!` calls, which is how
+`v[i] = x` compiles), the mutable check of `set_car!` / `set_cdr!`, tagged
+integer arithmetic, and the `pair?` / `vector?` / `string?` branch tests
+(pointer test plus type-byte compare). `cons` / `pcons` call `llvm_cons`, which
+uses `try_alloc_list` (like `try_alloc_vector`, returns NULL without collecting
+when the nursery is full) so the common path needs no rooting. Calls to the
+constant float globals (what `#arith(f)` expands to) use `llvm_float_binop`
+(`fadd`/`fsub`/`fmul`/`fdiv`, `fmod`) and direct helpers for `fcmp`, `fneg`,
+`fabs` and the unary sqrt/exp/log/trig/rounding functions; non-float, non-fixnum
+operands and NaN comparisons fall back to the generic call so errors are
+unchanged.
+
+#### Hardcoded layouts
+
+Generated IR hardcodes `call_llvm` (11), `struct call_stack_mudlle` offsets
+(`next` 0, `type` 8, `fn` 16, `code` 24, `locals` 32, `native_args` 40, `nargs`
+48, `offset` 52; size 56), `struct closure` / `struct variable` / `struct
+vector` / `struct code` field offsets (closure code 16 and variables 24,
+variable value 16, vector data 16, code `seclevel` 58), the object type byte
+at offset 9, and the closure cache size. `_Static_assert`s in
+`runtime/llvm.c` break the build if any of these change; update the IR and the
+assertions together. Runtime source fingerprints invalidate cached objects.
 
 Readonly vectors become immutable only when all their elements are immutable.
 A compiler hint alone cannot establish this: readonly constants can still

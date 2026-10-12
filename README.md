@@ -80,7 +80,7 @@ compatibility rules are described in `doc/llvm-backend.md`.
 Benchmarks
 ----------
 Host: AMD Ryzen 9 7940HS, Linux 7.0.14, GCC 14.2.0, LLVM 19.1.7, single
-threaded. LLVM runs `default<O2>`. The host was shared: load average was 4 to 7
+threaded. LLVM runs `default<O2>`. The host was shared: load average was 5 to 6
 during the runs, so treat differences under about 10% as noise.
 
 Median CPU milliseconds per kernel (see below), lower is better; ratio is
@@ -91,17 +91,17 @@ timed runs; the other kernels: 7 processes.
 
 | Workload | LLVM | x64 | LLVM / x64 |
 |----------|-----:|----:|-----------:|
-| Integer loop (50,000 x 2,000) | 41 | 89 | 0.46 |
-| Native list/vector conversion, width 257 | 29 | 35 | 0.83 |
-| Native list/vector conversion, width 32 | 19 | 22 | 0.86 |
-| Floating point (100,000 steps per call) | 116 | 128 | 0.91 |
-| Library list/vector round trip, width 32 (interpreted `misc.mud`) | 165 | 164 | 1.01 |
-| Bigint (20,000 steps per call) | 61 | 60 | 1.02 |
-| Mixed bigint/float | 39 | 38 | 1.03 |
-| Tables, 257 keys | 14 | 10 | 1.40 |
-| Tables, 32 keys | 12 | 8 | 1.50 |
-| Recursive local closure, `fib(27)` | 22 | 12 | 1.83 |
-| Local closure called in a loop (2,000,000 iterations per call) | 91 | 27 | 3.37 |
+| Integer loop (50,000 x 2,000) | 39 | 88 | 0.44 |
+| Native list/vector conversion, width 257 | 27 | 37 | 0.73 |
+| Native list/vector conversion, width 32 | 18 | 22 | 0.82 |
+| Floating point (100,000 steps per call) | 119 | 138 | 0.86 |
+| Library list/vector round trip, width 32 (interpreted `misc.mud`) | 178 | 173 | 1.03 |
+| Bigint (20,000 steps per call) | 63 | 61 | 1.03 |
+| Mixed bigint/float | 41 | 39 | 1.05 |
+| Tables, 257 keys | 13 | 10 | 1.30 |
+| Tables, 32 keys | 12 | 9 | 1.33 |
+| Recursive local closure, `fib(27)` | 21 | 12 | 1.75 |
+| Local closure called in a loop (2,000,000 iterations per call) | 80 | 29 | 2.76 |
 
 Notes:
 
@@ -119,7 +119,7 @@ Notes:
 - No ARM64, RISC-V or LLVM 14 benchmarks or validation are included.
 
 Samples, parameters and build fingerprints are in
-`doc/benchmarks/2026-10-11-final.json`.
+`doc/benchmarks/2026-10-12-final.json`.
 
 Reproduce (build both trees from the same commit; `<x64>` is the plain-`make`
 tree, with the benchmark files copied into its `regression/` directory):
