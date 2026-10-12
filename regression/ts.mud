@@ -106,27 +106,5 @@
   regress("load_ts status", ts_stats["status"], 200);
   regress("load_ts summary", ts_stats["summary"], "text:valid");
 
-  // 17. Deque library in TypeScript (deque.ts)
-  | make_deque, dq |
-  make_deque = load_ts("deque.ts");
-  dq = make_deque();
-  regress("deque initially empty", dq["is_empty"](), true);
-  regress("deque initial size", dq["size"](), 0);
-
-  dq["push_back"](10);
-  dq["push_back"](20);
-  dq["push_front"](5); // [5, 10, 20]
-
-  regress("deque peek_front", dq["peek_front"](), 5);
-  regress("deque peek_back", dq["peek_back"](), 20);
-  regress("deque size 3", dq["size"](), 3);
-
-  regress("deque pop_front", dq["pop_front"](), 5); // [10, 20]
-  regress("deque pop_back", dq["pop_back"](), 20); // [10]
-
-  regress("deque remaining size", dq["size"](), 1);
-  regress("deque remaining element", dq["pop_front"](), 10);
-  regress("deque empty after pops", dq["is_empty"](), true);
-
   true
 ];

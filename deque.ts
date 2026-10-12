@@ -19,99 +19,191 @@
  * SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-// Double-ended queue (Deque) library in TypeScript for Mudlle
+// Optimal O(1) Circular Ring Buffer Deque and Algorithms in TypeScript for Mudlle
 
-interface Deque {
-  push_front: (val: any) => void;
-  push_back: (val: any) => void;
-  pop_front: () => any;
-  pop_back: () => any;
-  peek_front: () => any;
-  peek_back: () => any;
-  size: () => number;
-  is_empty: () => boolean;
+// Representation: d = [buffer_vector, head_index, count, capacity]
+
+function deque_new(): vector {
+  let cap: number = 8;
+  return [make_vector(cap), 0, 0, cap];
 };
 
-function create_deque(): Deque {
-  let items: vector = make_vector(0);
-  let count: number = 0;
-
-  let push_back = (val: any): void => {
-    let new_items: vector = make_vector(count + 1);
-    for (let i: number = 0; i < count; i = i + 1) {
-      new_items[i] = items[i];
-    };
-    new_items[count] = val;
-    items = new_items;
-    count = count + 1;
-  };
-
-  let push_front = (val: any): void => {
-    let new_items: vector = make_vector(count + 1);
-    new_items[0] = val;
-    for (let i: number = 0; i < count; i = i + 1) {
-      new_items[i + 1] = items[i];
-    };
-    items = new_items;
-    count = count + 1;
-  };
-
-  let pop_back = (): any => {
-    if (count == 0) {
-      return null;
-    };
-    let val: any = items[count - 1];
-    count = count - 1;
-    let new_items: vector = make_vector(count);
-    for (let i: number = 0; i < count; i = i + 1) {
-      new_items[i] = items[i];
-    };
-    items = new_items;
-    return val;
-  };
-
-  let pop_front = (): any => {
-    if (count == 0) {
-      return null;
-    };
-    let val: any = items[0];
-    count = count - 1;
-    let new_items: vector = make_vector(count);
-    for (let i: number = 0; i < count; i = i + 1) {
-      new_items[i] = items[i + 1];
-    };
-    items = new_items;
-    return val;
-  };
-
-  let peek_front = (): any => {
-    if (count == 0) {
-      return null;
-    };
-    return items[0];
-  };
-
-  let peek_back = (): any => {
-    if (count == 0) {
-      return null;
-    };
-    return items[count - 1];
-  };
-
-  let get_size = (): number => count;
-  let is_empty = (): boolean => count == 0;
-
-  return {
-    push_front: push_front,
-    push_back: push_back,
-    pop_front: pop_front,
-    pop_back: pop_back,
-    peek_front: peek_front,
-    peek_back: peek_back,
-    size: get_size,
-    is_empty: is_empty
-  };
+function deque_size(d: vector): number {
+  return d[2];
 };
 
-// Return factory function for Mudlle export
-create_deque;
+function deque_is_empty(d: vector): boolean {
+  return d[2] == 0;
+};
+
+function deque_resize(d: vector): void {
+  let old_buf: vector = d[0];
+  let head: number = d[1];
+  let count: number = d[2];
+  let old_cap: number = d[3];
+  let new_cap: number = old_cap * 2;
+  let new_buf: vector = make_vector(new_cap);
+
+  for (let i: number = 0; i < count; i = i + 1) {
+    let idx: number = (head + i) % old_cap;
+    new_buf[i] = old_buf[idx];
+  };
+
+  d[0] = new_buf;
+  d[1] = 0;
+  d[3] = new_cap;
+};
+
+function deque_push_back(d: vector, val: any): void {
+  let count: number = d[2];
+  let cap: number = d[3];
+  if (count == cap) {
+    deque_resize(d);
+    cap = d[3];
+  };
+  let buf: vector = d[0];
+  let head: number = d[1];
+  let idx: number = (head + count) % cap;
+  buf[idx] = val;
+  d[2] = count + 1;
+};
+
+function deque_push_front(d: vector, val: any): void {
+  let count: number = d[2];
+  let cap: number = d[3];
+  if (count == cap) {
+    deque_resize(d);
+    cap = d[3];
+  };
+  let buf: vector = d[0];
+  let head: number = d[1];
+  let new_head: number = (head - 1 + cap) % cap;
+  buf[new_head] = val;
+  d[0] = buf;
+  d[1] = new_head;
+  d[2] = count + 1;
+};
+
+function deque_pop_front(d: vector): any {
+  let count: number = d[2];
+  if (count == 0) {
+    return null;
+  };
+  let buf: vector = d[0];
+  let head: number = d[1];
+  let cap: number = d[3];
+  let val: any = buf[head];
+  buf[head] = null;
+  d[1] = (head + 1) % cap;
+  d[2] = count - 1;
+  return val;
+};
+
+function deque_pop_back(d: vector): any {
+  let count: number = d[2];
+  if (count == 0) {
+    return null;
+  };
+  let buf: vector = d[0];
+  let head: number = d[1];
+  let cap: number = d[3];
+  let last_idx: number = (head + count - 1) % cap;
+  let val: any = buf[last_idx];
+  buf[last_idx] = null;
+  d[2] = count - 1;
+  return val;
+};
+
+function deque_peek_front(d: vector): any {
+  let count: number = d[2];
+  if (count == 0) {
+    return null;
+  };
+  let buf: vector = d[0];
+  let head: number = d[1];
+  return buf[head];
+};
+
+function deque_peek_back(d: vector): any {
+  let count: number = d[2];
+  if (count == 0) {
+    return null;
+  };
+  let buf: vector = d[0];
+  let head: number = d[1];
+  let cap: number = d[3];
+  let last_idx: number = (head + count - 1) % cap;
+  return buf[last_idx];
+};
+
+// O(N) Sliding Window Maximum using Monotonic Deque
+function sliding_window_max(arr: vector, k: number): vector {
+  let n: number = vlength(arr);
+  if (n == 0 || k <= 0) {
+    return make_vector(0);
+  };
+  let res_size: number = n - k + 1;
+  if (res_size <= 0) {
+    return make_vector(0);
+  };
+  let res: vector = make_vector(res_size);
+  let dq: vector = deque_new();
+
+  for (let i: number = 0; i < n; i = i + 1) {
+    // Remove indices out of current window
+    while (!deque_is_empty(dq) && deque_peek_front(dq) <= i - k) {
+      deque_pop_front(dq);
+    };
+
+    // Maintain decreasing order in deque
+    while (!deque_is_empty(dq) && arr[deque_peek_back(dq)] <= arr[i]) {
+      deque_pop_back(dq);
+    };
+
+    deque_push_back(dq, i);
+
+    if (i >= k - 1) {
+      res[i - k + 1] = arr[deque_peek_front(dq)];
+    };
+  };
+
+  return res;
+};
+
+// O(V + E) Shortest Path BFS using Deque
+function bfs_shortest_path(graph: object, start: string, target: string): number {
+  if (string_cmp(start, target) == 0) {
+    return 0;
+  };
+
+  let dq: vector = deque_new();
+  let visited: object = make_table();
+
+  // Enqueue [node, dist]
+  deque_push_back(dq, [start, 0]);
+  visited[start] = true;
+
+  while (!deque_is_empty(dq)) {
+    let item: vector = deque_pop_front(dq);
+    let curr: string = item[0];
+    let dist: number = item[1];
+
+    if (string_cmp(curr, target) == 0) {
+      return dist;
+    };
+
+    let neighbors: vector = graph[curr];
+    if (neighbors != null) {
+      let n_len: number = vlength(neighbors);
+      for (let i: number = 0; i < n_len; i = i + 1) {
+        let neighbor: string = neighbors[i];
+        if (visited[neighbor] == null) {
+          visited[neighbor] = true;
+          deque_push_back(dq, [neighbor, dist + 1]);
+        };
+      };
+    };
+  };
+
+  return -1; // Unreachable
+};

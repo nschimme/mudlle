@@ -20,39 +20,61 @@
  */
 
 [
-  | create_deque, dq |
-  create_deque = load_ts("deque.ts");
+  load_ts("deque.ts");
 
-  dq = create_deque();
+  | dq |
+  dq = deque_new();
 
   // Test empty state
-  regress("deque.ts initial is_empty", dq["is_empty"](), true);
-  regress("deque.ts initial size", dq["size"](), 0);
-  regress("deque.ts empty peek_front", dq["peek_front"](), null);
-  regress("deque.ts empty peek_back", dq["peek_back"](), null);
-  regress("deque.ts empty pop_front", dq["pop_front"](), null);
-  regress("deque.ts empty pop_back", dq["pop_back"](), null);
+  regress("deque.ts initial is_empty", deque_is_empty(dq), true);
+  regress("deque.ts initial size", deque_size(dq), 0);
+  regress("deque.ts empty peek_front", deque_peek_front(dq), null);
+  regress("deque.ts empty peek_back", deque_peek_back(dq), null);
+  regress("deque.ts empty pop_front", deque_pop_front(dq), null);
+  regress("deque.ts empty pop_back", deque_pop_back(dq), null);
 
   // Push elements
-  dq["push_back"]("first");
-  dq["push_back"]("second");
-  dq["push_front"]("zero"); // Deque order: ["zero", "first", "second"]
+  deque_push_back(dq, "first");
+  deque_push_back(dq, "second");
+  deque_push_front(dq, "zero"); // Deque order: ["zero", "first", "second"]
 
-  regress("deque.ts size after pushes", dq["size"](), 3);
-  regress("deque.ts is_empty after pushes", dq["is_empty"](), false);
-  regress("deque.ts peek_front value", dq["peek_front"](), "zero");
-  regress("deque.ts peek_back value", dq["peek_back"](), "second");
+  regress("deque.ts size after pushes", deque_size(dq), 3);
+  regress("deque.ts is_empty after pushes", deque_is_empty(dq), false);
+  regress("deque.ts peek_front value", deque_peek_front(dq), "zero");
+  regress("deque.ts peek_back value", deque_peek_back(dq), "second");
+
+  // Push more items to trigger capacity resizing (> 8 elements)
+  | i |
+  i = 1;
+  while (i <= 10)
+    [
+      deque_push_back(dq, i);
+      i = i + 1;
+    ];
+  regress("deque.ts size after 10 additional pushes", deque_size(dq), 13);
 
   // Pop elements
-  regress("deque.ts pop_front 1", dq["pop_front"](), "zero");
-  regress("deque.ts pop_back 1", dq["pop_back"](), "second");
-  regress("deque.ts size after 2 pops", dq["size"](), 1);
-  regress("deque.ts peek_front remaining", dq["peek_front"](), "first");
-  regress("deque.ts peek_back remaining", dq["peek_back"](), "first");
+  regress("deque.ts pop_front 1", deque_pop_front(dq), "zero");
+  regress("deque.ts pop_back 1", deque_pop_back(dq), 10);
+  regress("deque.ts size after 2 pops", deque_size(dq), 11);
 
-  regress("deque.ts pop_front last", dq["pop_front"](), "first");
-  regress("deque.ts final size", dq["size"](), 0);
-  regress("deque.ts final is_empty", dq["is_empty"](), true);
+  // Test Sliding Window Maximum O(N) algorithm
+  | arr, sw_res |
+  arr = ' [ 1 3 -1 -3 5 3 6 7 ];
+  sw_res = sliding_window_max(arr, 3);
+  regress("sliding_window_max result", sw_res, ' [ 3 3 5 5 6 7 ]);
+
+  // Test BFS Shortest Path O(V + E) algorithm
+  | graph, path_len |
+  graph = make_table();
+  graph["A"] = ' [ "B" "C" ];
+  graph["B"] = ' [ "A" "D" ];
+  graph["C"] = ' [ "A" "D" "E" ];
+  graph["D"] = ' [ "B" "C" "E" ];
+  graph["E"] = ' [ "C" "D" ];
+
+  path_len = bfs_shortest_path(graph, "A", "E");
+  regress("bfs_shortest_path A -> E", path_len, 2);
 
   true
 ];

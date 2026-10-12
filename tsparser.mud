@@ -573,15 +573,15 @@ defines ts_tokenize, ts_parse_string
           if (match_tok("op_sub"))
             [
               | sub_expr |
-              sub_expr = parse_primary();
+              sub_expr = parse_binary(8);
               make_builtin(loc, mc:b_negate, list(sub_expr))
             ]
           else if (match_tok("op_add"))
-            parse_primary()
+            parse_binary(8)
           else if (match_tok("op_not"))
             [
               | not_expr |
-              not_expr = parse_primary();
+              not_expr = parse_binary(8);
               make_builtin(loc, mc:b_eq, list(not_expr, make_const(loc, false)))
             ]
           else if (match_tok("number")) make_const(loc, tok[1])
@@ -599,7 +599,7 @@ defines ts_tokenize, ts_parse_string
               | operand, type_loc, seq, v_tv |
               type_loc = loc;
               v_tv = gen_tmp_var("tv");
-              operand = parse_primary();
+              operand = parse_binary(8);
               seq = list(
                 make_assign(type_loc, v_tv, operand),
                 make_builtin(type_loc, mc:b_ifelse, list(
@@ -1003,7 +1003,8 @@ defines ts_tokenize, ts_parse_string
                           consume_tok();
                           v_name = v_tok[1];
                           v_type = parse_type();
-                          block_locals = vector(format("%s", v_name), v_type, v_loc) . block_locals;
+                          if (string_cmp(end_token, "eof") != 0)
+                            block_locals = vector(format("%s", v_name), v_type, v_loc) . block_locals;
 
                           if (match_tok("op_assign"))
                             [
@@ -1197,7 +1198,9 @@ defines ts_tokenize, ts_parse_string
                   ret_type = parse_type();
                   body_s = parse_stmt_list("rbrace");
 
-                  block_locals = vector(format("%s", fn_name), TYPESET_ANY, loc) . block_locals;
+                  if (string_cmp(end_token, "eof") != 0)
+                    block_locals = vector(format("%s", fn_name), TYPESET_ANY, loc) . block_locals;
+
                   closure_comp = make_closure(loc, ret_type, null, lreverse!(params), body_s, fn_name);
                   block_seq = make_assign(loc, fn_name, closure_comp) . block_seq;
                 ]
