@@ -1214,9 +1214,16 @@ value llvm_call_global_constant(int64_t offset, value caller, value *arguments,
   seclev_t old_seclevel = internal_seclevel;
   bool old_seclevel_valid = seclevel_valid;
   set_seclevel(caller_seclevel);
-  llvm_check_callable(function, (long)nargs, caller_seclevel);
   value result;
-  if (TYPE(function, primitive) || TYPE(function, secure))
+  /* A plain primitive called with its exact arity needs no further check
+     (that is all function_callable() tests for one); it type-checks its own
+     parameters. */
+  if (TYPE(function, primitive)
+      && ((struct primitive *)function)->op->nargs == (unsigned)nargs)
+    result = llvm_call_primitive((struct primitive *)function, arguments,
+                                 (size_t)nargs);
+  else if (llvm_check_callable(function, (long)nargs, caller_seclevel),
+           TYPE(function, primitive) || TYPE(function, secure))
     {
       for (int64_t i = 0; i < nargs; ++i)
         GCCHECK(arguments[i]);
