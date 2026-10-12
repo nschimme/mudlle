@@ -214,7 +214,13 @@ void maybe_mrethrow(void);
 
 struct mcallback;
 
-value call_mcallback(struct mcallback *cb);
+typedef value (*mcallback_varargs_fn)(void *cbdata, struct closure *fn,
+                                      struct vector *args);
+bool mcallback_varargs_matches(struct closure *fn,
+                               mcallback_varargs_fn callback,
+                               void **cbdata);
+value call_mcallback(struct mcallback *cb, struct closure *fn,
+                     struct vector *locals);
 
 /* returns a mudlle 'fn() -> x' implemented by calling 'cb(cbarg) -> x';
    'cbfree(cbarg)' is called when the mudlle reference is lost */
@@ -225,6 +231,16 @@ struct closure *make_mcallback(
   const char *funcname,
   struct string *help,
   const char *filename, int line);
+struct closure *make_mcallback_varargs_captured_sec(
+  mcallback_varargs_fn cb, void (*cbfree)(void *cbdata), void *cbdata,
+  struct vector *captures, const char *funcname, struct string *help,
+  const char *filename, int line, seclev_t seclev);
+struct icode;
+struct closure *make_mcallback_varargs_captured_sec_cached(
+  mcallback_varargs_fn cb, void (*cbfree)(void *cbdata), void *cbdata,
+  struct vector *captures, const char *funcname, struct string *help,
+  const char *filename, int line, seclev_t seclev, struct icode **icode_slot,
+  struct vector *arguments, typeset_t return_typeset);
 
 #define MAKE_MCALLBACK(cb, cbfree, cbarg, funcname, help)       \
   make_mcallback((cb), (cbfree), (cbarg), (funcname), (help),   \

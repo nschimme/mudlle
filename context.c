@@ -61,9 +61,7 @@ const struct session_info cold_session = {
 
 value seclevel_to_maxseclevel(seclev_t seclev)
 {
-  if (seclev >= LEGACY_SECLEVEL)
-    return makeint(MAX_SECLEVEL);
-  return makeint(seclev);
+  return makeint(maxseclevel_for(seclev));
 }
 
 seclev_t get_effective_seclevel(void)

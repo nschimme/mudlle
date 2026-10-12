@@ -1372,6 +1372,8 @@ static void define_strings(void)
     "x86_64"
 #elif defined __aarch64__
     "arm64"
+#elif defined __riscv && __riscv_xlen == 64
+    "riscv64"
 #else
 #  error Fix me
 #endif

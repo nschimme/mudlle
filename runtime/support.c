@@ -323,25 +323,29 @@ UNSAFEOP(register_mcode_module, ,
 {
   CHECK_TYPES(l, CT_TYPES(null, pair));
 
-#ifdef NOCOMPILER
-  RUNTIME_ERROR(error_abort, "not supported");
-#else
-  const char *errmsg;
-  enum runtime_error err = check_proper_list(l, TSET(mcode), NULL, &errmsg);
-  if (err != error_none)
-    RUNTIME_ERROR(err, errmsg);
-
+#ifndef NOCOMPILER
   struct mcode_array mcodes = ARRAY_NULL;
-  for (; l; l = l->cdr)
+#endif
+  for (; l != NULL; l = l->cdr)
     {
+      TYPEIS(l, pair);
+      if (TYPE(l->car, icode))
+        continue;
+#ifdef NOCOMPILER
+      RUNTIME_ERROR(error_bad_value, "native module contains non-LLVM code");
+#else
+      if (!TYPE(l->car, mcode))
+        RUNTIME_ERROR(error_bad_type, "code module contains invalid code");
       struct mcode *mcode = l->car;
       if (!mcode->dwarf_seen)
         ARRAY_ADD(mcodes, mcode);
+#endif
     }
+#ifndef NOCOMPILER
   register_dwarf_mcodes(0, &mcodes);
   ARRAY_FREE(mcodes);
-  undefined();
 #endif
+  undefined();
 }
 
 TYPEDOP(dwarf_line_number_info, ,
@@ -1306,14 +1310,24 @@ static void support_define_consts(void)
 
   system_define("mc:max_local_vars", makeint(MAX_LOCAL_VARS));
 
-#ifdef __x86_64__
-  #define ARCHNAME "x64"
+#if defined __x86_64__
   #define ARCH 0x64
 #elif defined __aarch64__
-  #define ARCHNAME "arm64"
   #define ARCH 0x41
+#elif defined __riscv && __riscv_xlen == 64
+  #define ARCH 0x52
 #else
   #error Fix me
+#endif
+
+#ifdef MUDLLE_USE_LLVM
+  #define ARCHNAME "llvm"
+#elif defined __x86_64__
+  #define ARCHNAME "x64"
+#elif defined __aarch64__
+  #define ARCHNAME "arm64"
+#elif defined __riscv && __riscv_xlen == 64
+  #define ARCHNAME "riscv64"
 #endif
 
   system_define("mc:typeset_flag_return", makeint(TYPESET_FLAG_RETURN));

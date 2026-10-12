@@ -1,0 +1,3628 @@
+/*
+ * Copyright (c) 2026 Nils Schimmelmann
+ * All rights reserved.
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose, without fee, and without written agreement is hereby granted,
+ * provided that the above copyright notice and the following two paragraphs
+ * appear in all copies of this software.
+ *
+ * IN NO EVENT SHALL NILS SCHIMMELMANN BE LIABLE TO ANY PARTY FOR DIRECT,
+ * INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+ * USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN IF NILS SCHIMMELMANN HAS
+ * BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ * NILS SCHIMMELMANN SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+ * PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS"
+ * BASIS, AND NILS SCHIMMELMANN HAS NO OBLIGATION TO PROVIDE MAINTENANCE,
+ * SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ */
+
+/*
+ * LLVM IR Generator for Mudlle
+ */
+
+library genllvm
+requires asmwriter, compiler, dlist, flow, graph, ins3, misc, optimise, phase1,
+  phase2, phase3, sequences, vars
+
+defines mc:gen_llvm_ir, mc:gen_llvm_function,
+  mc:llvm_constants, mc:llvm_global_relocations,
+  llvm:mgen_preamble, llvm:mgen_instruction, llvm:assemble
+
+reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
+
+[
+    | llvm_read_var, llvm_write_var, gen_ins, gen_function, tmp_seq,
+    globals_seen, current_ifn, capture_indices, llvm_constant_list,
+    llvm_constant_index,
+    llvm_emit_closure, llvm_check_integer_args, llvm_emit_loop_check,
+    llvm_emit_integer_type_check, llvm_integer_comparison?,
+    llvm_check_comparison_types, llvm_check_typed_integer_args,
+    llvm_args_immutable?,
+    llvm_emit_vector, llvm_emit_concat, llvm_emit_builtin,
+    llvm_emit_binary_builtin, llvm_emit_ref, llvm_emit_set, llvm_exact_arity?,
+    llvm_scalar_numeric_leaf?,
+    llvm_read_var_storage, llvm_read_env,
+    llvm_emit_rooted_arguments, llvm_emit_copying_arguments,
+    llvm_constant_values, llvm_global_relocation_values,
+    function_roots_required, function_root_scope_required,
+    llvm_function_needs_roots?, llvm_allocate_slots, llvm_slot_number,
+    slot_indices, llvm_instruction_may_allocate?, root_slot_indices, nonallocating_ops, nonallocating_branches, vector_find_required,
+    llvm_inline_max_size, closure_cache_fns, closure_cache_seen,
+    float_internal, float_doubles, float_consts, known_args_max,
+    llvm_float_call_op,
+    llvm_find_float_temps, primitive_arities |
+
+  llvm_inline_max_size = 3500;
+  closure_cache_fns = null;
+  closure_cache_seen = make_table();
+  float_internal = make_table();
+  float_doubles = make_table();
+  float_consts = null;
+  known_args_max = 0;
+  tmp_seq = 0;
+  globals_seen = make_table();
+  current_ifn = null;
+  function_roots_required = false;
+  function_root_scope_required = false;
+  slot_indices = make_table();
+  root_slot_indices = null;
+  capture_indices = make_table();
+  llvm_constant_list = null;
+  llvm_constant_values = null;
+  llvm_global_relocation_values = null;
+  mc:llvm_constants = fn () llvm_constant_values;
+  mc:llvm_global_relocations = fn () llvm_global_relocation_values;
+
+  nonallocating_ops = list(mc:b_iadd, mc:b_bitand, mc:b_bitor, mc:b_bitxor,
+                  mc:b_shift_left, mc:b_shift_right, mc:b_bitnot,
+                  mc:b_logical_xor, mc:b_assign, mc:b_funcarg,
+                  mc:b_car, mc:b_cdr, mc:b_vlength);
+  nonallocating_branches = list(mc:branch_never, mc:branch_always,
+                       mc:branch_true, mc:branch_false,
+                       mc:branch_eq, mc:branch_ne,
+                       mc:branch_bitand, mc:branch_nbitand,
+                       mc:branch_xor, mc:branch_xnor);
+
+  llvm_slot_number = fn (var)
+    [
+      | slot |
+      slot = slot_indices[itoa(var[mc:v_number])];
+      if (integer?(slot)) slot else var[mc:v_number]
+    ];
+
+  // GC-visible slots escape to C, so LLVM cannot reuse their stack storage.
+  // Color the compiler's interference graph before flattening its blocks.
+  // Indirect variables keep exclusive slots because their cells are created
+  // at entry and may be used by closures throughout the function.
+  llvm_allocate_slots = fn (ifn)
+    [
+      | vars, neighbors, add_edges, all, args, color, live_roots, entry_allocates, immediate_vars, immediate_ops,
+        root_variables, assigned_vars, checked_args, entry_open, argument_origins,
+        scalar_candidates, scalar_proof, changed, scalar_returns_valid |
+      slot_indices = make_table();
+      root_slot_indices = null;
+      if (!pair?(ifn[mc:c_fvalue])) exit<function> null;
+      mc:recompute_vars(ifn, false);
+      mc:flow_live(ifn);
+      vars = ifn[mc:c_flocals];
+      neighbors = make_table();
+      all = mc:new_varset(ifn);
+      live_roots = mc:new_varset(ifn);
+      immediate_vars = make_table();
+      assigned_vars = make_table();
+      checked_args = make_table();
+      argument_origins = make_table();
+      lforeach(fn (fa) [
+        argument_origins[itoa(fa[0][0][mc:v_number])] = fa[0][0][mc:v_number];
+      ],ifn[mc:c_ffullargs]);
+      immediate_ops = list(mc:b_iadd, mc:b_bitand, mc:b_bitor, mc:b_bitxor,
+                           mc:b_shift_left, mc:b_shift_right, mc:b_bitnot,
+                           mc:b_logical_xor, mc:b_logical_not,
+                           mc:b_eq, mc:b_ne, mc:b_lt, mc:b_le,
+                           mc:b_gt, mc:b_ge, mc:b_vlength);
+      entry_allocates = ifn[mc:c_fnargs_var]
+        || ifn[mc:c_farginfo][mc:arginfo_vararg]
+        || lexists?(fn (v) v[mc:v_indirect], vars)
+        || lexists?(fn (fa) fa[0][0][mc:v_indirect], ifn[mc:c_ffullargs]);
+      lforeach(fn (v) [
+        neighbors[itoa(v[mc:v_number])] = mc:new_varset(ifn);
+        immediate_vars[itoa(v[mc:v_number])] = true;
+        set_bit!(all, v[mc:v_number]);
+      ], vars);
+      add_edges = fn (live)
+        bforeach(fn (n) [
+          | edges |
+          edges = neighbors[itoa(n)];
+          if (edges != null) bunion!(edges, live);
+        ], live);
+      graph_nodes_apply(fn (node) [
+        mc:rscan_live(fn (il, live_in, live_out, x) [
+          | ins, dest |
+          ins = il[mc:il_ins];
+          if (ins != null) [
+            dest = mc:defined_var(ins);
+            if (dest) assigned_vars[itoa(dest[mc:v_number])] = true;
+            // This optional instruction has a destination outside defined_var.
+            if (ins[mc:i_class] == mc:i_maybe_sconcat)
+              [
+                assigned_vars[itoa(ins[mc:i_scdest][mc:v_number])] = true;
+              ];
+          ];
+          add_edges(live_in);
+          add_edges(live_out);
+          if (il[mc:il_ins] != null
+              && llvm_instruction_may_allocate?(il[mc:il_ins]))
+            bunion!(live_roots, live_in);
+          null
+        ], null, graph_node_get(node));
+      ], cdr(ifn[mc:c_fvalue]));
+      // A never-assigned argument checked as an integer in the entry block
+      // before any allocation cannot become a heap pointer at later safepoints.
+      // Restrict this to checks the generator really emits, not merely inferred
+      // types. Indirect arguments and allocating entry setup remain rooted.
+      entry_open = !entry_allocates;
+      dforeach(fn (il) [
+        | ins, class, op, args, types, checks, typed_comparison, dest |
+        ins = il[mc:il_ins];
+        if (entry_open && ins != null) [
+          class = ins[mc:i_class];
+          if (llvm_instruction_may_allocate?(ins))
+            entry_open = false
+          else [
+            dest = mc:defined_var(ins);
+            if (dest) [
+              if (class == mc:i_compute && ins[mc:i_aop] == mc:b_assign
+                  && car(ins[mc:i_aargs])[mc:v_class] == mc:v_local
+                  && !car(ins[mc:i_aargs])[mc:v_indirect])
+                argument_origins[itoa(dest[mc:v_number])] =
+                  argument_origins[itoa(car(ins[mc:i_aargs])[mc:v_number])]
+              else
+                argument_origins[itoa(dest[mc:v_number])] = null;
+            ];
+            checks = null;
+            typed_comparison = false;
+            if (class == mc:i_branch) [
+              op = ins[mc:i_bop];
+              if (op == mc:branch_lt || op == mc:branch_le
+                  || op == mc:branch_gt || op == mc:branch_ge) [
+                checks = ins[mc:i_bargs];
+                types = ins[mc:i_btypes];
+                typed_comparison = llvm_integer_comparison?(types);
+              ];
+            ] else if (class == mc:i_compute) [
+              op = ins[mc:i_aop];
+              if (op == mc:b_iadd || op == mc:b_bitand || op == mc:b_bitor
+                  || op == mc:b_bitxor || op == mc:b_shift_left
+                  || op == mc:b_shift_right || op == mc:b_bitnot)
+                checks = ins[mc:i_aargs];
+            ] else if (class == mc:i_trap && ins[mc:i_top] == mc:trap_type) [
+              args = ins[mc:i_targs];
+              if (cadr(args)[mc:v_class] == mc:v_constant
+                  && cadr(args)[mc:v_kvalue] == type_integer)
+                checks = list(car(args));
+            ];
+            lforeach(fn (v) [
+              | origin |
+              origin = argument_origins[itoa(v[mc:v_number])];
+              if ((!typed_comparison || (car(types) & ~itype_integer) != 0)
+                  && v[mc:v_class] == mc:v_local && !v[mc:v_indirect]
+                  && origin != null)
+                checked_args[itoa(origin)] = true;
+              if (typed_comparison) types = cdr(types);
+            ], checks);
+            // A check later in the block does not dominate code after a
+            // control-flow boundary. Inspect the boundary's own checks first.
+            if (class == mc:i_branch || class == mc:i_return
+                || (class == mc:i_trap
+                    && (ins[mc:i_top] == mc:trap_always
+                        || mc:trap_is_unreachable?(ins))))
+              entry_open = false;
+          ];
+        ];
+      ], graph_node_get(car(ifn[mc:c_fvalue]))[mc:f_ilist]);
+      // Reclassify definitions after collecting entry argument proofs. A
+      // numeric operation on certified integer arguments/constants returns an
+      // integer (or raises); it cannot leave a heap value in its destination.
+      lforeach(fn (v) immediate_vars[itoa(v[mc:v_number])] = true,vars);
+      graph_nodes_apply(fn (node) [
+        dforeach(fn (il) [
+          | ins, dest, scalar, op, types |
+          ins = il[mc:il_ins];
+          if (ins != null) [
+            dest = mc:defined_var(ins);
+            scalar = false;
+            if (ins[mc:i_class] == mc:i_compute) [
+              op = ins[mc:i_aop];
+              types = ins[mc:i_atypes];
+              scalar = lexists?(fn (x) x == op,immediate_ops)
+                || (op == mc:b_assign
+                    && car(ins[mc:i_aargs])[mc:v_class] == mc:v_constant
+                    && (integer?(car(ins[mc:i_aargs])[mc:v_kvalue])
+                        || car(ins[mc:i_aargs])[mc:v_kvalue] == null))
+                || (lexists?(fn (x) x == op,
+                      list(mc:b_add,mc:b_subtract,mc:b_multiply,
+                           mc:b_divide,mc:b_remainder,mc:b_negate))
+                    && ((types && llength(types) == llength(ins[mc:i_aargs])
+                         && !lexists?(fn(t) t == 0 || (t & ~itype_integer) != 0,
+                                      types))
+                        || !lexists?(fn(v) [
+                             if(v[mc:v_class] == mc:v_constant)
+                               !integer?(v[mc:v_kvalue])
+                             else
+                               !(v[mc:v_class] == mc:v_local
+                                 && !v[mc:v_indirect]
+                                 && checked_args[itoa(v[mc:v_number])] == true
+                                 && assigned_vars[itoa(v[mc:v_number])] == null)
+                           ],ins[mc:i_aargs])));
+            ];
+            if (dest && !scalar) immediate_vars[itoa(dest[mc:v_number])] = false;
+            if (ins[mc:i_class] == mc:i_maybe_sconcat)
+              immediate_vars[itoa(ins[mc:i_scdest][mc:v_number])] = false;
+          ];
+        ],graph_node_get(node)[mc:f_ilist]);
+      ],cdr(ifn[mc:c_fvalue]));
+      // All arguments are loaded at entry, before the first instruction.
+      args = mc:new_varset(ifn);
+      lforeach(fn (fa) [
+        set_bit!(args, fa[0][0][mc:v_number]);
+        immediate_vars[itoa(fa[0][0][mc:v_number])] =
+          checked_args[itoa(fa[0][0][mc:v_number])] == true
+          && assigned_vars[itoa(fa[0][0][mc:v_number])] == null;
+      ], ifn[mc:c_ffullargs]);
+
+      // A second, stronger proof is deliberately separate from the legacy
+      // immediate-value heuristic above. Locals start scalar because entry
+      // initializes their slots to tagged zero. Arguments need a dominating
+      // emitted integer check and must never be assigned. Then monotonically
+      // remove locals with any definition that can produce a heap value.
+      // Exact self calls are accepted only when every normal return value is
+      // itself proven scalar, giving an induction over finite returns.
+      scalar_candidates = make_table();
+      lforeach(fn (v) [
+        scalar_candidates[itoa(v[mc:v_number])] = !entry_allocates
+          && !v[mc:v_indirect];
+      ], vars);
+      lforeach(fn (fa) [
+        | av |
+        av = fa[0][0];
+        scalar_candidates[itoa(av[mc:v_number])] = !entry_allocates
+          && !av[mc:v_indirect]
+          && checked_args[itoa(av[mc:v_number])] == true
+          && assigned_vars[itoa(av[mc:v_number])] == null;
+      ], ifn[mc:c_ffullargs]);
+      scalar_proof = fn (v)
+        if (v[mc:v_class] == mc:v_constant)
+          integer?(v[mc:v_kvalue]) || v[mc:v_kvalue] == null
+        else
+          v[mc:v_class] == mc:v_local && !v[mc:v_indirect]
+            && scalar_candidates[itoa(v[mc:v_number])] == true;
+      changed = true;
+      while (changed) [
+        changed = false;
+        graph_nodes_apply(fn (node) [
+          dforeach(fn (il) [
+            | ins, dest, safe, op, cargs |
+            ins = il[mc:il_ins];
+            if (ins != null) [
+              dest = mc:defined_var(ins);
+              if (dest && dest[mc:v_class] == mc:v_local
+                  && !dest[mc:v_indirect]
+                  && scalar_candidates[itoa(dest[mc:v_number])] == true) [
+                safe = false;
+                if (ins[mc:i_class] == mc:i_compute) [
+                  op = ins[mc:i_aop];
+                  cargs = ins[mc:i_aargs];
+                  safe = op == mc:b_assign
+                    && scalar_proof(car(cargs));
+                  if (lexists?(fn (x) x == op, immediate_ops))
+                    safe = true;
+                  if (op == mc:b_add || op == mc:b_subtract
+                      || op == mc:b_multiply)
+                    safe = llength(cargs) == 2
+                      && !lexists?(fn (v) !scalar_proof(v), cargs);
+                ] else if (ins[mc:i_class] == mc:i_call) [
+                  cargs = ins[mc:i_cargs];
+                  if (car(cargs)[mc:v_class] == mc:v_closure
+                      && car(cargs)[mc:v_cparent] == mc:myself
+                      && llvm_exact_arity?(ifn, llength(cdr(cargs)))) [
+                    // The final whole-function return check validates this
+                    // coinductive self-call assumption once per function.
+                    safe = true;
+                  ] else if (car(cargs)[mc:v_class] == mc:v_function
+                             && llvm_exact_arity?(car(cargs)[mc:v_fvalue],
+                                                  llength(cdr(cargs)))
+                             && llvm_scalar_numeric_leaf?(car(cargs)[mc:v_fvalue])
+                             && !lexists?(fn (v) !scalar_proof(v),
+                                          cdr(cargs))) [
+                    safe = true;
+                  ];
+                ];
+                if (!safe) [
+                  scalar_candidates[itoa(dest[mc:v_number])] = false;
+                  changed = true;
+                ];
+              ];
+              // maybe_sconcat has a destination outside defined_var.
+              if (ins[mc:i_class] == mc:i_maybe_sconcat
+                  && ins[mc:i_scdest]
+                  && scalar_candidates[itoa(ins[mc:i_scdest][mc:v_number])]
+                     == true) [
+                scalar_candidates[itoa(ins[mc:i_scdest][mc:v_number])] = false;
+                changed = true;
+              ];
+            ];
+          ], graph_node_get(node)[mc:f_ilist]);
+        ], cdr(ifn[mc:c_fvalue]));
+      ];
+      // Reject the proof as a whole if any return can expose a non-scalar.
+      scalar_returns_valid = true;
+      graph_nodes_apply(fn (node) [
+        dforeach(fn (il) [
+          | ins |
+          ins = il[mc:il_ins];
+          if (ins != null && ins[mc:i_class] == mc:i_return
+              && !scalar_proof(ins[mc:i_rvalue]))
+            scalar_returns_valid = false;
+        ], graph_node_get(node)[mc:f_ilist]);
+      ], cdr(ifn[mc:c_fvalue]));
+      if (!scalar_returns_valid) scalar_candidates = null;
+      if (ifn[mc:c_fnargs_var])
+        set_bit!(args, ifn[mc:c_fnargs_var][mc:vl_var][mc:v_number]);
+      add_edges(args);
+      lforeach(fn (v) [
+        if (v[mc:v_indirect])
+          [
+            bunion!(neighbors[itoa(v[mc:v_number])], all);
+            bforeach(fn (n) set_bit!(neighbors[itoa(n)], v[mc:v_number]), all);
+          ];
+      ], vars);
+      root_variables = make_table();
+      lforeach(fn (v) [
+        root_variables[itoa(v[mc:v_number])] = entry_allocates
+          || v[mc:v_indirect]
+          || (bit_set?(live_roots, v[mc:v_number])
+              && !immediate_vars[itoa(v[mc:v_number])]
+              && !(scalar_candidates != null
+                   && scalar_candidates[itoa(v[mc:v_number])] == true));
+      ], vars);
+      lforeach(fn (v) [
+        | used |
+        used = make_table();
+        bforeach(fn (n) [
+          color = slot_indices[itoa(n)];
+          if (integer?(color)) used[itoa(color)] = true;
+        ], neighbors[itoa(v[mc:v_number])]);
+        // Variable zero is the compiler's discarded-value slot. Entry setup
+        // can still write it (e.g. an unused argument-count variable).
+        // Keep GC-visible and private slots in separate color classes. A
+        // scalar must not escape merely because it shares storage with a
+        // heap reference whose lifetime does not overlap its own.
+        color = if (root_variables[itoa(v[mc:v_number])]) 1 else 2;
+        while (used[itoa(color)] == true) color = color + 2;
+        slot_indices[itoa(v[mc:v_number])] = color;
+      ], vars);
+      // Publish each physical GC-visible slot once; multiple rooted
+      // variables can share it when their lifetimes do not overlap.
+      root_slot_indices = make_table();
+      lforeach(fn (v) [
+        if (root_variables[itoa(v[mc:v_number])])
+          root_slot_indices[itoa(llvm_slot_number(v))] = true;
+      ], vars);
+      mc:clear_dataflow(ifn);
+    ];
+
+  llvm_constant_index = fn (value)
+    [
+      | found, index |
+      found = assq(value, llvm_constant_list);
+      if (found)
+        cdr(found)
+      else
+        [
+          index = llength(llvm_constant_list);
+          llvm_constant_list = (value . index) . llvm_constant_list;
+          index
+        ]
+    ];
+
+  llvm_read_var = fn (vector var, w)
+    [
+      | class |
+      class = var[mc:v_class];
+      if (class == mc:v_constant)
+        [
+          | val, index, result, raw, tagged |
+          val = var[mc:v_kvalue];
+          if (val == false)
+            "1"
+          else if (val == true)
+            "3"
+          else if (val == null)
+            "0"
+          else if (integer?(val))
+            [
+              tmp_seq = tmp_seq + 1;
+              raw = format("%%integer_raw_%d", tmp_seq);
+              tagged = format("%%integer_tagged_%d", tmp_seq);
+              writer:format(w, "  %s = shl i64 %d, 1\n", raw, val);
+              writer:format(w, "  %s = or i64 %s, 1\n", tagged, raw);
+              tagged
+            ]
+          else
+            [
+              index = llvm_constant_index(val);
+              tmp_seq = tmp_seq + 1;
+              result = format("%%constant_%d", tmp_seq);
+              writer:format(w,
+                "  %s = call i64 @llvm_constant_get(i64 %s, i64 %d)\n",
+                result, llvm_read_env(w), index);
+              result
+            ]
+        ]
+      else if (class == mc:v_function)
+        llvm_emit_closure(var[mc:v_fvalue], w, false)
+      else if (class == mc:v_closure)
+        [
+          | cidx, res |
+          cidx = capture_indices[itoa(var[mc:v_number])];
+          if (!integer?(cidx)) error(error_bad_value);
+          tmp_seq = tmp_seq + 1;
+          res = format("%%capture_%d", tmp_seq);
+          writer:format(w,
+            "  %s = call i64 @llvm_closure_capture_get(i64 %s, i64 %d)\n",
+            res, llvm_read_env(w), cidx);
+          res
+        ]
+      else if (class == mc:v_global || class == mc:v_global_constant
+          || class == mc:v_global_define)
+        [
+          | res |
+          tmp_seq = tmp_seq + 1;
+          res = format("%%global_%d", tmp_seq);
+          writer:format(w,
+            "  %s = call i64 @llvm_global_read(i64 %d)\n",
+            res, var[mc:v_goffset]);
+          res
+        ]
+      else
+        [
+          | vnum, tname |
+          vnum = llvm_slot_number(var);
+          tmp_seq = tmp_seq + 1;
+          tname = format("%%rd_%d_%d", vnum, tmp_seq);
+          writer:format(w, "  %s = load i64, ptr %%slot_%d\n", tname, vnum);
+          tname
+        ]
+    ];
+
+  // A runtime helper may trigger moving GC, so reload the closure environment
+  // from its registered root instead of reusing the incoming SSA parameter.
+  llvm_read_env = fn (w)
+    [
+      | env_value |
+      if (!function_roots_required)
+        "%env"
+      else
+        [
+          tmp_seq = tmp_seq + 1;
+          env_value = format("%%env_value_%d", tmp_seq);
+          writer:format(w, "  %s = load i64, ptr %%env_slot_%d\n",
+                        env_value, current_ifn[mc:c_fnumber]);
+          env_value
+        ]
+    ];
+
+  // Return an indirect variable's storage cell for closure capture.
+  llvm_read_var_storage = fn (vector var, w)
+    [
+      | class, cidx, result |
+      class = var[mc:v_class];
+      if (class == mc:v_closure)
+        [
+          cidx = capture_indices[itoa(var[mc:v_number])];
+          if (!integer?(cidx)) error(error_bad_value);
+          tmp_seq = tmp_seq + 1;
+          result = format("%%capture_cell_%d", tmp_seq);
+          writer:format(w,
+            "  %s = call i64 @llvm_closure_capture_get(i64 %s, i64 %d)\n",
+            result, llvm_read_env(w), cidx);
+          result
+        ]
+      else
+        [
+          tmp_seq = tmp_seq + 1;
+          result = format("%%cell_ptr_%d", tmp_seq);
+          writer:format(w, "  %s = load i64, ptr %%slot_%d\n",
+                        result, llvm_slot_number(var));
+          result
+        ]
+    ];
+
+  llvm_write_var = fn (vector var, string val_str, w)
+    [
+      | class |
+      class = var[mc:v_class];
+      if (class == mc:v_global || class == mc:v_global_constant
+          || class == mc:v_global_define)
+        [
+          writer:format(w,
+            "  call void @llvm_global_write(i64 %d, i64 %s)\n",
+            var[mc:v_goffset], val_str);
+        ]
+      else if (class == mc:v_closure)
+        [
+          | cidx, cell |
+          cidx = capture_indices[itoa(var[mc:v_number])];
+          if (!integer?(cidx)) error(error_bad_value);
+          if (var[mc:v_indirect])
+            [
+              cell = llvm_read_var_storage(var, w);
+              writer:format(w,
+                "  call void @llvm_variable_set(i64 %s, i64 %s)\n",
+                cell, val_str);
+            ]
+          else
+            writer:format(w,
+              "  call void @llvm_closure_capture_set(i64 %s, i64 %d, i64 %s)\n",
+              llvm_read_env(w), cidx, val_str);
+        ]
+      else if (class != mc:v_constant && class != mc:v_function)
+        [
+          | vnum, cell |
+          vnum = llvm_slot_number(var);
+          if (var[mc:v_indirect])
+            [
+              cell = llvm_read_var_storage(var, w);
+              writer:format(w,
+                "  call void @llvm_variable_set(i64 %s, i64 %s)\n",
+                cell, val_str);
+            ]
+          else
+            writer:format(w, "  store i64 %s, ptr %%slot_%d\n", val_str, vnum);
+        ];
+    ];
+
+  llvm_check_integer_args = fn (args, w)
+    lforeach(fn (arg) writer:format(w,
+      "  call void @mudlle_check_integer(i64 %s)\n",
+      llvm_read_var(arg, w)), args);
+
+  llvm_emit_integer_type_check = fn (arg, w)
+    [
+      | value |
+      value = llvm_read_var(arg, w);
+      writer:format(w, "  call void @mudlle_check_integer(i64 %s)\n", value);
+    ];
+
+  llvm_integer_comparison? = fn (types)
+    types && llength(types) == 2
+      && (car(types) & itype_integer) != 0
+      && (cadr(types) & itype_integer) != 0;
+
+  // Shared conservative safepoint classification for frame elision and
+  // per-slot liveness. Unknown instructions and function materialization
+  // must stay collecting until their runtime helpers have been audited.
+  llvm_instruction_may_allocate? = fn (ins)
+    [
+      | class, op, args |
+      class = ins[mc:i_class];
+      args = mc:arguments(ins, null);
+      if (lexists?(fn (v) v[mc:v_class] == mc:v_function, args))
+        exit<function> true;
+      if (class == mc:i_call || class == mc:i_closure
+          || class == mc:i_maybe_sconcat)
+        exit<function> true;
+      if (class == mc:i_compute)
+        [
+          op = ins[mc:i_aop];
+          if (lexists?(fn (safe_op) safe_op == op, nonallocating_ops))
+            null
+          else if ((op == mc:b_lt || op == mc:b_le
+                    || op == mc:b_gt || op == mc:b_ge)
+                   && llvm_integer_comparison?(ins[mc:i_atypes]))
+            null
+          else
+            exit<function> true;
+        ];
+      if (class == mc:i_branch)
+        [
+          op = ins[mc:i_bop];
+          if (lexists?(fn (safe_op) safe_op == op, nonallocating_branches))
+            null
+          else if (op == mc:branch_lt || op == mc:branch_le
+                   || op == mc:branch_gt || op == mc:branch_ge)
+            null
+          else
+            exit<function> true;
+        ];
+      if (class != mc:i_compute && class != mc:i_memory
+          && class != mc:i_branch && class != mc:i_return
+          && class != mc:i_trap && class != mc:i_nop)
+        exit<function> true;
+      false
+    ];
+
+  llvm_function_needs_roots? = fn (ifn)
+    [
+      | scan, ins, next_ins, op, branches |
+      if (ifn[mc:c_fnargs_var]
+          || ifn[mc:c_farginfo][mc:arginfo_vararg]
+          || lexists?(fn (v) v[mc:v_indirect], ifn[mc:c_flocals])
+          || lexists?(fn (fa) fa[0][0][mc:v_indirect], ifn[mc:c_ffullargs]))
+        exit<function> true;
+      if (pair?(ifn[mc:c_fvalue])) mc:flatten_blocks(ifn);
+      scan = ifn[mc:c_fvalue];
+      if (!vector?(scan)) exit<function> true;
+      branches = false;
+      loop [
+        ins = dget(scan)[mc:il_ins];
+        if (ins != null && llvm_instruction_may_allocate?(ins))
+          [
+            // A final numeric builtin consumes its arguments before it
+            // allocates. llvm_call_global roots any allocating fallback's
+            // parameters, and nothing in this function is read afterwards
+            // except the returned value. The call_llvm frame still owns the
+            // closure and original arguments for collection/backtraces.
+            // Keep this limited to audited numeric helpers and straight-line
+            // code: other builtins can read their input buffers after GC.
+            next_ins = dget(dnext(scan))[mc:il_ins];
+            op = if (ins[mc:i_class] == mc:i_compute) ins[mc:i_aop] else null;
+            if (!branches && op != null
+                && lexists?(fn (v) v == op,
+                     list(mc:b_add, mc:b_subtract, mc:b_multiply,
+                          mc:b_divide, mc:b_remainder, mc:b_negate))
+                && !lexists?(fn (v) v[mc:v_class] == mc:v_function,
+                             ins[mc:i_aargs])
+                && ins[mc:i_adest][mc:v_class] == mc:v_local
+                && !ins[mc:i_adest][mc:v_indirect]
+                && next_ins != null && next_ins[mc:i_class] == mc:i_return
+                && next_ins[mc:i_rvalue] == ins[mc:i_adest]
+                && dnext(dnext(scan)) == ifn[mc:c_fvalue])
+              exit<function> false;
+            exit<function> true;
+          ];
+        if (ins != null && ins[mc:i_class] == mc:i_branch)
+          branches = true;
+        scan = dnext(scan);
+        if (scan == ifn[mc:c_fvalue]) exit false;
+      ]
+    ];
+
+  llvm_check_comparison_types = fn (args, types, w)
+    [
+      if ((car(types) & ~itype_integer) != 0)
+        llvm_emit_integer_type_check(car(args), w);
+      if ((cadr(types) & ~itype_integer) != 0)
+        llvm_emit_integer_type_check(cadr(args), w);
+    ];
+
+  llvm_check_typed_integer_args = fn (args, types, w)
+    if (!types || llength(types) != llength(args))
+      llvm_check_integer_args(args, w)
+    else
+      [
+        | arg, itypeset |
+        @(arg . args) = args;
+        @(itypeset . types) = types;
+        if ((itypeset & itype_integer) == 0)
+          writer:format(w,
+            "  call void @mudlle_check_integer(i64 %s)\n",
+            llvm_read_var(arg, w))
+        else if ((itypeset & ~itype_integer) != 0)
+          llvm_emit_integer_type_check(arg, w);
+        if (args != null)
+          llvm_check_typed_integer_args(args, types, w);
+      ];
+
+  llvm_emit_loop_check = fn (w)
+    [
+      | id, old_count, decremented, in_budget, slow_label, continue_label |
+      tmp_seq = tmp_seq + 1;
+      id = tmp_seq;
+      old_count = format("%%loop_count_old_%d", id);
+      decremented = format("%%loop_count_new_%d", id);
+      in_budget = format("%%loop_in_budget_%d", id);
+      slow_label = format("loop_limit_%d", id);
+      continue_label = format("loop_continue_%d", id);
+      writer:format(w,
+        "  %s = load atomic volatile i64, ptr @internal_xcount monotonic,\
+ align 8\n",
+        old_count);
+      writer:format(w, "  %s = sub i64 %s, 1\n", decremented, old_count);
+      writer:format(w,
+        "  store atomic volatile i64 %s, ptr @internal_xcount monotonic, align\
+ 8\n",
+        decremented);
+      writer:format(w, "  %s = icmp sgt i64 %s, 0\n",
+                    in_budget, decremented);
+      writer:format(w,
+        "  br i1 %s, label %%%s, label %%%s\n",
+        in_budget, continue_label, slow_label);
+      writer:format(w, "%s:\n", slow_label);
+      writer:write_line(w, "  call void @llvm_loop_slow_path()");
+      writer:format(w, "  br label %%%s\n", continue_label);
+      writer:format(w, "%s:\n", continue_label);
+    ];
+
+  // Materialize values one at a time into GC-visible slots. A later
+  // argument or the consuming runtime helper may trigger a moving collection.
+  llvm_emit_rooted_arguments = fn (args, prefix, w)
+    [
+      | count, id, values_array, slots_array, records_array, stack_mark,
+        root_token, slots_data, records_data, i, slot, slot_ptr,
+        values_ptr |
+      count = llength(args);
+      if (count == 0)
+        vector("null", "null", "null", 0)
+      else
+        [
+          tmp_seq = tmp_seq + 1;
+          id = tmp_seq;
+          values_array = format("%%%s_values_%d", prefix, id);
+          slots_array = format("%%%s_root_slots_%d", prefix, id);
+          records_array = format("%%%s_root_records_%d", prefix, id);
+          stack_mark = format("%%%s_stack_%d", prefix, id);
+          root_token = format("%%%s_roots_token_%d", prefix, id);
+          writer:format(w, "  %s = call ptr @llvm.stacksave()\n", stack_mark);
+          writer:format(w, "  %s = alloca [%d x i64]\n", values_array, count);
+          writer:format(w, "  %s = alloca [%d x ptr]\n", slots_array, count);
+          writer:format(w, "  %s = alloca [%d x { ptr, ptr }]\n", records_array,
+                        count);
+          i = 0;
+          while (i < count)
+            [
+              slot = format("%%%s_value_slot_%d_%d", prefix, id, i);
+              slot_ptr = format("%%%s_root_slot_ptr_%d_%d", prefix, id, i);
+              writer:format(w,
+                "  %s = getelementptr inbounds [%d x i64], ptr %s, i64 0, i64\
+ %d\n",
+                slot, count, values_array, i);
+              writer:format(w, "  store i64 0, ptr %s\n", slot);
+              writer:format(w,
+                "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64\
+ %d\n",
+                slot_ptr, count, slots_array, i);
+              writer:format(w, "  store ptr %s, ptr %s\n", slot, slot_ptr);
+              i = i + 1;
+            ];
+          slots_data = format("%%%s_root_slots_data_%d", prefix, id);
+          records_data = format("%%%s_root_records_data_%d", prefix, id);
+          writer:format(w,
+            "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64 0\n",
+            slots_data, count, slots_array);
+          writer:format(w,
+            "  %s = getelementptr inbounds [%d x { ptr, ptr }], ptr %s, i64 0,\
+ i64 0\n",
+            records_data, count, records_array);
+          writer:format(w,
+            "  %s = call ptr @mudlle_roots_enter(ptr %s,\
+ i64 %d, ptr %s)\n",
+            root_token, slots_data, count, records_data);
+          i = 0;
+          lforeach(fn (arg) [
+            | item_slot, item_value |
+            item_value = llvm_read_var(arg, w);
+            item_slot = format("%%%s_value_slot_%d_%d", prefix, id, i);
+            writer:format(w, "  store i64 %s, ptr %s\n", item_value, item_slot);
+            i = i + 1;
+          ], args);
+          values_ptr = format("%%%s_values_data_%d", prefix, id);
+          writer:format(w,
+            "  %s = getelementptr inbounds [%d x i64], ptr %s, i64 0, i64 0\n",
+            values_ptr, count, values_array);
+          vector(values_ptr, stack_mark, root_token, count)
+        ]
+    ];
+
+  // build_vector and call_global copy and root their input values before
+  // allocating. Their caller buffer is never read after the call. Only
+  // function materialization can collect while evaluating these arguments;
+  // retain the full temporary frame for that case. concat_strings instead
+  // reads its caller buffer after allocation and must keep the rooted path.
+  llvm_emit_copying_arguments = fn (args, prefix, w)
+    [
+      | id, count, values, mark, ptr, i, slot, item |
+      if (lexists?(fn (arg) arg[mc:v_class] == mc:v_function, args))
+        exit<function> llvm_emit_rooted_arguments(args, prefix, w);
+      count = llength(args);
+      if (count == 0) exit<function> vector("null", "null", "null", 0);
+      tmp_seq = tmp_seq + 1;
+      id = tmp_seq;
+      values = format("%%%s_values_%d", prefix, id);
+      mark = format("%%%s_stack_%d", prefix, id);
+      ptr = format("%%%s_values_data_%d", prefix, id);
+      writer:format(w, "  %s = call ptr @llvm.stacksave()\n", mark);
+      writer:format(w, "  %s = alloca [%d x i64]\n", values, count);
+      i = 0;
+      lforeach(fn (arg) [
+        item = llvm_read_var(arg, w);
+        slot = format("%%%s_value_slot_%d_%d", prefix, id, i);
+        writer:format(w,
+          "  %s = getelementptr [%d x i64], ptr %s, i64 0, i64 %d\n",
+          slot, count, values, i);
+        writer:format(w, "  store i64 %s, ptr %s\n", item, slot);
+        i = i + 1;
+      ], args);
+      writer:format(w,
+        "  %s = getelementptr [%d x i64], ptr %s, i64 0, i64 0\n",
+        ptr, count, values);
+      vector(ptr, mark, "null", count)
+    ];
+
+  // For a call to fadd/fsub/fmul/fdiv or fneg/fabs/fsqrt on non-function
+  // arguments: (index . unary?), else null. These can run on raw doubles.
+  llvm_float_call_op = fn (ins)
+    [
+      | args, fnv, names, found, idx, unary |
+      if (ins[mc:i_class] != mc:i_call) exit<function> null;
+      args = ins[mc:i_cargs];
+      fnv = car(args);
+      if (fnv[mc:v_class] != mc:v_global_constant
+          || lexists?(fn (v) v[mc:v_class] == mc:v_function, cdr(args)))
+        exit<function> null;
+      unary = llength(cdr(args)) == 1;
+      names = if (unary) '("fneg" "fabs" "fsqrt")
+              else if (llength(cdr(args)) == 2)
+                '("fadd" "fsub" "fmul" "fdiv")
+              else null;
+      found = -1;
+      idx = 0;
+      lforeach(fn (cand) [
+        if (found < 0 && string_equal?(fnv[mc:v_name], cand)) found = idx;
+        idx = idx + 1;
+      ], names);
+      if (found < 0) null else found . unary
+    ];
+
+  // Marks anonymous temporaries that are produced by a raw-double-capable
+  // float call and consumed exactly once, in the same basic block, by another
+  // one; such a value never needs a boxed float object.
+  llvm_find_float_temps = fn (ifn)
+    [
+      | uses, defs, produced, consumed, block, scan, il, ins, dest, key |
+      float_internal = make_table();
+      float_doubles = make_table();
+      float_consts = null;
+      if (!vector?(ifn[mc:c_fvalue])) exit<function> null;
+      uses = make_table();
+      defs = make_table();
+      produced = make_table();
+      consumed = make_table();
+      block = 0;
+      scan = ifn[mc:c_fvalue];
+      loop [
+        il = dget(scan);
+        if (il[mc:il_label]) block = block + 1;
+        ins = il[mc:il_ins];
+        if (ins != null)
+          [
+            lforeach(fn (v) [
+              if (vector?(v) && v[mc:v_class] == mc:v_local
+                  && slength(v[mc:v_name]) == 0)
+                [
+                  key = itoa(v[mc:v_number]);
+                  uses[key] = if (uses[key] == null) 1 else uses[key] + 1;
+                ];
+            ], mc:arguments(ins, null));
+            dest = if (ins[mc:i_class] == mc:i_closure
+                       || ins[mc:i_class] == mc:i_maybe_sconcat)
+              false
+            else mc:defined_var(ins);
+            if (dest && vector?(dest) && dest[mc:v_class] == mc:v_local
+                && slength(dest[mc:v_name]) == 0)
+              [
+                key = itoa(dest[mc:v_number]);
+                defs[key] = if (defs[key] == null) 1 else defs[key] + 1;
+                if (llvm_float_call_op(ins) != null)
+                  produced[key] = block;
+              ];
+            if (llvm_float_call_op(ins) != null)
+              lforeach(fn (v) [
+                if (vector?(v) && v[mc:v_class] == mc:v_local
+                    && slength(v[mc:v_name]) == 0)
+                  consumed[itoa(v[mc:v_number])] = block
+                else if (v[mc:v_class] == mc:v_constant
+                         && float?(v[mc:v_kvalue]))
+                  [
+                    key = llvm_constant_index(v[mc:v_kvalue]);
+                    if (!memq(key, float_consts))
+                      float_consts = key . float_consts;
+                  ];
+              ], cdr(ins[mc:i_cargs]));
+          ];
+        scan = dnext(scan);
+        if (scan == ifn[mc:c_fvalue]) exit 0;
+      ];
+      table_foreach(fn (@<k = b>) [
+        if (defs[k] == 1 && uses[k] == 1 && consumed[k] == b)
+          float_internal[k] = true;
+      ], produced);
+    ];
+
+  // True if 'ifn' takes exactly 'count' fixed arguments, no optional or
+  // variable-length ones.
+  llvm_exact_arity? = fn (ifn, count)
+    [
+      | info |
+      info = ifn[mc:c_farginfo];
+      info[mc:arginfo_nargs] == count
+        && info[mc:arginfo_noptargs] == 0
+        && !info[mc:arginfo_vararg]
+    ];
+
+  // Prove only a tiny, straight-line direct numeric leaf: one arithmetic
+  // compute over formal arguments or integer/null constants, then return that
+  // compute's local result. Its scalar inputs either produce an integer or
+  // raise; this helper is used only for direct calls with scalar inputs.
+  llvm_scalar_numeric_leaf? = fn (ifn)
+    [
+      | formals, cvalue, graph, blocks, valid, compute, returned, ins, op,
+        args, dest, formal_map |
+      if (ifn[mc:c_fnargs_var] || ifn[mc:c_farginfo][mc:arginfo_vararg]
+          || llength(ifn[mc:c_fclosure]) != 0
+          || lexists?(fn (v) v[mc:v_indirect], ifn[mc:c_flocals])
+          || lexists?(fn (fa) fa[0][0][mc:v_indirect],
+                      ifn[mc:c_ffullargs]))
+        exit<function> false;
+      formals = ifn[mc:c_ffullargs];
+      formal_map = make_table();
+      lforeach(fn (fa)
+        formal_map[itoa(fa[0][0][mc:v_number])] = true, formals);
+      cvalue = ifn[mc:c_fvalue];
+      // A compiled function is IR text paired with metadata, not a flow graph.
+      if (pair?(cvalue) && string?(car(cvalue))) exit<function> false;
+      blocks = 0;
+      valid = true;
+      compute = null;
+      returned = null;
+      ins = fn (il)
+        if (il[mc:il_ins] != null) [
+          | current, class |
+          current = il[mc:il_ins];
+          class = current[mc:i_class];
+          if (class == mc:i_compute && compute == null && returned == null)
+            compute = current
+          else if (class == mc:i_return && compute != null && returned == null)
+            returned = current
+          else
+            valid = false;
+        ];
+      if (pair?(cvalue) && vector?(cdr(cvalue))) [
+        graph = cdr(cvalue);
+        graph_nodes_apply(fn (node) [
+          blocks = blocks + 1;
+          dforeach(ins, graph_node_get(node)[mc:f_ilist]);
+        ], graph);
+      ] else if (vector?(cvalue)) [
+        blocks = 1;
+        dforeach(ins, cvalue);
+      ] else
+        exit<function> false;
+      if (!valid || blocks != 1 || compute == null || returned == null
+          || returned[mc:i_rvalue] != compute[mc:i_adest])
+        exit<function> false;
+      op = compute[mc:i_aop];
+      args = compute[mc:i_aargs];
+      dest = compute[mc:i_adest];
+      if (!lexists?(fn (x) x == op,
+                    list(mc:b_add, mc:b_subtract, mc:b_multiply,
+                         mc:b_divide, mc:b_remainder, mc:b_negate))
+          || dest[mc:v_class] != mc:v_local || dest[mc:v_indirect]
+          || llength(args) != (if (op == mc:b_negate) 1 else 2))
+        exit<function> false;
+      !lexists?(fn (v)
+        !(if (v[mc:v_class] == mc:v_constant)
+            integer?(v[mc:v_kvalue]) || v[mc:v_kvalue] == null
+          else
+            v[mc:v_class] == mc:v_local && !v[mc:v_indirect]
+              && formal_map[itoa(v[mc:v_number])] == true), args)
+    ];
+
+  // for_call: the closure is created only to be called at once, so a
+  // capture-free one may be shared between evaluations.
+  llvm_emit_closure = fn (ifn, w, for_call)
+    [
+      | cvars, ncaptures, tmp, res, captures_array, captures_ptr,
+        capture_index, parent_var, capture_value, parent_class, self_capture,
+        stack_mark, entry_address, args_index, args_metadata, root_slots,
+        root_records, root_slots_data, root_records_data, root_token,
+        slot_ptr, slot_index, capture_ptr |
+      cvars = ifn[mc:c_fclosure];
+      ncaptures = llength(cvars);
+      tmp_seq = tmp_seq + 1;
+      tmp = tmp_seq;
+      res = format("%%cls_%d", tmp);
+      self_capture = -1;
+      if (ncaptures == 0)
+        captures_ptr = "null"
+      else
+        [
+          stack_mark = format("%%closure_stack_%d", tmp);
+          captures_array = format("%%closure_captures_%d", tmp);
+          root_slots = format("%%closure_root_slots_%d", tmp);
+          root_records = format("%%closure_root_records_%d", tmp);
+          root_token = format("%%closure_roots_token_%d", tmp);
+          writer:format(w, "  %s = call ptr @llvm.stacksave()\n", stack_mark);
+          writer:format(w, "  %s = alloca [%d x i64]\n",
+                        captures_array, ncaptures);
+          writer:format(w, "  %s = alloca [%d x ptr]\n",
+                        root_slots, ncaptures);
+          writer:format(w, "  %s = alloca [%d x { ptr, ptr }]\n",
+                        root_records, ncaptures);
+          slot_index = 0;
+          while (slot_index < ncaptures)
+            [
+              capture_ptr = format("%%closure_capture_ptr_%d_%d", tmp,
+                                   slot_index);
+              slot_ptr = format("%%closure_root_slot_ptr_%d_%d", tmp,
+                                slot_index);
+              writer:format(w,
+                "  %s = getelementptr inbounds [%d x i64], ptr %s, i64 0, i64\
+ %d\n",
+                capture_ptr, ncaptures, captures_array, slot_index);
+              writer:format(w, "  store i64 1, ptr %s\n", capture_ptr);
+              writer:format(w,
+                "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64\
+ %d\n",
+                slot_ptr, ncaptures, root_slots, slot_index);
+              writer:format(w, "  store ptr %s, ptr %s\n", capture_ptr,
+                            slot_ptr);
+              slot_index = slot_index + 1;
+            ];
+          root_slots_data = format("%%closure_root_slots_data_%d", tmp);
+          root_records_data = format("%%closure_root_records_data_%d", tmp);
+          writer:format(w,
+            "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64 0\n",
+            root_slots_data, ncaptures, root_slots);
+          writer:format(w,
+            "  %s = getelementptr inbounds [%d x { ptr, ptr }], ptr %s, i64 0,\
+ i64 0\n",
+            root_records_data, ncaptures, root_records);
+          writer:format(w,
+            "  %s = call ptr @mudlle_roots_enter(ptr %s,\
+ i64 %d, ptr %s)\n",
+            root_token, root_slots_data, ncaptures, root_records_data);
+          capture_index = 0;
+          lforeach(fn (capture) [
+            parent_var = capture[mc:v_cparent];
+            capture_ptr = format("%%closure_capture_ptr_%d_%d",
+                                 tmp, capture_index);
+            if (parent_var == mc:myself)
+              [
+                self_capture = capture_index;
+                writer:format(w, "  store i64 1, ptr %s\n", capture_ptr);
+              ]
+            else
+              [
+                parent_class = parent_var[mc:v_class];
+                if (parent_var[mc:v_indirect]
+                    && parent_class != mc:v_global
+                    && parent_class != mc:v_global_constant
+                    && parent_class != mc:v_global_define)
+                  capture_value = llvm_read_var_storage(parent_var, w)
+                else
+                  capture_value = llvm_read_var(parent_var, w);
+                writer:format(w, "  store i64 %s, ptr %s\n",
+                              capture_value, capture_ptr);
+              ];
+            capture_index = capture_index + 1;
+          ], cvars);
+          captures_ptr = format("%%closure_captures_data_%d", tmp);
+          writer:format(w,
+            "  %s = getelementptr inbounds [%d x i64], ptr %s, i64 0, i64 0\n",
+            captures_ptr, ncaptures, captures_array);
+        ];
+      entry_address = format("%%closure_entry_%d", tmp);
+      writer:format(w, "  %s = ptrtoint ptr @entry_%d to i64\n",
+                    entry_address, ifn[mc:c_fnumber]);
+      args_index = llvm_constant_index(mc:function_closure_args(ifn));
+      args_metadata = format("%%closure_args_%d", tmp);
+      if (for_call && ncaptures == 0)
+        // Looks up a shared closure in IR; only a miss reads the metadata.
+        writer:format(w,
+          "  %s = call i64 @mudlle_closure_for_call(i64 %s, i64 %s, i64 %d,\
+ i64 %d, i64 %d)\n",
+          res, llvm_read_env(w), entry_address, llength(ifn[mc:c_ffullargs]),
+          args_index, ifn[mc:c_freturn_typeset])
+      else
+        [
+          writer:format(w,
+            "  %s = call i64 @llvm_constant_get(i64 %s, i64 %d)\n",
+            args_metadata, llvm_read_env(w), args_index);
+          writer:format(w,
+            "  %s = call i64 @llvm_make_function_closure(i64 %s, i64 %d,\
+ ptr %s, i64 %d, i64 %d, i64 %s, i64 %s, i64 %d)\n",
+            res, entry_address, llength(ifn[mc:c_ffullargs]), captures_ptr,
+            ncaptures, self_capture, llvm_read_env(w), args_metadata,
+            ifn[mc:c_freturn_typeset]);
+        ];
+      if (ncaptures != 0)
+        [
+          writer:format(w, "  call void @mudlle_roots_leave(ptr %s)\n",
+                        root_token);
+          writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
+                        stack_mark);
+        ];
+      res
+    ];
+
+  llvm_args_immutable? = fn (args, types)
+    [
+      | type, arg |
+      loop
+        [
+          if (args == null) exit true;
+          @(arg . args) = args;
+          if (types)
+            [
+              type = car(types);
+              types = cdr(types);
+            ]
+          else
+            [
+              type = mc:const_itype(arg);
+              if (!integer?(type)) type = itype_any;
+            ];
+          if (arg[mc:v_class] != mc:v_constant
+              && (type & ~(itype_null | itype_integer
+                           | itype_float | itype_bigint)) != 0)
+            exit false;
+        ];
+    ];
+
+  llvm_emit_vector = fn (args, readonly, types, w)
+    [
+      | rooted, ptr, stack_mark, root_token, count, result, immutable |
+      rooted = llvm_emit_copying_arguments(args, "vector", w);
+      ptr = rooted[0];
+      stack_mark = rooted[1];
+      root_token = rooted[2];
+      count = rooted[3];
+      immutable = readonly && llvm_args_immutable?(args, types);
+      tmp_seq = tmp_seq + 1;
+      result = format("%%vector_result_%d", tmp_seq);
+      writer:format(w,
+        "  %s = call i64 @llvm_build_vector(ptr %s, i64 %d, i64 %d, i64 %d)\n",
+        result, ptr, count, if (readonly) 1 else 0,
+        if (immutable) 1 else 0);
+      if (count != 0)
+        [
+          if (!string_equal?(root_token, "null"))
+            writer:format(w, "  call void @mudlle_roots_leave(ptr %s)\n",
+                          root_token);
+          writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
+                        stack_mark);
+        ];
+      result
+    ];
+
+  llvm_emit_concat = fn (args, w)
+    [
+      | rooted, ptr, count, result, stack_mark, root_token |
+      rooted = llvm_emit_rooted_arguments(args, "concat", w);
+      ptr = rooted[0];
+      stack_mark = rooted[1];
+      root_token = rooted[2];
+      count = rooted[3];
+      tmp_seq = tmp_seq + 1;
+      result = format("%%concat_result_%d", tmp_seq);
+      writer:format(w,
+        "  %s = call i64 @llvm_concat_strings(ptr %s, i64 %d)\n",
+        result, ptr, count);
+      if (count != 0)
+        [
+          writer:format(w, "  call void @mudlle_roots_leave(ptr %s)\n",
+                        root_token);
+          writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
+                        stack_mark);
+        ];
+      result
+    ];
+
+  llvm_emit_builtin = fn (op, args, w)
+    [
+      | name, name_index, name_value, caller, rooted, count, ptr,
+        stack_mark, root_token, result |
+      name = if (string?(op)) op
+        else if (op == mc:b_negate) "negate" else mc:builtin_names[op];
+      name_index = llvm_constant_index(name);
+      rooted = llvm_emit_copying_arguments(args, "builtin", w);
+      count = rooted[3];
+      ptr = rooted[0];
+      stack_mark = rooted[1];
+      root_token = rooted[2];
+      tmp_seq = tmp_seq + 1;
+      name_value = format("%%builtin_name_%d", tmp_seq);
+      caller = llvm_read_env(w);
+      writer:format(w,
+        "  %s = call i64 @llvm_constant_get(i64 %s, i64 %d)\n",
+        name_value, llvm_read_env(w), name_index);
+      result = format("%%builtin_result_%d", tmp_seq);
+      writer:format(w,
+        "  %s = call i64 @llvm_call_global(i64 %s, i64 %s, ptr %s, i64 %d)\n",
+        result, caller, name_value, ptr, count);
+      if (count != 0)
+        [
+          if (!string_equal?(root_token, "null"))
+            writer:format(w, "  call void @mudlle_roots_leave(ptr %s)\n",
+                          root_token);
+          writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
+                        stack_mark);
+        ];
+      result
+    ];
+
+  // Preserve the dynamic primitive fallback, but expose tagged integer
+  // arithmetic to LLVM. Integer arithmetic wraps exactly like x64; no nsw
+  // flags are valid here. Divisor zero must take the ordinary error path.
+  llvm_emit_binary_builtin = fn (op, args, w)
+    [
+      | a, b, id, tag, both, valid, nonzero, fast_label, slow_label,
+        join_label, first, second, raw, tagged, fast, slow, result |
+      if (lexists?(fn (v) v[mc:v_class] == mc:v_function, args))
+        exit<function> llvm_emit_builtin(op, args, w);
+      a = llvm_read_var(car(args), w);
+      b = llvm_read_var(cadr(args), w);
+      tmp_seq = tmp_seq + 1;
+      id = tmp_seq;
+      tag = format("%%ib_tag_%d", id);
+      both = format("%%ib_both_%d", id);
+      valid = format("%%ib_valid_%d", id);
+      fast_label = format("ib_fast_%d", id);
+      slow_label = format("ib_slow_%d", id);
+      join_label = format("ib_join_%d", id);
+      writer:format(w, "  %s = and i64 %s, %s\n", both, a, b);
+      writer:format(w, "  %s = and i64 %s, 1\n", tag, both);
+      writer:format(w, "  %s = icmp eq i64 %s, 1\n", valid, tag);
+      if (op == mc:b_divide || op == mc:b_remainder)
+        [
+          nonzero = format("%%ib_nonzero_%d", id);
+          both = format("%%ib_div_valid_%d", id);
+          writer:format(w, "  %s = icmp ne i64 %s, 1\n", nonzero, b);
+          writer:format(w, "  %s = and i1 %s, %s\n", both, valid, nonzero);
+          valid = both;
+        ];
+      writer:format(w, "  br i1 %s, label %%%s, label %%%s\n",
+                    valid, fast_label, slow_label);
+      writer:format(w, "%s:\n", fast_label);
+      raw = format("%%ib_raw_%d", id);
+      fast = format("%%ib_fast_value_%d", id);
+      if (op == mc:b_add || op == mc:b_subtract)
+        [
+          writer:format(w, "  %s = %s i64 %s, %s\n", raw,
+                        if (op == mc:b_add) "add" else "sub", a, b);
+          writer:format(w, "  %s = %s i64 %s, 1\n", fast,
+                        if (op == mc:b_add) "sub" else "add", raw);
+        ]
+      else
+        [
+          first = format("%%ib_first_%d", id);
+          second = format("%%ib_second_%d", id);
+          tagged = format("%%ib_tagged_%d", id);
+          writer:format(w, "  %s = ashr i64 %s, 1\n", first, a);
+          writer:format(w, "  %s = ashr i64 %s, 1\n", second, b);
+          writer:format(w, "  %s = %s i64 %s, %s\n", raw,
+                        if (op == mc:b_multiply) "mul"
+                        else if (op == mc:b_divide) "sdiv" else "srem",
+                        first, second);
+          writer:format(w, "  %s = shl i64 %s, 1\n", tagged, raw);
+          writer:format(w, "  %s = or i64 %s, 1\n", fast, tagged);
+        ];
+      writer:format(w, "  br label %%%s\n", join_label);
+      writer:format(w, "%s:\n", slow_label);
+      slow = llvm_emit_builtin(op, args, w);
+      writer:format(w, "  br label %%%s\n", join_label);
+      writer:format(w, "%s:\n", join_label);
+      result = format("%%ib_result_%d", id);
+      writer:format(w, "  %s = phi i64 [ %s, %%%s ], [ %s, %%%s ]\n",
+                    result, fast, fast_label, slow, slow_label);
+      result
+    ];
+
+  // Dynamic vector indexing keeps string/other reference semantics and all
+  // bounds/type failures on the existing runtime path. No interior address
+  // survives a collecting call: the fast path contains only a type query,
+  // arithmetic and a load.
+  llvm_emit_ref = fn (args, w)
+    [
+      | array, index, id, type_ok, tag, int_ok, valid, object, size,
+        bytes, length, raw_index, negative, from_end, normalized, in_bounds,
+        data, address, fast, slow, result, check_label, load_label,
+        slow_label, join_label |
+      if (lexists?(fn (v) v[mc:v_class] == mc:v_function, args))
+        exit<function> llvm_emit_builtin(mc:b_ref, args, w);
+      array = llvm_read_var(car(args), w);
+      index = llvm_read_var(cadr(args), w);
+      tmp_seq = tmp_seq + 1;
+      id = tmp_seq;
+      type_ok = format("%%vr_type_%d", id);
+      tag = format("%%vr_tag_%d", id);
+      int_ok = format("%%vr_int_%d", id);
+      valid = format("%%vr_valid_%d", id);
+      check_label = format("vr_check_%d", id);
+      load_label = format("vr_load_%d", id);
+      slow_label = format("vr_slow_%d", id);
+      join_label = format("vr_join_%d", id);
+      writer:format(w, "  %s = call i32 @mudlle_vector_matches(i64 %s)\n",
+                    type_ok, array);
+      writer:format(w, "  %s = icmp ne i32 %s, 0\n", valid, type_ok);
+      writer:format(w, "  %s = and i64 %s, 1\n", tag, index);
+      writer:format(w, "  %s = icmp eq i64 %s, 1\n", int_ok, tag);
+      type_ok = format("%%vr_both_%d", id);
+      writer:format(w, "  %s = and i1 %s, %s\n", type_ok, valid, int_ok);
+      writer:format(w, "  br i1 %s, label %%%s, label %%%s\n",
+                    type_ok, check_label, slow_label);
+      writer:format(w, "%s:\n", check_label);
+      object = format("%%vr_object_%d", id);
+      size = format("%%vr_size_%d", id);
+      bytes = format("%%vr_bytes_%d", id);
+      length = format("%%vr_length_%d", id);
+      raw_index = format("%%vr_index_%d", id);
+      negative = format("%%vr_negative_%d", id);
+      from_end = format("%%vr_from_end_%d", id);
+      normalized = format("%%vr_normalized_%d", id);
+      in_bounds = format("%%vr_bounds_%d", id);
+      writer:format(w, "  %s = inttoptr i64 %s to ptr\n", object, array);
+      writer:format(w, "  %s = load i64, ptr %s, align 8\n", size, object);
+      writer:format(w, "  %s = sub i64 %s, 16\n", bytes, size);
+      writer:format(w, "  %s = lshr i64 %s, 3\n", length, bytes);
+      writer:format(w, "  %s = ashr i64 %s, 1\n", raw_index, index);
+      writer:format(w, "  %s = icmp slt i64 %s, 0\n", negative, raw_index);
+      writer:format(w, "  %s = add i64 %s, %s\n", from_end, raw_index, length);
+      writer:format(w, "  %s = select i1 %s, i64 %s, i64 %s\n",
+                    normalized, negative, from_end, raw_index);
+      writer:format(w, "  %s = icmp ult i64 %s, %s\n",
+                    in_bounds, normalized, length);
+      writer:format(w, "  br i1 %s, label %%%s, label %%%s\n",
+                    in_bounds, load_label, slow_label);
+      writer:format(w, "%s:\n", load_label);
+      data = format("%%vr_data_%d", id);
+      address = format("%%vr_address_%d", id);
+      fast = format("%%vr_fast_value_%d", id);
+      writer:format(w, "  %s = getelementptr i8, ptr %s, i64 16\n", data, object);
+      writer:format(w, "  %s = getelementptr i64, ptr %s, i64 %s\n",
+                    address, data, normalized);
+      writer:format(w, "  %s = load i64, ptr %s, align 8\n", fast, address);
+      writer:format(w, "  br label %%%s\n", join_label);
+      writer:format(w, "%s:\n", slow_label);
+      slow = llvm_emit_builtin(mc:b_ref, args, w);
+      writer:format(w, "  br label %%%s\n", join_label);
+      writer:format(w, "%s:\n", join_label);
+      result = format("%%vr_result_%d", id);
+      writer:format(w, "  %s = phi i64 [ %s, %%%s ], [ %s, %%%s ]\n",
+                    result, fast, load_label, slow, slow_label);
+      result
+    ];
+
+  llvm_emit_set = fn (args, w)
+    [
+      | array, index, id, type_ok, tag, int_ok, valid, object, size,
+        bytes, length, raw_index, negative, from_end, normalized, in_bounds,
+        data, address, fast, slow, result, check_label, load_label,
+        slow_label, join_label, masked, newval, flagptr, flags, ro, rw_label |
+      if (lexists?(fn (v) v[mc:v_class] == mc:v_function, args))
+        exit<function> llvm_emit_builtin(mc:b_set, args, w);
+      array = llvm_read_var(car(args), w);
+      index = llvm_read_var(cadr(args), w);
+      newval = llvm_read_var(caddr(args), w);
+      tmp_seq = tmp_seq + 1;
+      id = tmp_seq;
+      type_ok = format("%%vs_type_%d", id);
+      tag = format("%%vs_tag_%d", id);
+      int_ok = format("%%vs_int_%d", id);
+      valid = format("%%vs_valid_%d", id);
+      check_label = format("vs_check_%d", id);
+      load_label = format("vs_load_%d", id);
+      slow_label = format("vs_slow_%d", id);
+      join_label = format("vs_join_%d", id);
+      writer:format(w, "  %s = call i32 @mudlle_vector_matches(i64 %s)\n",
+                    type_ok, array);
+      writer:format(w, "  %s = icmp ne i32 %s, 0\n", valid, type_ok);
+      writer:format(w, "  %s = and i64 %s, 1\n", tag, index);
+      writer:format(w, "  %s = icmp eq i64 %s, 1\n", int_ok, tag);
+      type_ok = format("%%vs_both_%d", id);
+      writer:format(w, "  %s = and i1 %s, %s\n", type_ok, valid, int_ok);
+      writer:format(w, "  br i1 %s, label %%%s, label %%%s\n",
+                    type_ok, check_label, slow_label);
+      writer:format(w, "%s:\n", check_label);
+      object = format("%%vs_object_%d", id);
+      size = format("%%vs_size_%d", id);
+      bytes = format("%%vs_bytes_%d", id);
+      length = format("%%vs_length_%d", id);
+      raw_index = format("%%vs_index_%d", id);
+      negative = format("%%vs_negative_%d", id);
+      from_end = format("%%vs_from_end_%d", id);
+      normalized = format("%%vs_normalized_%d", id);
+      in_bounds = format("%%vs_bounds_%d", id);
+      writer:format(w, "  %s = inttoptr i64 %s to ptr\n", object, array);
+      writer:format(w, "  %s = load i64, ptr %s, align 8\n", size, object);
+      writer:format(w, "  %s = sub i64 %s, 16\n", bytes, size);
+      writer:format(w, "  %s = lshr i64 %s, 3\n", length, bytes);
+      writer:format(w, "  %s = ashr i64 %s, 1\n", raw_index, index);
+      writer:format(w, "  %s = icmp slt i64 %s, 0\n", negative, raw_index);
+      writer:format(w, "  %s = add i64 %s, %s\n", from_end, raw_index, length);
+      writer:format(w, "  %s = select i1 %s, i64 %s, i64 %s\n",
+                    normalized, negative, from_end, raw_index);
+      writer:format(w, "  %s = icmp ult i64 %s, %s\n",
+                    in_bounds, normalized, length);
+      flagptr = format("%%vs_flagptr_%d", id);
+      flags = format("%%vs_flags_%d", id);
+      ro = format("%%vs_ro_%d", id);
+      rw_label = format("vs_rw_%d", id);
+      writer:format(w, "  br i1 %s, label %%%s, label %%%s\n",
+                    in_bounds, rw_label, slow_label);
+      writer:format(w, "%s:\n", rw_label);
+      writer:format(w, "  %s = getelementptr i8, ptr %s, i64 10\n", flagptr, object);
+      writer:format(w, "  %s = load i16, ptr %s, align 2\n", flags, flagptr);
+      masked = format("%%vs_masked_%d", id);
+      writer:format(w, "  %s = and i16 %s, 1\n", masked, flags);
+      writer:format(w, "  %s = icmp eq i16 %s, 0\n", ro, masked);
+      writer:format(w, "  br i1 %s, label %%%s, label %%%s\n",
+                    ro, load_label, slow_label);
+      writer:format(w, "%s:\n", load_label);
+      data = format("%%vs_data_%d", id);
+      address = format("%%vs_address_%d", id);
+      fast = format("%%vs_fast_value_%d", id);
+      writer:format(w, "  %s = getelementptr i8, ptr %s, i64 16\n", data, object);
+      writer:format(w, "  %s = getelementptr i64, ptr %s, i64 %s\n",
+                    address, data, normalized);
+      writer:format(w, "  store i64 %s, ptr %s, align 8\n", newval, address);
+      writer:format(w, "  br label %%%s\n", join_label);
+      writer:format(w, "%s:\n", slow_label);
+      slow = llvm_emit_builtin(mc:b_set, args, w);
+      writer:format(w, "  br label %%%s\n", join_label);
+      writer:format(w, "%s:\n", join_label);
+      result = format("%%vs_result_%d", id);
+      writer:format(w, "  %s = phi i64 [ %s, %%%s ], [ %s, %%%s ]\n",
+                    result, newval, load_label, slow, slow_label);
+      result
+    ];
+
+  llvm:mgen_preamble = fn (ifn, ainfo)
+    [
+      | fname, args, vars_seen, root_vars_seen, add_var, w, code, root_vars,
+        root_count, root_slots, root_records, root_slots_data,
+        root_records_data,
+        root_token, root_index, arg_no, scan, il, ins, defvar, args_seen |
+
+      function_root_scope_required = false;
+      w = writer:new_string();
+      closure_cache_fns = null;
+      closure_cache_seen = make_table();
+      known_args_max = 0;
+      if (pair?(ifn[mc:c_fvalue])) mc:flatten_blocks(ifn);
+      llvm_find_float_temps(ifn);
+      fname = format("fn_%d", ifn[mc:c_fnumber]);
+      args = lmap(fn (fa) fa[0][0], ifn[mc:c_ffullargs]);
+
+      // Function header
+      writer:format(w, "define i64 @%s(i64 %%env, ptr %%argv, i64 %%nargs",
+                    fname);
+      writer:write_line(w, ") {");
+      writer:write_line(w, "entry:");
+      writer:format(w,
+        "  call void @mudlle_check_arity(i64 %%nargs, i64 %d, i64 %d)\n",
+        ifn[mc:c_farginfo][mc:arginfo_nargs]
+          - ifn[mc:c_farginfo][mc:arginfo_noptargs],
+        if (ifn[mc:c_farginfo][mc:arginfo_vararg]) -1
+        else ifn[mc:c_farginfo][mc:arginfo_nargs]);
+      writer:write_line(w, "  call void @mudlle_function_entry()\n");
+
+      // Collect all variables used in function
+      vars_seen = make_table();
+      root_vars_seen = make_table();
+      root_vars = null;
+
+      add_var = fn (v)
+        [
+          if (vector?(v))
+            [
+              | class |
+              class = v[mc:v_class];
+              if (class == mc:v_global || class == mc:v_global_constant
+          || class == mc:v_global_define)
+                globals_seen[v[mc:v_name]] = v
+              else if (class != mc:v_constant && class != mc:v_function
+                       && class != mc:v_closure)
+                [
+                  | vnum |
+                  vnum = itoa(llvm_slot_number(v));
+                  vars_seen[vnum] = v;
+                  if (root_vars_seen[vnum] == null
+                      && (root_slot_indices == null
+                          || root_slot_indices[vnum] == true
+                          || !integer?(slot_indices[itoa(v[mc:v_number])])))
+                    [
+                      root_vars_seen[vnum] = true;
+                      root_vars = v . root_vars;
+                    ];
+                ];
+            ]
+        ];
+
+      args_seen = make_table();
+      lforeach(fn (arg) [
+        add_var(arg);
+        args_seen[itoa(llvm_slot_number(arg))] = true;
+      ], args);
+      if (ifn[mc:c_fnargs_var])
+        add_var(ifn[mc:c_fnargs_var][mc:vl_var]);
+      if (ifn[mc:c_flocals] != null)
+        lforeach(add_var, ifn[mc:c_flocals]);
+      if (pair?(ifn[mc:c_fvalue])) mc:flatten_blocks(ifn);
+      if (vector?(ifn[mc:c_fvalue]))
+        [
+          // Some temporaries (notably memory-read results) are not in
+          // c_flocals.
+          scan = ifn[mc:c_fvalue];
+          loop
+            [
+              il = dget(scan);
+              ins = il[mc:il_ins];
+              if (ins != null)
+                [
+                  if (function_roots_required
+                      && ins[mc:i_class] == mc:i_call)
+                    [
+                      | cargs, cvar, cifn |
+                      cargs = ins[mc:i_cargs];
+                      cvar = car(cargs);
+                      if ((cvar[mc:v_class] == mc:v_function
+                           && llvm_exact_arity?(cvar[mc:v_fvalue],
+                                                llength(cdr(cargs))))
+                          || (cvar[mc:v_class] == mc:v_closure
+                              && cvar[mc:v_cparent] == mc:myself
+                              && llvm_exact_arity?(ifn, llength(cdr(cargs)))))
+                        known_args_max = max(known_args_max,
+                                             llength(cdr(cargs)));
+                      if (cvar[mc:v_class] == mc:v_function)
+                        [
+                          cifn = cvar[mc:v_fvalue];
+                          if (llvm_exact_arity?(cifn, llength(cdr(cargs)))
+                              && llength(cifn[mc:c_fclosure]) == 0
+                              && closure_cache_seen[itoa(cifn[mc:c_fnumber])]
+                                 == null)
+                            [
+                              closure_cache_seen[itoa(cifn[mc:c_fnumber])]
+                                = true;
+                              closure_cache_fns
+                                = cifn[mc:c_fnumber] . closure_cache_fns;
+                            ];
+                        ];
+                    ];
+                  lforeach(add_var, mc:arguments(ins, null));
+                  if (ins[mc:i_class] == mc:i_memory
+                      && ins[mc:i_mop] == mc:memory_read)
+                    defvar = ins[mc:i_mscalar]
+                  else
+                    defvar = mc:defined_var(ins);
+                  if (defvar) add_var(defvar);
+                ];
+              scan = dnext(scan);
+              if (scan == ifn[mc:c_fvalue]) exit 0;
+            ]
+        ];
+
+      // Allocate slots for all variables
+      table_foreach(fn (@<_ = var>) [
+        writer:format(w, "  %%slot_%d = alloca i64\n", llvm_slot_number(var));
+        writer:format(w, "  store i64 1, ptr %%slot_%d\n",
+                      llvm_slot_number(var));
+      ], vars_seen);
+
+      // Keep Mudlle values in local slots visible to the garbage collector.
+      // The incoming closure environment can move during any allocating
+      // helper call; its call_llvm frame supplies the updated environment.
+      if (function_roots_required)
+        [
+          root_count = llength(root_vars) + llength(closure_cache_fns);
+          // The active call_llvm frame already roots our closure. Read it
+          // through that stable stack slot after allocations instead of
+          // maintaining a duplicate gcpro record for the environment.
+          writer:format(w,
+            "  %%env_frame_%d = load ptr, ptr @call_stack, align 8\n\
+  %%env_slot_%d = getelementptr inbounds i8, ptr %%env_frame_%d, i64 16\n",
+            ifn[mc:c_fnumber], ifn[mc:c_fnumber], ifn[mc:c_fnumber]);
+          if (known_args_max > 0)
+            writer:format(w, "  %%known_args = alloca [%d x i64]\n",
+                          known_args_max);
+          function_root_scope_required = root_count != 0;
+          if (function_root_scope_required)
+            [
+              root_token = format("%%roots_token_%d", ifn[mc:c_fnumber]);
+              root_slots = format("%%root_slots_%d", ifn[mc:c_fnumber]);
+              root_records = format("%%root_records_%d", ifn[mc:c_fnumber]);
+              writer:format(w, "  %s = alloca [%d x ptr]\n",
+                            root_slots, root_count);
+              writer:format(w, "  %s = alloca [%d x { ptr, ptr }]\n",
+                            root_records, root_count);
+              root_index = 0;
+              lforeach(fn (root_var) [
+                | slot_ptr |
+                slot_ptr = format("%%root_slot_ptr_%d_%d",
+                                  ifn[mc:c_fnumber], root_index);
+                writer:format(w,
+                  "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64\
+ %d\n",
+                  slot_ptr, root_count, root_slots, root_index);
+                writer:format(w, "  store ptr %%slot_%d, ptr %s\n",
+                              llvm_slot_number(root_var), slot_ptr);
+                root_index = root_index + 1;
+              ], root_vars);
+              lforeach(fn (cfn) [
+                | slot_ptr |
+                slot_ptr = format("%%root_slot_ptr_%d_%d",
+                                  ifn[mc:c_fnumber], root_index);
+                writer:format(w, "  %%ccache_%d = alloca i64\n", cfn);
+                writer:format(w, "  store i64 1, ptr %%ccache_%d\n", cfn);
+                writer:format(w,
+                  "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64\
+ %d\n",
+                  slot_ptr, root_count, root_slots, root_index);
+                writer:format(w, "  store ptr %%ccache_%d, ptr %s\n", cfn,
+                              slot_ptr);
+                root_index = root_index + 1;
+              ], closure_cache_fns);
+              root_slots_data = format("%%root_slots_data_%d", ifn[mc:c_fnumber]);
+              root_records_data = format("%%root_records_data_%d",
+                                         ifn[mc:c_fnumber]);
+              writer:format(w,
+                "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64 0\n",
+                root_slots_data, root_count, root_slots);
+              writer:format(w,
+                "  %s = getelementptr inbounds [%d x { ptr, ptr }], ptr %s,\
+ i64 0, i64 0\n",
+                root_records_data, root_count, root_records);
+              writer:format(w,
+                "  %s = call ptr @mudlle_roots_enter(ptr %s,\
+ i64 %d, ptr %s)\n",
+                root_token, root_slots_data, root_count, root_records_data);
+            ];
+        ];
+
+      // Load arguments only after local slots have been registered as roots.
+      arg_no = 0;
+      lforeach(fn (arg) [
+        | vnum, arg_value |
+        vnum = llvm_slot_number(arg);
+        if (arg_no == llength(args) - 1
+            && last_element(ifn[mc:c_ffullargs])[mc:fullarg_arg][1] == null)
+          [
+            arg_value = format("%%varargs_%d", ifn[mc:c_fnumber]);
+            writer:format(w,
+              "  %s = call i64 @llvm_make_varargs(ptr %%argv, i64 %%nargs, i64\
+ %d)\n",
+              arg_value, ifn[mc:c_farginfo][mc:arginfo_nargs] - 1);
+          ]
+        else
+          [
+            // Phase 3 can coalesce argument variables into the same slot.
+            // Each incoming load still needs its own LLVM SSA name.
+            arg_value = format("%%argvalue_%d_%d", ifn[mc:c_fnumber], arg_no);
+            writer:format(w,
+              "  %s = call i64 @mudlle_argument_get(ptr %%argv, i64 %%nargs, i64\
+ %d)\n",
+              arg_value, arg_no);
+          ];
+        writer:format(w, "  store i64 %s, ptr %%slot_%d\n", arg_value, vnum);
+        arg_no = arg_no + 1;
+      ], args);
+      if (ifn[mc:c_fnargs_var])
+        [
+          | nv, tagged_nargs, tagged_nargs_value |
+          nv = llvm_slot_number(ifn[mc:c_fnargs_var][mc:vl_var]);
+          tagged_nargs = format("%%tagged_nargs_%d", ifn[mc:c_fnumber]);
+          tagged_nargs_value = format("%%tagged_nargs_value_%d",
+                                      ifn[mc:c_fnumber]);
+          writer:format(w, "  %s = shl i64 %%nargs, 1\n", tagged_nargs);
+          writer:format(w, "  %s = or i64 %s, 1\n", tagged_nargs_value,
+                        tagged_nargs);
+          writer:format(w, "  store i64 %s, ptr %%slot_%d\n",
+                        tagged_nargs_value, nv);
+        ];
+
+      // Float literals used by raw-double arithmetic are fetched once.
+      lforeach(fn (idx) [
+        writer:format(w,
+          "  %%fcv_%d = call i64 @llvm_constant_get(i64 %s, i64 %d)\n\
+  %%fct_%d = call { double, i1 } @mudlle_try_double(i64 %%fcv_%d)\n\
+  %%fconst_%d = extractvalue { double, i1 } %%fct_%d, 0\n",
+          idx, llvm_read_env(w), idx, idx, idx, idx, idx);
+      ], float_consts);
+
+      // Box variables whose address escapes into a closure. Arguments retain
+      // their incoming value; other locals begin as null, like x64's allocator.
+      table_foreach(fn (@<_ = var>) [
+        if (var[mc:v_indirect])
+          [
+            | raw, cell |
+            if (args_seen[itoa(llvm_slot_number(var))])
+              [
+                raw = format("%%indirect_initial_%d", var[mc:v_number]);
+                writer:format(w, "  %s = load i64, ptr %%slot_%d\n",
+                              raw, llvm_slot_number(var));
+              ]
+            else
+              raw = "0";
+            cell = format("%%indirect_cell_%d", var[mc:v_number]);
+            writer:format(w,
+              "  %s = call i64 @llvm_variable_new(i64 %s)\n", cell, raw);
+            writer:format(w, "  store i64 %s, ptr %%slot_%d\n",
+                          cell, llvm_slot_number(var));
+          ];
+      ], vars_seen);
+
+      code = vector(ifn, w, false); // element 2 is terminated status
+      code
+    ];
+
+  llvm:mgen_instruction = fn (code, ifn, ainfo, il)
+    [
+      | w, ins, lbl_num, terminated |
+      w = code[1];
+      terminated = code[2];
+
+      if (il[mc:il_label])
+        [
+          lbl_num = il[mc:il_label][mc:l_number];
+          if (!terminated)
+            writer:format(w, "  br label %%L_%d\n", lbl_num);
+          writer:format(w, "L_%d:\n", lbl_num);
+          code[2] = false;
+          terminated = false;
+        ];
+
+      ins = il[mc:il_ins];
+      if (ins != null && !terminated)
+        [
+          gen_ins(ins, w);
+          if (ins[mc:i_class] == mc:i_return ||
+              (ins[mc:i_class] == mc:i_branch
+               && ins[mc:i_bop] == mc:branch_always) ||
+              (ins[mc:i_class] == mc:i_trap &&
+               (ins[mc:i_top] == mc:trap_always
+                || mc:trap_is_unreachable?(ins))))
+            code[2] = true;
+        ];
+    ];
+
+  llvm:assemble = fn (code)
+    [
+      | w, terminated, ir_str, info |
+      w = code[1];
+      terminated = code[2];
+
+      if (!terminated)
+        error(error_bad_value);
+
+      writer:write_line(w, "}\n");
+      ir_str = writer:get_string(w);
+
+      info = make_vector(mc:a_info_fields);
+      ir_str . info
+    ];
+
+  gen_function = fn (ifn, w)
+    [
+      | code, fval, scan, il, fname, cidx, ir, hpos |
+      if (pair?(ifn[mc:c_fvalue]) && string?(car(ifn[mc:c_fvalue]))
+          && string_search(car(ifn[mc:c_fvalue]), "define i64") >= 0)
+        [
+          writer:write(w, car(ifn[mc:c_fvalue]));
+          exit<function> null;
+        ];
+
+      current_ifn = ifn;
+      llvm_allocate_slots(ifn);
+      if (pair?(ifn[mc:c_fvalue])) mc:flatten_blocks(ifn);
+      function_roots_required = llvm_function_needs_roots?(ifn);
+      capture_indices = make_table();
+      cidx = 0;
+      lforeach(fn (cvar) [
+        capture_indices[itoa(cvar[mc:v_number])] = cidx;
+        cidx = cidx + 1;
+      ], ifn[mc:c_fclosure]);
+
+      code = llvm:mgen_preamble(ifn, null);
+      fval = ifn[mc:c_fvalue];
+      if (vector?(fval))
+        [
+          scan = fval;
+          loop
+            [
+              il = dget(scan);
+              llvm:mgen_instruction(code, ifn, null, il);
+              scan = dnext(scan);
+              if (scan == fval) exit 0
+            ]
+        ];
+      ir = car(llvm:assemble(code));
+      // Small functions are internal and always inlined, so statically known
+      // callers see their bodies; entry_N below keeps the exported bridge.
+      hpos = string_search(ir, ") {\n");
+      if (slength(ir) <= llvm_inline_max_size && hpos > 0)
+        [
+          writer:write(w, "define internal i64 @");
+          writer:write(w, substring(ir, 12, hpos - 11));
+          writer:write(w, " alwaysinline {\n");
+          writer:write(w, substring(ir, hpos + 4, slength(ir) - hpos - 4));
+        ]
+      else
+        writer:write(w, ir);
+
+      // Export the native argument-vector ABI to the runtime closure bridge.
+      fname = format("entry_%d", ifn[mc:c_fnumber]);
+      writer:format(w,
+        "define i64 @%s(i64 %%env, ptr %%args, i64 %%nargs) {\nentry:\n",
+        fname);
+      writer:format(w,
+                    "  %%entry_result = call i64 @fn_%d(i64 %%env, ptr %%args,\
+ i64 %%nargs",
+                    ifn[mc:c_fnumber]);
+      writer:write_line(w, ")");
+      writer:write_line(w, "  ret i64 %entry_result");
+      writer:write_line(w, "}\n");
+    ];
+
+  gen_ins = fn (vector ins, w)
+    [
+      | class |
+      class = ins[mc:i_class];
+
+      if (class == mc:i_compute)
+        [
+          | dest_var, op, args, types, integer_compare |
+          dest_var = ins[mc:i_adest];
+          op = ins[mc:i_aop];
+          args = ins[mc:i_aargs];
+          types = ins[mc:i_atypes];
+          integer_compare = (op == mc:b_lt || op == mc:b_le
+                             || op == mc:b_gt || op == mc:b_ge)
+            && llvm_integer_comparison?(types);
+          if (integer_compare)
+            llvm_check_comparison_types(args, types, w);
+          if (op == mc:b_iadd)
+            writer:format(w,
+              "  call void @mudlle_check_integer_pair(i64 %s, i64 %s)\n",
+              llvm_read_var(car(args), w),
+              llvm_read_var(cadr(args), w));
+          if (op == mc:b_bitand || op == mc:b_bitor || op == mc:b_bitxor
+              || op == mc:b_shift_left || op == mc:b_shift_right
+              || op == mc:b_bitnot)
+            llvm_check_integer_args(args, w);
+          if (op == mc:b_add || op == mc:b_subtract
+              || op == mc:b_multiply || op == mc:b_divide
+              || op == mc:b_remainder)
+            [
+              llvm_write_var(dest_var, llvm_emit_binary_builtin(op, args, w), w);
+              exit<function> null;
+            ];
+          if (op == mc:b_add || op == mc:b_subtract
+              || op == mc:b_multiply || op == mc:b_divide
+              || op == mc:b_remainder || op == mc:b_negate
+              || ((op == mc:b_lt || op == mc:b_le
+                   || op == mc:b_gt || op == mc:b_ge)
+                  && !integer_compare))
+            [
+              llvm_write_var(dest_var, llvm_emit_builtin(op, args, w), w);
+              exit<function> null;
+            ];
+          if (op == mc:b_vector || op == mc:b_sequence)
+            [
+              llvm_write_var(dest_var,
+                llvm_emit_vector(args, op == mc:b_sequence,
+                                 ins[mc:i_atypes], w), w);
+              exit<function> null;
+            ];
+          if (op == mc:b_iadd || op == mc:b_add)
+            [
+              | a1, a2, t1, t2 |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              t1 = format("%%add_%d", tmp_seq);
+              t2 = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = add i64 %s, %s\n", t1, a1, a2);
+              writer:format(w, "  %s = sub i64 %s, 1\n", t2, t1);
+              llvm_write_var(dest_var, t2, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_subtract)
+            [
+              | a1, a2, t1, t2 |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              t1 = format("%%sub_%d", tmp_seq);
+              t2 = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = sub i64 %s, %s\n", t1, a1, a2);
+              writer:format(w, "  %s = add i64 %s, 1\n", t2, t1);
+              llvm_write_var(dest_var, t2, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_multiply)
+            [
+              | a1, a2, u1, u2, m1, res |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              u1 = format("%%u1_%d", tmp_seq);
+              u2 = format("%%u2_%d", tmp_seq);
+              m1 = format("%%m1_%d", tmp_seq);
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = ashr i64 %s, 1\n", u1, a1);
+              writer:format(w, "  %s = sub i64 %s, 1\n", u2, a2);
+              writer:format(w, "  %s = mul i64 %s, %s\n", m1, u1, u2);
+              writer:format(w, "  %s = add i64 %s, 1\n", res, m1);
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_divide)
+            [
+              | a1, a2, u1, u2, d1, res, tagged_res |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              u1 = format("%%u1_%d", tmp_seq);
+              u2 = format("%%u2_%d", tmp_seq);
+              d1 = format("%%d1_%d", tmp_seq);
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = ashr i64 %s, 1\n", u1, a1);
+              writer:format(w, "  %s = ashr i64 %s, 1\n", u1, a1);
+              writer:format(w, "  %s = ashr i64 %s, 1\n", u2, a2);
+              writer:format(w, "  %s = sdiv i64 %s, %s\n", d1, u1, u2);
+              writer:format(w, "  %s = shl i64 %s, 1\n", res, d1);
+              tagged_res = format("%%tagged_div_%d", tmp_seq);
+              writer:format(w, "  %s = or i64 %s, 1\n", tagged_res, res);
+              llvm_write_var(dest_var, tagged_res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_bitand)
+            [
+              | a1, a2, res |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = and i64 %s, %s\n", res, a1, a2);
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_bitor)
+            [
+              | a1, a2, res |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = or i64 %s, %s\n", res, a1, a2);
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_bitxor)
+            [
+              | a1, a2, x1, res |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              x1 = format("%%x1_%d", tmp_seq);
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = xor i64 %s, %s\n", x1, a1, a2);
+              writer:format(w, "  %s = or i64 %s, 1\n", res, x1);
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_eq)
+            [
+              | a1, a2, cmp, res |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              cmp = format("%%cmp_%d", tmp_seq);
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = icmp eq i64 %s, %s\n", cmp, a1, a2);
+              writer:format(w, "  %s = select i1 %s, i64 3, i64 1\n", res, cmp);
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_ne)
+            [
+              | a1, a2, cmp, res |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              cmp = format("%%cmp_%d", tmp_seq);
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = icmp ne i64 %s, %s\n", cmp, a1, a2);
+              writer:format(w, "  %s = select i1 %s, i64 3, i64 1\n", res, cmp);
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_lt || op == mc:b_le
+                   || op == mc:b_gt || op == mc:b_ge)
+            [
+              | a1, a2, cmp, res, cmpop |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              cmpop = if (op == mc:b_lt) "slt"
+                else if (op == mc:b_le) "sle"
+                else if (op == mc:b_gt) "sgt" else "sge";
+              tmp_seq = tmp_seq + 1;
+              cmp = format("%%cmp_%d", tmp_seq);
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = icmp %s i64 %s, %s\n",
+                            cmp, cmpop, a1, a2);
+              writer:format(w, "  %s = select i1 %s, i64 3, i64 1\n", res, cmp);
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_remainder)
+            [
+              | a1, a2, u1, u2, rem, res, tagged_res |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              u1 = format("%%u1_%d", tmp_seq);
+              u2 = format("%%u2_%d", tmp_seq);
+              rem = format("%%rem_%d", tmp_seq);
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = ashr i64 %s, 1\n", u1, a1);
+              writer:format(w, "  %s = ashr i64 %s, 1\n", u2, a2);
+              writer:format(w, "  %s = srem i64 %s, %s\n", rem, u1, u2);
+              writer:format(w, "  %s = shl i64 %s, 1\n", res, rem);
+              tagged_res = format("%%tagged_rem_%d", tmp_seq);
+              writer:format(w, "  %s = or i64 %s, 1\n", tagged_res, res);
+              llvm_write_var(dest_var, tagged_res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_shift_left || op == mc:b_shift_right)
+            [
+              | a1, a2, u1, u2, shift_count, shifted, res, shiftop, tagged_res |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              u1 = format("%%u1_%d", tmp_seq);
+              u2 = format("%%u2_%d", tmp_seq);
+              shift_count = format("%%shift_count_%d", tmp_seq);
+              shifted = format("%%shift_%d", tmp_seq);
+              res = format("%%res_%d", tmp_seq);
+              shiftop = if (op == mc:b_shift_left) "shl" else "ashr";
+              writer:format(w, "  %s = ashr i64 %s, 1\n", u1, a1);
+              writer:format(w, "  %s = ashr i64 %s, 1\n", u2, a2);
+              writer:format(w, "  %s = and i64 %s, 63\n", shift_count, u2);
+              writer:format(w, "  %s = %s i64 %s, %s\n",
+                            shifted, shiftop, u1, shift_count);
+              writer:format(w, "  %s = shl i64 %s, 1\n", res, shifted);
+              tagged_res = format("%%tagged_shift_%d", tmp_seq);
+              writer:format(w, "  %s = or i64 %s, 1\n", tagged_res, res);
+              llvm_write_var(dest_var, tagged_res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_negate || op == mc:b_bitnot)
+            [
+              | arg, untagged, changed, res, tagged_res |
+              arg = llvm_read_var(car(args), w);
+              tmp_seq = tmp_seq + 1;
+              untagged = format("%%unboxed_%d", tmp_seq);
+              changed = format("%%changed_%d", tmp_seq);
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = ashr i64 %s, 1\n", untagged, arg);
+              if (op == mc:b_negate)
+                writer:format(w, "  %s = sub i64 0, %s\n", changed, untagged)
+              else
+                writer:format(w, "  %s = xor i64 %s, -1\n", changed, untagged);
+              writer:format(w, "  %s = shl i64 %s, 1\n", res, changed);
+              tagged_res = format("%%tagged_neg_%d", tmp_seq);
+              writer:format(w, "  %s = or i64 %s, 1\n", tagged_res, res);
+              llvm_write_var(dest_var, tagged_res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_logical_not)
+            [
+              | arg, cmp, res |
+              arg = llvm_read_var(car(args), w);
+              tmp_seq = tmp_seq + 1;
+              cmp = format("%%cmp_%d", tmp_seq);
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = icmp eq i64 %s, 1\n", cmp, arg);
+              writer:format(w, "  %s = select i1 %s, i64 3, i64 1\n", res, cmp);
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_logical_xor)
+            [
+              | a1, a2, truth1, truth2, xorv, res |
+              a1 = llvm_read_var(car(args), w);
+              a2 = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              truth1 = format("%%truth1_%d", tmp_seq);
+              truth2 = format("%%truth2_%d", tmp_seq);
+              xorv = format("%%xor_%d", tmp_seq);
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w, "  %s = icmp ne i64 %s, 1\n", truth1, a1);
+              writer:format(w, "  %s = icmp ne i64 %s, 1\n", truth2, a2);
+              writer:format(w, "  %s = xor i1 %s, %s\n", xorv, truth1, truth2);
+              writer:format(w, "  %s = select i1 %s, i64 3, i64 1\n", res,
+                            xorv);
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_car || op == mc:b_cdr)
+            [
+              | arg, res, helper |
+              arg = llvm_read_var(car(args), w);
+              tmp_seq = tmp_seq + 1;
+              res = format("%%res_%d", tmp_seq);
+              writer:format(w,
+                "  %s = call i64 @mudlle_pair_field(i64 %s, i64 %d)\n",
+                res, arg, if (op == mc:b_car) 16 else 24);
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_funcarg)
+            [
+              | arg_index, arg_value |
+              arg_index = car(args)[mc:v_kvalue];
+              tmp_seq = tmp_seq + 1;
+              arg_value = format("%%funcarg_%d", tmp_seq);
+              writer:format(w,
+                "  %s = call i64 @mudlle_argument_get(ptr %%argv, i64 %%nargs,\
+ i64 %d)\n",
+                arg_value, arg_index);
+              llvm_write_var(dest_var, arg_value, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_assign)
+            [
+              | a1 |
+              a1 = llvm_read_var(car(args), w);
+              llvm_write_var(dest_var, a1, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_ref)
+            [
+              llvm_write_var(dest_var, llvm_emit_ref(args, w), w);
+              exit<function> null;
+            ];
+          if (op == mc:b_set)
+            [
+              llvm_write_var(dest_var, llvm_emit_set(args, w), w);
+              exit<function> null;
+            ];
+          if (op == mc:b_vlength)
+            [
+              | value, result |
+              value = llvm_read_var(car(args), w);
+              tmp_seq = tmp_seq + 1;
+              result = format("%%vlength_%d", tmp_seq);
+              writer:format(w,
+                "  %s = call i64 @mudlle_vector_length(i64 %s)\n",
+                result, value);
+              llvm_write_var(dest_var, result, w);
+              exit<function> null;
+            ];
+          if ((op == mc:b_symbol_name || op == mc:b_symbol_get)
+              && !lexists?(fn (v) v[mc:v_class] == mc:v_function,args))
+            [
+              | value, id, fast, slow, result |
+              value = llvm_read_var(car(args),w);
+              tmp_seq = tmp_seq+1;
+              id = tmp_seq;
+              fast = format("%%symbol_fast_%d",id);
+              writer:format(w,
+                "  %%symbol_type_%d = call i32 @mudlle_has_type(i64 %s, i64 %d)\n\
+  %%symbol_ok_%d = icmp ne i32 %%symbol_type_%d, 0\n\
+  br i1 %%symbol_ok_%d, label %%symbol_load_%d, label %%symbol_slow_%d\nsymbol_load_%d:\n\
+  %%symbol_obj_%d = inttoptr i64 %s to ptr\n\
+  %%symbol_slot_%d = getelementptr inbounds i8, ptr %%symbol_obj_%d, i64 %d\n\
+  %s = load i64, ptr %%symbol_slot_%d, align 8\n\
+  br label %%symbol_join_%d\nsymbol_slow_%d:\n",
+                id,value,type_symbol,id,id,id,id,id,id,id,value,id,id,
+                if(op == mc:b_symbol_name) 16 else 24,fast,id,id,id);
+              slow = llvm_emit_builtin(op,args,w);
+              result = format("%%symbol_result_%d",id);
+              writer:format(w,
+                "  br label %%symbol_join_%d\nsymbol_join_%d:\n\
+  %s = phi i64 [ %s, %%symbol_load_%d ], [ %s, %%symbol_slow_%d ]\n",
+                id,id,result,fast,id,slow,id);
+              llvm_write_var(dest_var,result,w);
+              exit<function> null;
+            ];
+          if (op == mc:b_cons || op == mc:b_pcons)
+            [
+              | a, b, res |
+              a = llvm_read_var(car(args), w);
+              b = llvm_read_var(cadr(args), w);
+              tmp_seq = tmp_seq + 1;
+              res = format("%%cons_%d", tmp_seq);
+              writer:format(w, "  %s = call i64 @llvm_cons(i64 %s, i64 %s, i64 %d)\n",
+                            res, a, b, if (op == mc:b_pcons) 1 else 0);
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
+          if (op == mc:b_slength || op == mc:b_vlength
+                   || op == mc:b_typeof || op == mc:b_loop_count
+                   || op == mc:b_max_loop_count
+                   || op == mc:b_symbol_name || op == mc:b_symbol_get
+                   || op == mc:b_cons || op == mc:b_pcons
+                   || op == mc:b_ref || op == mc:b_set
+                   || op == mc:b_ffs)
+            [
+              llvm_write_var(dest_var, llvm_emit_builtin(op, args, w), w);
+              exit<function> null;
+            ];
+          error(error_bad_value)
+        ]
+      else if (class == mc:i_memory)
+        [
+          | array, array_ptr, field_ptr, value_str, offset |
+          tmp_seq = tmp_seq + 1;
+          array_ptr = format("%%array_%d", tmp_seq);
+          field_ptr = format("%%field_%d", tmp_seq);
+          offset = 16 + 8 * ins[mc:i_mindex];
+
+          if (ins[mc:i_mop] == mc:memory_read)
+            [
+              array = llvm_read_var(ins[mc:i_marray], w);
+              writer:format(w, "  %s = inttoptr i64 %s to ptr\n",
+                            array_ptr, array);
+              writer:format(w,
+                            "  %s = getelementptr inbounds i8, ptr %s,\
+ i64 %d\n",
+                            field_ptr, array_ptr, offset);
+              value_str = format("%%mem_%d", tmp_seq);
+              writer:format(w, "  %s = load i64, ptr %s\n", value_str,
+                            field_ptr);
+              llvm_write_var(ins[mc:i_mscalar], value_str, w);
+            ]
+          else if (ins[mc:i_mop] == mc:memory_write
+                   || ins[mc:i_mop] == mc:memory_write_safe)
+            [
+              if (ins[mc:i_mop] == mc:memory_write_safe)
+                [
+                  array = llvm_read_var(ins[mc:i_marray], w);
+                  writer:format(w,
+                    "  call void @mudlle_check_mutable(i64 %s)\n", array);
+                ];
+              value_str = llvm_read_var(ins[mc:i_mscalar], w);
+              array = llvm_read_var(ins[mc:i_marray], w);
+              writer:format(w, "  %s = inttoptr i64 %s to ptr\n",
+                            array_ptr, array);
+              writer:format(w,
+                            "  %s = getelementptr inbounds i8, ptr %s,\
+ i64 %d\n",
+                            field_ptr, array_ptr, offset);
+              writer:format(w, "  store i64 %s, ptr %s\n", value_str,
+                            field_ptr);
+            ]
+          else
+            error(error_bad_value);
+        ]
+      else if (class == mc:i_branch)
+        [
+          | op, dest_lbl, args, types |
+          op = ins[mc:i_bop];
+          dest_lbl = ins[mc:i_bdest][mc:l_number];
+          args = ins[mc:i_bargs];
+          types = ins[mc:i_btypes];
+          if (op == mc:branch_lt || op == mc:branch_ge
+              || op == mc:branch_le || op == mc:branch_gt)
+            if (llvm_integer_comparison?(types))
+              llvm_check_comparison_types(args, types, w)
+            else
+              llvm_check_integer_args(args, w);
+
+          if (op == mc:branch_never)
+            null
+          else if (op == mc:branch_always)
+            [
+              writer:format(w, "  br label %%L_%d\n", dest_lbl);
+            ]
+          else
+            [
+              | cmp, seq, v1, v2 |
+              tmp_seq = tmp_seq + 1;
+              seq = tmp_seq;
+              cmp = format("%%brcmp_%d", seq);
+
+              if (op == mc:branch_true)
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  writer:format(w, "  %s = icmp ne i64 %s, 1\n", cmp, v1);
+                ]
+              else if (op == mc:branch_false)
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  writer:format(w, "  %s = icmp eq i64 %s, 1\n", cmp, v1);
+                ]
+              else if (op == mc:branch_eq)
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  writer:format(w, "  %s = icmp eq i64 %s, %s\n", cmp, v1, v2);
+                ]
+              else if (op == mc:branch_ne)
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  writer:format(w, "  %s = icmp ne i64 %s, %s\n", cmp, v1, v2);
+                ]
+              else if (op == mc:branch_bitand || op == mc:branch_nbitand)
+                [
+                  | u1, u2, bits, predicate |
+                  writer:format(w,
+                    "  call void @mudlle_check_integer(i64 %s)\n",
+                    llvm_read_var(car(args), w));
+                  writer:format(w,
+                    "  call void @mudlle_check_integer(i64 %s)\n",
+                    llvm_read_var(cadr(args), w));
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  u1 = format("%%branch_u1_%d", seq);
+                  u2 = format("%%branch_u2_%d", seq);
+                  bits = format("%%branch_bits_%d", seq);
+                  writer:format(w, "  %s = ashr i64 %s, 1\n", u1, v1);
+                  writer:format(w, "  %s = ashr i64 %s, 1\n", u2, v2);
+                  writer:format(w, "  %s = and i64 %s, %s\n", bits, u1, u2);
+                  predicate = if (op == mc:branch_bitand) "ne" else "eq";
+                  writer:format(w, "  %s = icmp %s i64 %s, 0\n",
+                                cmp, predicate, bits);
+                ]
+              else if (op == mc:branch_bitset || op == mc:branch_bitclear)
+                [
+                  | bit_result |
+                  bit_result = llvm_emit_builtin("bit_set?", args, w);
+                  writer:format(w, "  %s = icmp %s i64 %s, 1\n", cmp,
+                    if (op == mc:branch_bitset) "ne" else "eq", bit_result);
+                ]
+              else if (op == mc:branch_xor || op == mc:branch_xnor)
+                [
+                  | truth1, truth2, xorv |
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  truth1 = format("%%branch_truth1_%d", seq);
+                  truth2 = format("%%branch_truth2_%d", seq);
+                  xorv = format("%%branch_xor_%d", seq);
+                  writer:format(w, "  %s = icmp ne i64 %s, 1\n", truth1, v1);
+                  writer:format(w, "  %s = icmp ne i64 %s, 1\n", truth2, v2);
+                  writer:format(w, "  %s = xor i1 %s, %s\n", xorv, truth1,
+                                truth2);
+                  if (op == mc:branch_xor)
+                    writer:format(w, "  %s = or i1 %s, false\n", cmp, xorv)
+                  else
+                    writer:format(w, "  %s = xor i1 %s, true\n", cmp, xorv);
+                ]
+              else if (op == mc:branch_vfind? || op == mc:branch_vnfind?)
+                [
+                  | found |
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  vector_find_required = true;
+                  found = format("%%vfind_%d", seq);
+                  writer:format(w,
+                    "  %s = call i32 @mudlle_vector_find(i64 %s, i64 %s)\n",
+                    found, v1, v2);
+                  writer:format(w, "  %s = icmp %s i32 %s, 0\n", cmp,
+                    if (op == mc:branch_vfind?) "ne" else "eq", found);
+                ]
+              else if (op == mc:branch_equal || op == mc:branch_nequal)
+                [
+                  | equal |
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  equal = format("%%equal_%d", seq);
+                  writer:format(w,
+                    "  %s = call i32 @llvm_equal(i64 %s, i64 %s)\n",
+                    equal, v1, v2);
+                  writer:format(w, "  %s = icmp %s i32 %s, 0\n", cmp,
+                    if (op == mc:branch_equal) "ne" else "eq", equal);
+                ]
+              else if (op == mc:branch_lt)
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  writer:format(w, "  %s = icmp slt i64 %s, %s\n", cmp, v1, v2);
+                ]
+              else if (op == mc:branch_ge)
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  writer:format(w, "  %s = icmp sge i64 %s, %s\n", cmp, v1, v2);
+                ]
+              else if (op == mc:branch_le)
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  writer:format(w, "  %s = icmp sle i64 %s, %s\n", cmp, v1, v2);
+                ]
+              else if (op == mc:branch_gt)
+                [
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  writer:format(w, "  %s = icmp sgt i64 %s, %s\n", cmp, v1, v2);
+                ]
+              else if (op >= mc:branch_slength && op < mc:branch_equal)
+                [
+                  | length, relation, kind, lenop |
+                  v1 = llvm_read_var(car(args), w);
+                  v2 = llvm_read_var(cadr(args), w);
+                  kind = if (op < mc:branch_vlength) 1 else 0;
+                  relation = if (kind == 1)
+                    op - mc:branch_slength else op - mc:branch_vlength;
+                  lenop = if (relation == 0) "eq"
+                    else if (relation == 1) "ne"
+                    else if (relation == 2) "slt"
+                    else if (relation == 3) "sge"
+                    else if (relation == 4) "sle" else "sgt";
+                  length = format("%%length_%d", seq);
+                  writer:format(w,
+                    "  %s = call i64 @llvm_object_length(i64 %s, i64 %d)\n",
+                    length, v1, kind);
+                  writer:format(w,
+                    "  %s = icmp %s i64 %s, %s\n", cmp, lenop, length, v2);
+                ]
+              else if ((op >= mc:branch_type? && op < mc:branch_ntype?)
+                       || (op >= mc:branch_ntype?
+                           && op < mc:branch_ntype?
+                             + mudlle_synthetic_types))
+                [
+                  | type_idx, matched_value |
+                  v1 = llvm_read_var(car(args), w);
+                  if (op < mc:branch_ntype?)
+                    type_idx = op - mc:branch_type?
+                  else
+                    type_idx = op - mc:branch_ntype?;
+                  matched_value = format("%%typematch_%d", seq);
+                  // Plain object types are a pointer test and a type byte
+                  // compare; typesets and immediates keep the runtime query.
+                  if (type_idx == type_pair || type_idx == type_vector
+                      || type_idx == type_string)
+                    writer:format(w,
+                      "  %s = call i32 @mudlle_has_type(i64 %s, i64 %d)\n",
+                      matched_value, v1, type_idx)
+                  else
+                    writer:format(w,
+                      "  %s = call i32 @llvm_type_matches(i64 %s, i64 %d)\n",
+                      matched_value, v1, type_idx);
+                  writer:format(w, "  %s = icmp %s i32 %s, 0\n", cmp,
+                    if (op < mc:branch_ntype?) "ne" else "eq", matched_value);
+                ]
+              else if (op >= mc:branch_immutable
+                       && op <= mc:branch_not_prim)
+                [
+                  | predicate, matched_value |
+                  v1 = llvm_read_var(car(args), w);
+                  predicate = op - mc:branch_immutable;
+                  if (op == mc:branch_any_prim) predicate = 4;
+                  if (op == mc:branch_not_prim) predicate = 5;
+                  matched_value = format("%%predicate_%d", seq);
+                  writer:format(w,
+                    "  %s = call i32 @llvm_predicate(i64 %s, i64 %d)\n",
+                    matched_value, v1, predicate);
+                  writer:format(w, "  %s = icmp ne i32 %s, 0\n", cmp,
+                                matched_value);
+                ]
+              else
+                error(error_bad_value);
+
+              writer:format(w, "  br i1 %s, label %%L_%d, label %%L_next_%d\n",
+                            cmp, dest_lbl, seq);
+              writer:format(w, "L_next_%d:\n", seq);
+            ];
+        ]
+      else if (class == mc:i_call)
+        [
+          | dest_var, fn_var, called_ifn, call_args, cname, res,
+            arg_array, arg_ptr, arg_index, stack_mark, root_count,
+            root_slots, root_records, root_token, root_slot_ptr,
+            root_slots_data, root_records_data, arg_count,
+            arg_slot, root_index, call_id, secure_call, floatop, floatres, floatunary,
+            direct_fn, self_call, chain, chain_internal, fop, static_args |
+          dest_var = ins[mc:i_cdest];
+          call_args = ins[mc:i_cargs];
+          fn_var = car(call_args);
+          call_args = cdr(call_args);
+          arg_count = llength(call_args);
+          secure_call = fn_var[mc:v_class] == mc:v_global_constant;
+          called_ifn = if (fn_var[mc:v_class] == mc:v_function)
+            fn_var[mc:v_fvalue] else null;
+
+          tmp_seq = tmp_seq + 1;
+          call_id = tmp_seq;
+          res = format("%%call_%d", call_id);
+          if (secure_call && arg_count == 3
+              && string_equal?(fn_var[mc:v_name], "set!"))
+            [
+              llvm_write_var(dest_var, llvm_emit_set(call_args, w), w);
+              exit<function> null;
+            ];
+          floatop = -1;
+          floatunary = false;
+          if (secure_call
+              && !lexists?(fn (v) v[mc:v_class] == mc:v_function, call_args))
+            [
+              | nm, names, idx |
+              nm = fn_var[mc:v_name];
+              if (arg_count == 2)
+                names = '("fadd" "fsub" "fmul" "fdiv" "fmod" "fcmp")
+              else if (arg_count == 1)
+                [
+                  names = '("fneg" "fabs" "fsqrt" "fexp" "flog" "fsin" "fcos"
+                            "ftan" "fatan" "fasin" "facos" "fceil" "ffloor"
+                            "fround" "ftrunc");
+                  floatunary = true;
+                ]
+              else names = null;
+              idx = 0;
+              lforeach(fn (cand) [
+                if (floatop < 0 && string_equal?(nm, cand)) floatop = idx;
+                idx = idx + 1;
+              ], names);
+            ];
+          chain = floatop >= 0 && llvm_float_call_op(ins) != null;
+          if (chain)
+            [
+              // Raw-double arithmetic: operands that are single-use float
+              // temporaries stay doubles; other operands are converted
+              // inline. Anything unconvertible takes the generic call.
+              | fid, k, allok, dnames, dn, tname, op_text, boxed |
+              fid = call_id;
+              chain_internal = float_internal[itoa(dest_var[mc:v_number])]
+                != null;
+              writer:format(w, "  br label %%fl_start_%d\nfl_start_%d:\n",
+                            fid, fid);
+              k = 0;
+              allok = "true";
+              dnames = null;
+              lforeach(fn (a) [
+                dn = if (a[mc:v_class] == mc:v_constant)
+                  [
+                    if (float?(a[mc:v_kvalue]))
+                      format("%%fconst_%d", llvm_constant_index(a[mc:v_kvalue]))
+                    else if (integer?(a[mc:v_kvalue]))
+                      [
+                        writer:format(w,
+                          "  %%fl_ci_%d_%d = sitofp i64 %d to double\n",
+                          fid, k, a[mc:v_kvalue]);
+                        format("%%fl_ci_%d_%d", fid, k)
+                      ]
+                    else null
+                  ]
+                else float_doubles[itoa(a[mc:v_number])];
+                if (dn == null)
+                  [
+                    tname = format("%%fl_t_%d_%d", fid, k);
+                    writer:format(w,
+                      "  %s = call { double, i1 } @mudlle_try_double(i64 %s)\n\
+  %%fl_d_%d_%d = extractvalue { double, i1 } %s, 0\n\
+  %%fl_o_%d_%d = extractvalue { double, i1 } %s, 1\n\
+  %%fl_a_%d_%d = and i1 %s, %%fl_o_%d_%d\n",
+                      tname, llvm_read_var(a, w), fid, k, tname, fid, k,
+                      tname, fid, k, allok, fid, k);
+                    dn = format("%%fl_d_%d_%d", fid, k);
+                    allok = format("%%fl_a_%d_%d", fid, k);
+                  ];
+                dnames = dn . dnames;
+                k = k + 1;
+              ], call_args);
+              dnames = lreverse!(dnames);
+              writer:format(w,
+                "  br i1 %s, label %%fl_compute_%d, label %%fl_slow_%d\nfl_compute_%d:\n",
+                allok, fid, fid, fid);
+              fop = car(llvm_float_call_op(ins));
+              if (floatunary)
+                op_text = if (fop == 0)
+                  format("fneg double %s", car(dnames))
+                else if (fop == 1)
+                  format("call double @llvm.fabs.f64(double %s)", car(dnames))
+                else
+                  format("call double @llvm.sqrt.f64(double %s)", car(dnames))
+              else
+                op_text = format("%s double %s, %s",
+                                 '["fadd" "fsub" "fmul" "fdiv"][fop],
+                                 car(dnames), cadr(dnames));
+              writer:format(w, "  %%fl_r_%d = %s\n", fid, op_text);
+              if (chain_internal)
+                floatres = ""
+              else
+                [
+                  floatres = format("%%fl_box_%d", fid);
+                  writer:format(w,
+                    "  %s = call i64 @llvm_box_float(double %%fl_r_%d)\n",
+                    floatres, fid);
+                ];
+              writer:format(w, "  br label %%fl_join_%d\nfl_slow_%d:\n",
+                            fid, fid);
+              // The generic call needs boxed operands.
+              k = 0;
+              lforeach(fn (a) [
+                if (a[mc:v_class] == mc:v_local
+                    && float_doubles[itoa(a[mc:v_number])] != null)
+                  [
+                    boxed = format("%%fl_bx_%d_%d", fid, k);
+                    writer:format(w,
+                      "  %s = call i64 @llvm_box_float(double %s)\n",
+                      boxed, float_doubles[itoa(a[mc:v_number])]);
+                    llvm_write_var(a, boxed, w);
+                  ];
+                k = k + 1;
+              ], call_args);
+            ]
+          else if (floatop >= 0)
+            [
+              // Direct float arithmetic; non-numeric operands fall through
+              // to the generic call so errors are unchanged.
+              | fa, fb, fid |
+              fa = llvm_read_var(car(call_args), w);
+              fb = if (floatunary) null else llvm_read_var(cadr(call_args), w);
+              fid = call_id;
+              floatres = format("%%fl_fast_%d", fid);
+              writer:format(w, "  br label %%fl_start_%d\nfl_start_%d:\n",
+                            fid, fid);
+              if (floatunary)
+                writer:format(w,
+                  "  %s = call i64 @llvm_float_unop(i64 %d, i64 %s)\n",
+                  floatres, floatop, fa)
+              else
+                writer:format(w,
+                  "  %s = call i64 @llvm_float_binop(i64 %d, i64 %s, i64 %s)\n",
+                  floatres, floatop, fa, fb);
+              writer:format(w,
+                "  %%fl_ok_%d = icmp ne i64 %s, 0\n  br i1 %%fl_ok_%d, label %%fl_join_%d, label %%fl_slow_%d\nfl_slow_%d:\n",
+                fid, floatres, fid, fid, fid, fid);
+            ];
+          if (secure_call)
+            [
+              // A constant global callee is read by the runtime after the
+              // arguments are copied; primitives need no generated roots.
+              | copied, primitive, direct_primitive, values, index |
+              primitive = global_value(fn_var[mc:v_goffset]);
+              direct_primitive = typeof(primitive) == type_primitive
+                && primitive_nargs(primitive) == arg_count;
+              // Only closure materialization needs a temporary rooted buffer
+              // while reading arguments. Ordinary arguments stay in SSA values
+              // and go directly to the primitive's native calling convention.
+              copied = if (!direct_primitive
+                           || lexists?(fn (v) v[mc:v_class] == mc:v_function,
+                                       call_args))
+                         llvm_emit_copying_arguments(call_args, "gcall", w)
+                       else null;
+              if (direct_primitive) [
+                primitive_arities[itoa(arg_count)] = true;
+                index = 0;
+                values = lmap(fn (arg) [
+                  | slot, value |
+                  if (copied == null)
+                    value = llvm_read_var(arg,w)
+                  else [
+                    slot = format("%%gcall_direct_slot_%d_%d",call_id,index);
+                    value = format("%%gcall_direct_arg_%d_%d",call_id,index);
+                    writer:format(w,
+                      "  %s = getelementptr inbounds i64, ptr %s, i64 %d\n\
+  %s = load i64, ptr %s, align 8\n",
+                      slot,copied[0],index,value,slot);
+                  ];
+                  index = index+1;
+                  value
+                ],call_args);
+                writer:format(w,
+                  "  %s = call i64 @mudlle_call_primitive_%d(i64 %d, i64 %s",
+                  res,arg_count,fn_var[mc:v_goffset],llvm_read_env(w));
+                lforeach(fn (value) writer:format(w,", i64 %s",value),values);
+                writer:write_line(w,")");
+              ] else
+                writer:format(w,
+                  "  %s = call i64 @llvm_call_global_constant(i64 %d, i64 %s,\
+ ptr %s, i64 %d)\n",
+                  res,fn_var[mc:v_goffset],llvm_read_env(w),copied[0],copied[3]);
+              if (copied != null && copied[3] != 0)
+                [
+                  if (!string_equal?(copied[2], "null"))
+                    writer:format(w, "  call void @mudlle_roots_leave(ptr %s)\n",
+                                  copied[2]);
+                  writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
+                                copied[1]);
+                ];
+              if (chain && chain_internal)
+                [
+                  writer:format(w,
+                    "  %%fl_st_%d = call { double, i1 } @mudlle_try_double(i64 %s)\n\
+  %%fl_sd_%d = extractvalue { double, i1 } %%fl_st_%d, 0\n\
+  br label %%fl_join_%d\nfl_join_%d:\n\
+  %%fl_dres_%d = phi double [ %%fl_r_%d, %%fl_compute_%d ], [ %%fl_sd_%d, %%fl_slow_%d ]\n",
+                    call_id, res, call_id, call_id, call_id, call_id,
+                    call_id, call_id, call_id, call_id, call_id);
+                  float_doubles[itoa(dest_var[mc:v_number])]
+                    = format("%%fl_dres_%d", call_id);
+                  exit<function> null;
+                ];
+              if (floatop >= 0)
+                [
+                  writer:format(w,
+                    "  br label %%fl_join_%d\nfl_join_%d:\n  %%fl_res_%d = phi i64 [ %s, %%%s_%d ], [ %s, %%fl_slow_%d ]\n",
+                    call_id, call_id, call_id, floatres,
+                    if (chain) "fl_compute" else "fl_start", call_id,
+                    res, call_id);
+                  res = format("%%fl_res_%d", call_id);
+                ];
+              llvm_write_var(dest_var, res, w);
+              exit<function> null;
+            ];
+          // A call to a known function with exactly this many fixed
+          // arguments, or a direct recursive call (the callee is the
+          // running closure), needs no callability checks.
+          direct_fn = null;
+          self_call = false;
+          if (called_ifn != null
+              && llvm_exact_arity?(called_ifn, arg_count))
+            direct_fn = called_ifn[mc:c_fnumber]
+          else if (called_ifn == null
+                   && fn_var[mc:v_class] == mc:v_closure
+                   && fn_var[mc:v_cparent] == mc:myself
+                   && llvm_exact_arity?(current_ifn, arg_count))
+            [
+              direct_fn = current_ifn[mc:c_fnumber];
+              self_call = true;
+            ];
+          if (direct_fn != null)
+            [
+              // The call frame owns the argument array (the collector
+              // forwards it), so the caller registers no roots for it. The
+              // arguments are read from the caller's rooted locals, and the
+              // callee closure is not held across an allocation.
+              // The argument array is one static alloca per function, so the
+              // loop body needs no stack save/restore.
+              static_args = arg_count > 0 && known_args_max >= arg_count;
+              stack_mark = format("%%call_stack_%d", call_id);
+              arg_array = if (static_args) "%known_args"
+                          else format("%%call_values_%d", call_id);
+              if (!static_args)
+                writer:format(w, "  %s = call ptr @llvm.stacksave()\n",
+                              stack_mark);
+              if (self_call)
+                cname = llvm_read_env(w)
+              else if (closure_cache_seen[itoa(direct_fn)] != null)
+                [
+                  // One shared closure per call site function and
+                  // invocation, kept in a rooted slot.
+                  | cc |
+                  cc = format("cc_%d", call_id);
+                  writer:format(w,
+                    "  %%%s_v = load i64, ptr %%ccache_%d\n\
+  %%%s_t = and i64 %%%s_v, 1\n\
+  %%%s_s = icmp ne i64 %%%s_t, 0\n\
+  br i1 %%%s_s, label %%%s_miss, label %%%s_hit\n%s_miss:\n",
+                    cc, direct_fn, cc, cc, cc, cc, cc, cc, cc, cc);
+                  cname = llvm_emit_closure(called_ifn, w, true);
+                  writer:format(w,
+                    "  store i64 %s, ptr %%ccache_%d\n\
+  br label %%%s_hit\n%s_hit:\n\
+  %%%s_c = load i64, ptr %%ccache_%d\n",
+                    cname, direct_fn, cc, cc, cc, direct_fn);
+                  cname = format("%%%s_c", cc);
+                ]
+              else
+                cname = llvm_emit_closure(called_ifn, w, true);
+              if (arg_count == 0)
+                arg_ptr = "null"
+              else
+                [
+                  if (!static_args)
+                    writer:format(w, "  %s = alloca [%d x i64]\n", arg_array,
+                                  arg_count);
+                  arg_index = 0;
+                  lforeach(fn (arg) [
+                    | value_slot, value_str |
+                    value_str = llvm_read_var(arg, w);
+                    value_slot = format("%%call_value_slot_%d_%d", call_id,
+                                        arg_index);
+                    writer:format(w,
+                      "  %s = getelementptr inbounds [%d x i64], ptr %s, i64\
+ 0, i64 %d\n",
+                      value_slot, arg_count, arg_array, arg_index);
+                    writer:format(w, "  store i64 %s, ptr %s\n", value_str,
+                                  value_slot);
+                    arg_index = arg_index + 1;
+                  ], call_args);
+                  arg_ptr = format("%%call_value_slot_%d_0", call_id);
+                ];
+              writer:format(w,
+                "  %s = call i64 @mudlle_call_known(i64 %s, ptr @fn_%d,\
+ ptr %s, i64 %d)\n",
+                res, cname, direct_fn, arg_ptr, arg_count);
+              if (!static_args)
+                writer:format(w,
+                  "  call void @llvm.stackrestore(ptr %s)\n", stack_mark);
+            ]
+          else
+          [
+              root_count = arg_count + 1;
+              arg_array = format("%%call_values_%d", call_id);
+              stack_mark = format("%%call_stack_%d", call_id);
+              root_slots = format("%%call_root_slots_%d", call_id);
+              root_records = format("%%call_root_records_%d", call_id);
+              root_token = format("%%call_roots_token_%d", call_id);
+              writer:format(w, "  %s = call ptr @llvm.stacksave()\n",
+                            stack_mark);
+              writer:format(w, "  %s = alloca [%d x i64]\n", arg_array,
+                            root_count);
+              writer:format(w, "  %s = alloca [%d x ptr]\n", root_slots,
+                            root_count);
+              writer:format(w, "  %s = alloca [%d x { ptr, ptr }]\n",
+                            root_records, root_count);
+              root_index = 0;
+              while (root_index < root_count)
+                [
+                  arg_slot = format("%%call_value_slot_%d_%d", call_id,
+                                    root_index);
+                  root_slot_ptr = format("%%call_root_slot_ptr_%d_%d", call_id,
+                                         root_index);
+                  writer:format(w,
+                    "  %s = getelementptr inbounds [%d x i64], ptr %s, i64 0,\
+ i64 %d\n",
+                    arg_slot, root_count, arg_array, root_index);
+                  writer:format(w, "  store i64 0, ptr %s\n", arg_slot);
+                  writer:format(w,
+                    "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0,\
+ i64 %d\n",
+                    root_slot_ptr, root_count, root_slots, root_index);
+                  writer:format(w, "  store ptr %s, ptr %s\n", arg_slot,
+                                root_slot_ptr);
+                  root_index = root_index + 1;
+                ];
+              root_slots_data = format("%%call_root_slots_data_%d", call_id);
+              root_records_data = format("%%call_root_records_data_%d",
+                                         call_id);
+              writer:format(w,
+                "  %s = getelementptr inbounds [%d x ptr], ptr %s, i64 0, i64\
+ 0\n",
+                root_slots_data, root_count, root_slots);
+              writer:format(w,
+                "  %s = getelementptr inbounds [%d x { ptr, ptr }], ptr %s,\
+ i64 0, i64 0\n",
+                root_records_data, root_count, root_records);
+              writer:format(w,
+                "  %s = call ptr @mudlle_roots_enter(ptr %s,\
+ i64 %d, ptr %s)\n",
+                root_token, root_slots_data, root_count, root_records_data);
+
+              cname = llvm_read_var(fn_var, w);
+              arg_slot = format("%%call_value_slot_%d_0", call_id);
+              writer:format(w, "  store i64 %s, ptr %s\n", cname, arg_slot);
+              arg_index = 0;
+              lforeach(fn (arg) [
+                | value_slot, value_str |
+                value_str = llvm_read_var(arg, w);
+                value_slot = format("%%call_value_slot_%d_%d", call_id,
+                                    arg_index + 1);
+                writer:format(w, "  store i64 %s, ptr %s\n", value_str,
+                              value_slot);
+                arg_index = arg_index + 1;
+              ], call_args);
+              cname = format("%%call_callee_reloaded_%d", call_id);
+              writer:format(w, "  %s = load i64, ptr %%call_value_slot_%d_0\n",
+                            cname, call_id);
+              if (arg_count == 0)
+                arg_ptr = "null"
+              else
+                [
+                  arg_ptr = format("%%call_args_data_%d", call_id);
+                  writer:format(w,
+                    "  %s = getelementptr inbounds [%d x i64], ptr %s, i64 0,\
+ i64 1\n",
+                    arg_ptr, root_count, arg_array);
+                ];
+              if (direct_fn != null)
+                writer:format(w,
+                  "  %s = call i64 @mudlle_call_known(i64 %s, ptr @fn_%d,\
+ ptr %s, i64 %d)\n",
+                  res, cname, direct_fn, arg_ptr, arg_count)
+              else
+                writer:format(w,
+                  "  %s = call i64 @llvm_call_value(i64 %s, i64 %s, ptr %s,\
+ i64 %d, i64 %d)\n",
+                  res, llvm_read_env(w), cname, arg_ptr, arg_count,
+                  if (secure_call) 1 else 0);
+              writer:format(w,
+                "  call void @mudlle_roots_leave(ptr %s)\n", root_token);
+              writer:format(w,
+                "  call void @llvm.stackrestore(ptr %s)\n", stack_mark);
+            ];
+          llvm_write_var(dest_var, res, w);
+        ]
+      else if (class == mc:i_closure)
+        [
+          | dest_var, ifn, res |
+          dest_var = ins[mc:i_fdest];
+          ifn = ins[mc:i_ffunction];
+          res = llvm_emit_closure(ifn, w, false);
+          llvm_write_var(dest_var, res, w);
+        ]
+      else if (class == mc:i_maybe_sconcat)
+        [
+          | res |
+          res = llvm_emit_concat(ins[mc:i_scargs], w);
+          llvm_write_var(ins[mc:i_scdest], res, w);
+        ]
+      else if (class == mc:i_return)
+        [
+          | rval |
+          rval = llvm_read_var(ins[mc:i_rvalue], w);
+          if (function_root_scope_required)
+            writer:format(w,
+              "  call void @mudlle_roots_leave(ptr %%roots_token_%d)\n",
+              current_ifn[mc:c_fnumber]);
+          writer:format(w, "  ret i64 %s\n", rval);
+        ]
+      else if (class == mc:i_trap)
+        [
+          | nerror, argument, args |
+          if (mc:trap_is_unreachable?(ins))
+            writer:write_line(w, "  unreachable")
+          else if (ins[mc:i_top] == mc:trap_always)
+            [
+              nerror = ins[mc:i_tdest];
+              argument = mc:trap_is_nomatch?(ins);
+              if (argument)
+                argument = llvm_read_var(argument, w)
+              else
+                argument = "0";
+              writer:format(w,
+                "  call void @llvm_raise_error(i64 %d, i64 %s)\n",
+                nerror, argument);
+              writer:write_line(w, "  unreachable");
+            ]
+          else if (ins[mc:i_top] == mc:trap_loop)
+            llvm_emit_loop_check(w)
+          else if (ins[mc:i_top] == mc:trap_type)
+            [
+              args = ins[mc:i_targs];
+              argument = llvm_read_var(car(args), w);
+              nerror = cadr(args)[mc:v_kvalue];
+              writer:format(w,
+                "  call void @%s(i64 %s, i64 %d)\n",
+                if (nerror == type_vector) "mudlle_check_vector" else "llvm_check_type",
+                argument, nerror);
+            ]
+          else if (ins[mc:i_top] == mc:trap_typeset)
+            [
+              args = ins[mc:i_targs];
+              argument = llvm_read_var(car(args), w);
+              nerror = cadr(args)[mc:v_kvalue];
+              writer:format(w,
+                "  call void @llvm_check_typeset(i64 %s, i64 %d, i64 %d)\n",
+                argument, nerror, caddr(args)[mc:v_kvalue]);
+            ]
+          else if (ins[mc:i_top] == mc:trap_global_read)
+            [
+              if (mc:update_maxseclev == true)
+                writer:format(w,
+                  "  call void @llvm_check_global_read(i64 %d)\n",
+                  car(ins[mc:i_targs])[mc:v_goffset]);
+            ]
+          else if (ins[mc:i_top] == mc:trap_global_write)
+            [
+              args = ins[mc:i_targs];
+              argument = llvm_read_var(cadr(args), w);
+              writer:format(w,
+                "  call void @llvm_check_global_write(i64 %d, i64 %s)\n",
+                car(args)[mc:v_goffset], argument);
+            ]
+          else if (ins[mc:i_top] == mc:trap_never)
+            null
+          else
+            error(error_bad_value);
+        ]
+      else if (class == mc:i_nop)
+        [
+          writer:write_line(w, "  ; nop");
+        ]
+      else
+        error(error_bad_value);
+    ];
+
+  mc:gen_llvm_function = gen_function;
+
+  mc:gen_llvm_ir = fn "mod, {writer,null} w, functions -> . Generates LLVM IR\
+ for module" (mod, {vector,null} w = null, fns = null)
+    [
+      | created_w |
+      vector_find_required = false;
+      primitive_arities = make_table();
+      globals_seen = make_table();
+      llvm_constant_list = null;
+      llvm_constant_values = null;
+      llvm_global_relocation_values = null;
+
+      if (fns == null)
+        if (vector?(mod[mc:m_body]) && vlength(mod[mc:m_body]) > 6
+            && pair?(mod[mc:m_body][mc:c_fvalue]))
+          fns = mc:all_functions(mod[mc:m_body])
+        else
+          [
+            mc:phase1(mod, 15, null);
+            mc:phase2(mod);
+            fns = mc:all_functions(mod[mc:m_body]);
+            mc:phase3(fns);
+          ];
+
+      if (w == null)
+        [
+          w = writer:new_string();
+          created_w = true;
+        ]
+      else
+        created_w = false;
+
+      // ORC supplies the host target and data layout when it loads this IR.
+
+      writer:write_line(w, "; Runtime declarations");
+      writer:write_line(w, "declare i64 @alloc(i64, i64)");
+      writer:write_line(w, "declare i64 @pcons(i64, i64)");
+      writer:write_line(w, "declare i64 @make_vector(i64)");
+      writer:write_line(w, "declare void @error(i64)\n");
+      writer:write_line(w,
+                        "declare i64 @llvm_call_value(i64, i64, ptr, i64,\
+ i64)\n");
+      writer:write_line(w,
+                        "declare i64 @llvm_call_global(i64, i64, ptr, i64)\n");
+      writer:write_line(w,
+                        "declare i64 @llvm_call_global_constant(i64, i64, ptr,\
+ i64)\n");
+      writer:write_line(w, "declare i64 @llvm_argument_get(ptr, i64, i64)\n");
+      writer:write_line(w, "declare i64 @llvm_make_varargs(ptr, i64, i64)\n");
+      writer:write_line(w, "declare void @llvm_check_arity(i64, i64, i64)\n");
+      writer:write_line(w,
+                        "declare i64 @llvm_build_vector(ptr, i64, i64, i64)\n");
+      writer:write_line(w, "declare i64 @llvm_concat_strings(ptr, i64)\n");
+      writer:write_line(w,
+                        "declare i64 @llvm_make_function_closure(i64, i64,\
+ ptr, i64, i64, i64, i64, i64)\n");
+      writer:write_line(w, "declare i64 @llvm_constant_get(i64, i64)\n");
+      writer:write_line(w, "declare i64 @llvm_closure_capture_get(i64, i64)\n");
+      writer:write_line(w,
+                        "declare void @llvm_closure_capture_set(i64, i64,\
+ i64)\n");
+      writer:write_line(w, "declare i64 @llvm_variable_new(i64)\n");
+      writer:write_line(w, "declare i64 @llvm_variable_get(i64)\n");
+      writer:write_line(w, "declare void @llvm_variable_set(i64, i64)\n");
+      writer:write_line(w, "declare void @llvm_raise_error(i64, i64)\n");
+      writer:write_line(w, "declare void @llvm_loop_check()\n");
+      writer:write_line(w, "declare void @llvm_loop_slow_path()\n");
+      writer:write_line(w, "@internal_xcount = external global i64\n");
+      writer:write_line(w, "declare void @llvm_check_type(i64, i64)\n");
+      // Test pointer tags before reading the object header. Failure retains
+      // the runtime diagnostic path and its offending value.
+      writer:format(w, """
+define internal i32 @mudlle_vector_matches(i64 %%value) {
+entry:
+  %%tag = and i64 %%value, 1
+  %%even = icmp eq i64 %%tag, 0
+  %%nonnull = icmp ne i64 %%value, 0
+  %%pointer = and i1 %%even, %%nonnull
+  br i1 %%pointer, label %%header, label %%no
+header:
+  %%object = inttoptr i64 %%value to ptr
+  %%typeptr = getelementptr i8, ptr %%object, i64 9
+  %%type = load i8, ptr %%typeptr, align 1
+  %%matches = icmp eq i8 %%type, %d
+  %%result = zext i1 %%matches to i32
+  ret i32 %%result
+no:
+  ret i32 0
+}
+""", type_vector);
+      // Root registration in IR: link one record per slot onto the runtime's
+      // gcpro chain exactly as llvm_gc_roots_enter does, so LLVM can inline
+      // it and unroll the loop for constant slot counts.
+      writer:write_line(w, "@gcpro = external global ptr\n");
+      writer:format(w, """
+define internal ptr @mudlle_roots_enter(ptr %%slots, i64 %%n, ptr %%records) {
+entry:
+  %%old = load ptr, ptr @gcpro, align 8
+  %%empty = icmp eq i64 %%n, 0
+  br i1 %%empty, label %%done, label %%loop
+loop:
+  %%i = phi i64 [ 0, %%entry ], [ %%next, %%loop ]
+  %%prev = phi ptr [ %%old, %%entry ], [ %%rec, %%loop ]
+  %%rec = getelementptr inbounds { ptr, ptr }, ptr %%records, i64 %%i
+  %%slotp = getelementptr inbounds ptr, ptr %%slots, i64 %%i
+  %%slot = load ptr, ptr %%slotp, align 8
+  store ptr %%prev, ptr %%rec, align 8
+  %%objp = getelementptr inbounds i8, ptr %%rec, i64 8
+  store ptr %%slot, ptr %%objp, align 8
+  %%next = add i64 %%i, 1
+  %%more = icmp ult i64 %%next, %%n
+  br i1 %%more, label %%loop, label %%fin
+fin:
+  store ptr %%rec, ptr @gcpro, align 8
+  br label %%done
+done:
+  ret ptr %%old
+}
+define internal void @mudlle_roots_leave(ptr %%old) {
+entry:
+  store ptr %%old, ptr @gcpro, align 8
+  ret void
+}
+""");
+      // Function entry in IR. The arity check, the loop budget with the stack
+      // limit, and the argument fetch only call the runtime to raise errors
+      // or service the profiler.
+      writer:write_line(w, "@mudlle_stack_limit = external global i64\n");
+      writer:format(w, """
+define internal void @mudlle_check_arity(i64 %%nargs, i64 %%min, i64 %%max) {
+entry:
+  %%low = icmp slt i64 %%nargs, %%min
+  %%hasmax = icmp sge i64 %%max, 0
+  %%high = icmp sgt i64 %%nargs, %%max
+  %%toomany = and i1 %%hasmax, %%high
+  %%bad = or i1 %%low, %%toomany
+  br i1 %%bad, label %%slow, label %%ok
+slow:
+  call void @llvm_check_arity(i64 %%nargs, i64 %%min, i64 %%max)
+  ret void
+ok:
+  ret void
+}
+define internal i64 @mudlle_argument_get(ptr %%argv, i64 %%nargs, i64 %%index) {
+entry:
+  %%inrange = icmp ult i64 %%index, %%nargs
+  %%present = icmp ne ptr %%argv, null
+  %%ok = and i1 %%inrange, %%present
+  br i1 %%ok, label %%load, label %%none
+load:
+  %%slot = getelementptr inbounds i64, ptr %%argv, i64 %%index
+  %%value = load i64, ptr %%slot, align 8
+  ret i64 %%value
+none:
+  ret i64 0
+}
+define internal void @mudlle_function_entry() {
+entry:
+  %%old = load atomic volatile i64, ptr @internal_xcount monotonic, align 8
+  %%budget = icmp sgt i64 %%old, 1
+  br i1 %%budget, label %%fast, label %%slow
+fast:
+  %%new = sub i64 %%old, 1
+  store atomic volatile i64 %%new, ptr @internal_xcount monotonic, align 8
+  %%sp = call ptr @llvm.stacksave()
+  %%spi = ptrtoint ptr %%sp to i64
+  %%limit = load i64, ptr @mudlle_stack_limit, align 8
+  %%room = icmp uge i64 %%spi, %%limit
+  br i1 %%room, label %%done, label %%slow
+slow:
+  call void @llvm_loop_check()
+  ret void
+done:
+  ret void
+}
+""");
+      // Direct call of a statically known LLVM function from LLVM code: the
+      // callee is a closure of the same module, so it has the caller's
+      // security level, its arity is known, and no callability checks are
+      // needed. Builds the same call_llvm frame as llvm_invoke_closure (layouts
+      // are checked in runtime/llvm.c). It leaves internal_seclevel alone:
+      // llvm_call_value, llvm_call_global and llvm_call_global_constant set
+      // it from the calling closure's own code before a primitive can read
+      // it, and restore it afterwards (regression/llvm-known-call-seclevel.mud).
+      writer:write_line(w, "@call_stack = external global ptr\n");
+      writer:write_line(w, "@internal_seclevel = external global i8\n");
+      writer:write_line(w, "@seclevel_valid = external global i8\n");
+      writer:format(w, """
+define internal i64 @mudlle_call_known(i64 %%callee, ptr %%target, ptr %%argv, i64 %%nargs) alwaysinline {
+entry:
+  %%frame = alloca [7 x i64], align 8
+  %%cobj = inttoptr i64 %%callee to ptr
+  %%codeslot = getelementptr inbounds i8, ptr %%cobj, i64 16
+  %%code = load i64, ptr %%codeslot, align 8
+  %%top = load ptr, ptr @call_stack, align 8
+  store ptr %%top, ptr %%frame, align 8
+  %%f1 = getelementptr inbounds i64, ptr %%frame, i64 1
+  store i64 11, ptr %%f1, align 8
+  %%f2 = getelementptr inbounds i64, ptr %%frame, i64 2
+  store i64 %%callee, ptr %%f2, align 8
+  %%f3 = getelementptr inbounds i64, ptr %%frame, i64 3
+  store i64 %%code, ptr %%f3, align 8
+  %%f4 = getelementptr inbounds i64, ptr %%frame, i64 4
+  store i64 0, ptr %%f4, align 8
+  %%f5 = getelementptr inbounds i64, ptr %%frame, i64 5
+  %%argi = ptrtoint ptr %%argv to i64
+  store i64 %%argi, ptr %%f5, align 8
+  %%f6 = getelementptr inbounds i64, ptr %%frame, i64 6
+  %%nargsoff = or i64 %%nargs, -8589934592
+  store i64 %%nargsoff, ptr %%f6, align 8
+  store ptr %%frame, ptr @call_stack, align 8
+  %%res = call i64 %%target(i64 %%callee, ptr %%argv, i64 %%nargs)
+  store ptr %%top, ptr @call_stack, align 8
+  ret i64 %%res
+}
+""");
+      // Shared capture-free closure for an immediate call: the same direct-mapped
+      // cache as llvm_make_function_closure_for_call, probed without a call.
+      writer:write_line(w, "@llvm_call_closure_cache = external global ptr\n");
+      writer:format(w, """
+define internal i64 @mudlle_closure_for_call(i64 %%env, i64 %%address, i64 %%nargs, i64 %%argsindex, i64 %%rettypes) {
+entry:
+  %%envp = inttoptr i64 %%env to ptr
+  %%v1slot = getelementptr inbounds i8, ptr %%envp, i64 32
+  %%v1 = load ptr, ptr %%v1slot, align 8
+  %%cache = load ptr, ptr @llvm_call_closure_cache, align 8
+  %%havev = icmp ne ptr %%v1, null
+  %%havec = icmp ne ptr %%cache, null
+  %%usable = and i1 %%havev, %%havec
+  br i1 %%usable, label %%look, label %%slow
+look:
+  %%cslot = getelementptr inbounds i8, ptr %%v1, i64 16
+  %%cs = load i64, ptr %%cslot, align 8
+  %%a4 = lshr i64 %%address, 4
+  %%c4 = lshr i64 %%cs, 4
+  %%h = xor i64 %%a4, %%c4
+  %%slotno = and i64 %%h, 63
+  %%off = mul i64 %%slotno, 24
+  %%base = getelementptr inbounds i8, ptr %%cache, i64 16
+  %%cent = getelementptr inbounds i8, ptr %%base, i64 %%off
+  %%e0 = load i64, ptr %%cent, align 8
+  %%e1p = getelementptr inbounds i8, ptr %%cent, i64 8
+  %%e1 = load i64, ptr %%e1p, align 8
+  %%e2p = getelementptr inbounds i8, ptr %%cent, i64 16
+  %%e2 = load i64, ptr %%e2p, align 8
+  %%tagged = shl i64 %%address, 1
+  %%want = or i64 %%tagged, 1
+  %%m0 = icmp eq i64 %%e0, %%want
+  %%m1 = icmp eq i64 %%e1, %%cs
+  %%m2 = icmp ne i64 %%e2, 0
+  %%m01 = and i1 %%m0, %%m1
+  %%hit = and i1 %%m01, %%m2
+  br i1 %%hit, label %%done, label %%slow
+done:
+  ret i64 %%e2
+slow:
+  %%md = call i64 @llvm_constant_get(i64 %%env, i64 %%argsindex)
+  %%cl = call i64 @llvm_make_function_closure_for_call(i64 %%address, i64 %%nargs, ptr null, i64 0, i64 -1, i64 %%env, i64 %%md, i64 %%rettypes)
+  ret i64 %%cl
+}
+""");
+      // Writable heap object: pointer tag, then the read-only flag bit. The
+      // runtime check raises the diagnostics for everything else.
+      writer:format(w, """
+define internal void @mudlle_check_mutable(i64 %%value) {
+entry:
+  %%tag = and i64 %%value, 1
+  %%even = icmp eq i64 %%tag, 0
+  %%nonnull = icmp ne i64 %%value, 0
+  %%pointer = and i1 %%even, %%nonnull
+  br i1 %%pointer, label %%header, label %%slow
+header:
+  %%object = inttoptr i64 %%value to ptr
+  %%flagptr = getelementptr i8, ptr %%object, i64 10
+  %%flags = load i16, ptr %%flagptr, align 2
+  %%masked = and i16 %%flags, 1
+  %%writable = icmp eq i16 %%masked, 0
+  br i1 %%writable, label %%done, label %%slow
+slow:
+  call void @llvm_check_mutable(i64 %%value)
+  ret void
+done:
+  ret void
+}
+""");
+      writer:format(w, """
+define internal { double, i1 } @mudlle_try_double(i64 %%value) {
+entry:
+  %%tag = and i64 %%value, 1
+  %%isint = icmp ne i64 %%tag, 0
+  br i1 %%isint, label %%int, label %%object
+int:
+  %%shifted = ashr i64 %%value, 1
+  %%d = sitofp i64 %%shifted to double
+  %%ri = insertvalue { double, i1 } poison, double %%d, 0
+  %%rii = insertvalue { double, i1 } %%ri, i1 true, 1
+  ret { double, i1 } %%rii
+object:
+  %%nonnull = icmp ne i64 %%value, 0
+  br i1 %%nonnull, label %%header, label %%no
+header:
+  %%p = inttoptr i64 %%value to ptr
+  %%typeptr = getelementptr i8, ptr %%p, i64 9
+  %%type = load i8, ptr %%typeptr, align 1
+  %%isfloat = icmp eq i8 %%type, %d
+  br i1 %%isfloat, label %%load, label %%no
+load:
+  %%dptr = getelementptr i8, ptr %%p, i64 16
+  %%f = load double, ptr %%dptr, align 8
+  %%rf = insertvalue { double, i1 } poison, double %%f, 0
+  %%rff = insertvalue { double, i1 } %%rf, i1 true, 1
+  ret { double, i1 } %%rff
+no:
+  ret { double, i1 } { double 0.0, i1 false }
+}
+""", type_float);
+      writer:format(w, """
+define internal i32 @mudlle_has_type(i64 %%value, i64 %%expected) {
+entry:
+  %%tag = and i64 %%value, 1
+  %%even = icmp eq i64 %%tag, 0
+  %%nonnull = icmp ne i64 %%value, 0
+  %%pointer = and i1 %%even, %%nonnull
+  br i1 %%pointer, label %%header, label %%no
+header:
+  %%object = inttoptr i64 %%value to ptr
+  %%typeptr = getelementptr i8, ptr %%object, i64 9
+  %%type = load i8, ptr %%typeptr, align 1
+  %%want = trunc i64 %%expected to i8
+  %%matches = icmp eq i8 %%type, %%want
+  %%result = zext i1 %%matches to i32
+  ret i32 %%result
+no:
+  ret i32 0
+}
+""");
+      // Pair access and vector length: tag and type test, then a direct load.
+      // Failures call the runtime helpers, which raise the usual diagnostics.
+      writer:format(w, """
+define internal i64 @mudlle_pair_field(i64 %%value, i64 %%offset) {
+entry:
+  %%tag = and i64 %%value, 1
+  %%even = icmp eq i64 %%tag, 0
+  %%nonnull = icmp ne i64 %%value, 0
+  %%pointer = and i1 %%even, %%nonnull
+  br i1 %%pointer, label %%header, label %%slow
+header:
+  %%object = inttoptr i64 %%value to ptr
+  %%typeptr = getelementptr i8, ptr %%object, i64 9
+  %%type = load i8, ptr %%typeptr, align 1
+  %%matches = icmp eq i8 %%type, %d
+  br i1 %%matches, label %%fast, label %%slow
+fast:
+  %%fieldptr = getelementptr i8, ptr %%object, i64 %%offset
+  %%field = load i64, ptr %%fieldptr, align 8
+  ret i64 %%field
+slow:
+  %%isdr = icmp eq i64 %%offset, 24
+  br i1 %%isdr, label %%slow_cdr, label %%slow_car
+slow_car:
+  %%c0 = call i64 @llvm_pair_car(i64 %%value)
+  ret i64 %%c0
+slow_cdr:
+  %%c1 = call i64 @llvm_pair_cdr(i64 %%value)
+  ret i64 %%c1
+}
+define internal i64 @mudlle_vector_length(i64 %%value) {
+entry:
+  %%matches = call i32 @mudlle_vector_matches(i64 %%value)
+  %%ok = icmp ne i32 %%matches, 0
+  br i1 %%ok, label %%fast, label %%slow
+fast:
+  %%object = inttoptr i64 %%value to ptr
+  %%size = load i64, ptr %%object, align 8
+  %%bytes = sub i64 %%size, 16
+  %%length = lshr i64 %%bytes, 3
+  %%shifted = shl i64 %%length, 1
+  %%tagged = or i64 %%shifted, 1
+  ret i64 %%tagged
+slow:
+  %%r = call i64 @llvm_object_length(i64 %%value, i64 0)
+  ret i64 %%r
+}
+""", type_pair);
+      writer:format(w, """
+define internal void @mudlle_check_vector(i64 %%value, i64 %%expected) {
+entry:
+  %%matches = call i32 @mudlle_vector_matches(i64 %%value)
+  %%ok = icmp ne i32 %%matches, 0
+  br i1 %%ok, label %%done, label %%slow
+slow:
+  call void @llvm_check_type(i64 %%value, i64 %%expected)
+  unreachable
+done:
+  ret void
+}
+""");
+      writer:write_line(w, "declare void @llvm_check_integer_pair(i64, i64)\n");
+      writer:write_line(w,
+        "define internal void @mudlle_check_integer(i64 %value) {");
+      writer:write_line(w, "entry:");
+      writer:write_line(w, "  %tag = and i64 %value, 1");
+      writer:write_line(w, "  %ok_test = icmp eq i64 %tag, 1");
+      writer:write_line(w, "  br i1 %ok_test, label %ok, label %slow");
+      writer:write_line(w, "slow:");
+      writer:write_line(w,
+        "  call void @llvm_check_type(i64 %value, i64 7)");
+      writer:write_line(w, "  unreachable");
+      writer:write_line(w, "ok:");
+      writer:write_line(w, "  ret void");
+      writer:write_line(w, "}\n");
+      writer:write_line(w,
+        "define internal void @mudlle_check_integer_pair(i64 %a, i64 %b) {");
+      writer:write_line(w, "entry:");
+      writer:write_line(w, "  %a_tag = and i64 %a, 1");
+      writer:write_line(w, "  %a_ok = icmp eq i64 %a_tag, 1");
+      writer:write_line(w, "  %b_tag = and i64 %b, 1");
+      writer:write_line(w, "  %b_ok = icmp eq i64 %b_tag, 1");
+      writer:write_line(w, "  %both_ok = and i1 %a_ok, %b_ok");
+      writer:write_line(w, "  br i1 %both_ok, label %ok, label %slow");
+      writer:write_line(w, "slow:");
+      writer:write_line(w,
+        "  call void @llvm_check_integer_pair(i64 %a, i64 %b)");
+      writer:write_line(w, "  unreachable");
+      writer:write_line(w, "ok:");
+      writer:write_line(w, "  ret void");
+      writer:write_line(w, "}\n");
+      writer:write_line(w, "declare void @llvm_check_typeset(i64, i64, i64)\n");
+      writer:write_line(w, "declare void @llvm_check_mutable(i64)\n");
+      writer:write_line(w, "declare i32 @llvm_type_matches(i64, i64)\n");
+      writer:write_line(w, "declare i64 @llvm_object_length(i64, i64)\n");
+      writer:write_line(w, "declare i32 @llvm_predicate(i64, i64)\n");
+      writer:write_line(w, "declare i32 @llvm_vector_find(i64, i64)\n");
+      writer:write_line(w, "declare i64 @llvm_pair_car(i64)\n");
+      writer:write_line(w, "declare i64 @llvm_make_function_closure_for_call(i64, i64, ptr, i64, i64, i64, i64, i64)\n");
+      writer:write_line(w, "declare i64 @llvm_box_float(double)\n");
+      writer:write_line(w, "declare double @llvm.fabs.f64(double)\n");
+      writer:write_line(w, "declare double @llvm.sqrt.f64(double)\n");
+      writer:write_line(w, "declare i64 @llvm_cons(i64, i64, i64)\n");
+      writer:write_line(w, "declare i64 @llvm_float_binop(i64, i64, i64)\n");
+      writer:write_line(w, "declare i64 @llvm_float_unop(i64, i64)\n");
+      writer:write_line(w, "declare i64 @llvm_pair_cdr(i64)\n");
+      writer:write_line(w, "declare i32 @llvm_equal(i64, i64)\n");
+      writer:write_line(w, "declare ptr @llvm_gc_roots_enter(ptr, i64, ptr)\n");
+      writer:write_line(w, "declare void @llvm_gc_roots_leave(ptr)\n");
+      writer:write_line(w, "declare i64 @llvm_global_read(i64)\n");
+      writer:write_line(w, "declare void @llvm_check_global_read(i64)\n");
+      writer:write_line(w, "declare void @llvm_global_write(i64, i64)\n");
+      writer:write_line(w, "declare void @llvm_check_global_write(i64, i64)\n");
+      writer:write_line(w, "declare ptr @llvm.stacksave()\n");
+      writer:write_line(w, "declare void @llvm.stackrestore(ptr)\n");
+
+      lforeach(fn (ifn) gen_function(ifn, w), fns);
+      // Like x64's fixed primitive calls, pass values directly to the native
+      // function pointer. Retain the global helper for relocated globals that
+      // are no longer the expected plain primitive. Argument slots are owned
+      // by the caller just as on the existing global-constant path.
+      writer:write_line(w, "@llvm_primitive_nargs_offset = external constant i64");
+      writer:write_line(w, "@env_values = external global ptr");
+      table_foreach(fn (@<arity = _>) [
+        | n, i |
+        n = atoi(arity);
+        writer:format(w,"define internal i64 @mudlle_call_primitive_%d(i64 %%offset, i64 %%caller",n);
+        i = 0;
+        while (i < n) [
+          writer:format(w,", i64 %%a_%d",i);
+          i = i+1;
+        ];
+        writer:format(w, """
+) alwaysinline {
+entry:
+  %%values = load ptr, ptr @env_values, align 8
+  %%size = load i64, ptr %%values, align 8
+  %%words = lshr i64 %%size, 3
+  %%length = sub i64 %%words, 2
+  %%inrange = icmp ult i64 %%offset, %%length
+  br i1 %%inrange, label %%global, label %%fallback
+global:
+  %%data = getelementptr inbounds i8, ptr %%values, i64 16
+  %%slot = getelementptr inbounds i64, ptr %%data, i64 %%offset
+  %%fn = load i64, ptr %%slot, align 8
+  %%tag = and i64 %%fn, 1
+  %%pointer = icmp eq i64 %%tag, 0
+  %%nonnull = icmp ne i64 %%fn, 0
+  %%object = and i1 %%pointer, %%nonnull
+  br i1 %%object, label %%type, label %%fallback
+type:
+  %%obj = inttoptr i64 %%fn to ptr
+  %%ts = getelementptr inbounds i8, ptr %%obj, i64 9
+  %%t = load i8, ptr %%ts, align 1
+  %%plain = icmp eq i8 %%t, %d
+  br i1 %%plain, label %%arity, label %%fallback
+arity:
+  %%ops = getelementptr inbounds i8, ptr %%obj, i64 16
+  %%op = load ptr, ptr %%ops, align 8
+  %%noff = load i64, ptr @llvm_primitive_nargs_offset, align 8
+  %%ns = getelementptr inbounds i8, ptr %%op, i64 %%noff
+  %%n = load i16, ptr %%ns, align 2
+  %%exact = icmp eq i16 %%n, %d
+  br i1 %%exact, label %%direct, label %%fallback
+direct:
+  %%targetslot = getelementptr inbounds i8, ptr %%op, i64 16
+  %%target = load ptr, ptr %%targetslot, align 8
+""", type_primitive,n);
+        writer:write(w, "  %result = call i64 %target(");
+        i = 0;
+        while (i < n) [
+          if (i > 0) writer:write(w, ", ");
+          writer:format(w, "i64 %%a_%d", i);
+          i = i+1;
+        ];
+        writer:write_line(w, ")");
+        writer:write_line(w, """
+  ret i64 %result
+fallback:
+""");
+        if (n > 0) [
+          writer:format(w,"  %%mark = call ptr @llvm.stacksave()\n  %%argv = alloca [%d x i64], align 8\n",n);
+          i = 0;
+          while (i < n) [
+            writer:format(w,"  %%as_%d = getelementptr inbounds i64, ptr %%argv, i64 %d\n  store i64 %%a_%d, ptr %%as_%d, align 8\n",i,i,i,i);
+            i = i+1;
+          ];
+        ];
+        writer:format(w,"  %%generic = call i64 @llvm_call_global_constant(i64 %%offset, i64 %%caller, ptr %s, i64 %d)\n",if (n > 0) "%argv" else "null",n);
+        if (n > 0) writer:write_line(w,"  call void @llvm.stackrestore(ptr %mark)");
+        writer:write_line(w,"  ret i64 %generic\n}\n");
+      ], primitive_arities);
+      // A bounded, call-free OR reduction gives LLVM a real SIMD opportunity
+      // without changing language-loop accounting. Stop after each 32-word
+      // chunk, retaining short-circuit behavior between chunks and in the tail.
+      if (vector_find_required)
+        writer:write_line(w, """
+define internal i1 @mudlle_vector_find_chunk(ptr %data, i64 %needle) {
+entry:
+  br label %scan
+scan:
+  %i = phi i64 [ 0, %entry ], [ %next, %scan ]
+  %found = phi i1 [ false, %entry ], [ %combined, %scan ]
+  %address = getelementptr i64, ptr %data, i64 %i
+  %value = load i64, ptr %address, align 8
+  %match = icmp eq i64 %value, %needle
+  %combined = or i1 %found, %match
+  %next = add nuw nsw i64 %i, 1
+  %done = icmp eq i64 %next, 32
+  br i1 %done, label %exit, label %scan
+exit:
+  ret i1 %combined
+}
+define internal i32 @mudlle_vector_find(i64 %needle, i64 %haystack) {
+entry:
+  %tagged_length = call i64 @llvm_object_length(i64 %haystack, i64 0)
+  %length = lshr i64 %tagged_length, 1
+  %object = inttoptr i64 %haystack to ptr
+  %data = getelementptr i8, ptr %object, i64 16
+  %chunks_end = and i64 %length, -32
+  br label %chunks
+chunks:
+  %offset = phi i64 [ 0, %entry ], [ %next_chunk, %chunk_miss ]
+  %has_chunk = icmp ult i64 %offset, %chunks_end
+  br i1 %has_chunk, label %chunk_body, label %tail
+chunk_body:
+  %chunk_data = getelementptr i64, ptr %data, i64 %offset
+  %chunk_found = call i1 @mudlle_vector_find_chunk(ptr %chunk_data, i64 %needle)
+  br i1 %chunk_found, label %found, label %chunk_miss
+chunk_miss:
+  %next_chunk = add i64 %offset, 32
+  br label %chunks
+tail:
+  %index = phi i64 [ %offset, %chunks ], [ %next_tail, %tail_miss ]
+  %has_tail = icmp ult i64 %index, %length
+  br i1 %has_tail, label %tail_body, label %absent
+tail_body:
+  %tail_address = getelementptr i64, ptr %data, i64 %index
+  %tail_value = load i64, ptr %tail_address, align 8
+  %tail_match = icmp eq i64 %tail_value, %needle
+  br i1 %tail_match, label %found, label %tail_miss
+tail_miss:
+  %next_tail = add i64 %index, 1
+  br label %tail
+found:
+  ret i32 1
+absent:
+  ret i32 0
+}
+""");
+
+      llvm_constant_values = lmap(fn (entry) car(entry),
+                                  lreverse!(llvm_constant_list));
+      table_foreach(fn (@<name = var>) [
+        llvm_global_relocation_values =
+          vector(var[mc:v_goffset], name) . llvm_global_relocation_values;
+      ], globals_seen);
+
+      if (created_w)
+        writer:get_string(w)
+      else
+        true
+    ];
+
+];

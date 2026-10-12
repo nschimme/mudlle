@@ -4,12 +4,22 @@ if (load("regression/test.mud")
     && load("regression/compute.mud")
     && load("regression/equal.mud")
     && load("regression/gc.mud")
+    && load("regression/graph.mud")
     && load("regression/misc.mud")
     && load("regression/prologs.mud")
     && load("regression/s1.mud")
     && load("regression/s2.mud")
     && load("regression/s3.mud")
-    && load("regression/types.mud"))
+    && load("regression/types.mud")
+    && (string_equal?(mc:archname, "x64")
+        || (load("regression/llvm.mud")
+            && load("regression/llvm-fast-paths.mud")
+            && load("regression/llvm-float-chains.mud")
+            && load("regression/llvm-known-call-seclevel.mud")
+            && load("regression/llvm-interpreter-calls.mud")))
+    && regression_failures == 0)
   display("SUCCESS\n")
 else
-  display("FAILURE\n");
+  [ dformat("FAILURE: %d regression checks failed\n", regression_failures);
+    quit(1);
+  ];

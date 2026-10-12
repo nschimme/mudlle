@@ -21,7 +21,7 @@
 
 // 3-address (not really) instructions for intermediate representation
 library ins3
-requires compiler, dlist, misc, sequences, vars
+requires asmwriter, compiler, dlist, misc, sequences, vars
 defines
   mc:i_class, mc:i_compute, mc:i_aop, mc:i_adest, mc:i_aargs, mc:i_atypes,
   mc:i_asizeinfo,
@@ -1032,9 +1032,10 @@ mc:const_itype = fn (v)
   // code display
 
   mc:ins_list = fn """component -> . Prints instruction list of function\
- component""" (ifn)
+ component""" (ifn, {vector,null} w = null)
     [
       | closures |
+      if (w == null) w = writer:new();
 
       closures = ifn . null;
       while (closures != null)
@@ -1044,15 +1045,16 @@ mc:const_itype = fn (v)
 	  cl = car(closures);
 	  closures = cdr(closures);
 
-	  dformat("closure %s:\n", cl[mc:c_fnumber]);
-	  closures = lappend(closures, mc:ins_list1(cl[mc:c_fvalue]));
+	  writer:format(w, "closure %s:\n", cl[mc:c_fnumber]);
+	  closures = lappend(closures, mc:ins_list1(cl[mc:c_fvalue], w));
 	]
     ];
 
   mc:ins_list1 = fn """ilist -> l. Prints instruction list and returns list of\
- its closures""" (ilist)
+ its closures""" (ilist, {vector,null} w = null)
     [
       | scan, closures |
+      if (w == null) w = writer:new();
 
       closures = null;
       scan = ilist;
@@ -1061,41 +1063,43 @@ mc:const_itype = fn (v)
 	  | il |
 	  il = dget(scan);
 	  if (il[mc:il_label])
-	    dformat("%s:", mc:slabel(il[mc:il_label]));
+	    writer:format(w, "%s:", mc:slabel(il[mc:il_label]));
           | loc |
           loc = il[mc:il_loc];
-	  dformat("\t%d:%d\t(%s) ", mc:loc_line(loc), mc:loc_column(loc),
-                  il[mc:il_number]);
+	  writer:format(w, "\t%d:%d\t(%s) ", mc:loc_line(loc), mc:loc_column(loc),
+                 il[mc:il_number]);
           | ins |
           ins = il[mc:il_ins];
           if (ins == null)
-            display("<removed>")
+            writer:write(w, "<removed>")
           else
-            closures = mc:print_ins(il[mc:il_ins], closures);
-	  newline();
+            closures = mc:print_ins(il[mc:il_ins], closures, w);
+	  writer:newline(w);
 	  scan = dnext(scan);
 	  if (scan == ilist) exit closures
 	]
     ];
 
-  mc:print_ins = fn (vector ins, closures)
+  mc:print_ins = fn (vector ins, closures, {vector,null} w = null)
     [
+      if (w == null) w = writer:new();
+
       | print_sz |
       print_sz = fn (sz)
         if (integer?(sz) && sz > 0)
-          dformat(" (size >= %d)", sz);
+          writer:format(w, " (size >= %d)", sz);
 
       | class |
       class = ins[mc:i_class];
       if (class == mc:i_compute)
 	[
-	  dformat("%s := ", mc:svar(ins[mc:i_adest]));
+	  writer:format(w, "%s := ", mc:svar(ins[mc:i_adest]));
           | op |
           op = ins[mc:i_aop];
 	  print_op(if (op == mc:b_assign) null else mc:builtin_names[op],
 		   ins[mc:i_aargs],
                    (op == mc:b_vector || op == mc:b_sequence
-                    || op == mc:b_pcons));
+                    || op == mc:b_pcons), w);
           print_sz(ins[mc:i_asizeinfo]);
 	]
       else if (class == mc:i_branch)
@@ -1111,32 +1115,32 @@ mc:const_itype = fn (v)
 	    else
 	      format("!type[%s]", type_names[op - mc:branch_ntype?]);
 
-	  print_if(opname, ins[mc:i_bargs]);
-	  dformat("goto %s", mc:slabel(ins[mc:i_bdest]));
+	  print_if(opname, ins[mc:i_bargs], w);
+	  writer:format(w, "goto %s", mc:slabel(ins[mc:i_bdest]));
 	]
       else if (class == mc:i_memory)
 	if (ins[mc:i_mop] == mc:memory_read)
-	  dformat("%s := %s[%s]", mc:svar(ins[mc:i_mscalar]),
-                  mc:svar(ins[mc:i_marray]), ins[mc:i_mindex])
+	  writer:format(w, "%s := %s[%s]", mc:svar(ins[mc:i_mscalar]),
+                 mc:svar(ins[mc:i_marray]), ins[mc:i_mindex])
 	else
-	  dformat("%s[%s] := %s",
-                  mc:svar(ins[mc:i_marray]), ins[mc:i_mindex],
-                  mc:svar(ins[mc:i_mscalar]))
+	  writer:format(w, "%s[%s] := %s",
+                 mc:svar(ins[mc:i_marray]), ins[mc:i_mindex],
+                 mc:svar(ins[mc:i_mscalar]))
       else if (class == mc:i_closure)
 	[
 	  | ifn |
 
 	  ifn = ins[mc:i_ffunction];
 	  closures = ifn . closures;
-	  dformat("%s := newclosure %s(%s)", mc:svar(ins[mc:i_fdest]),
-                  ifn[mc:c_fnumber],
-                  concat_words(lmap(mc:svar, ifn[mc:c_fclosure]), ", "))
+	  writer:format(w, "%s := newclosure %s(%s)", mc:svar(ins[mc:i_fdest]),
+                 ifn[mc:c_fnumber],
+                 concat_words(lmap(mc:svar, ifn[mc:c_fclosure]), ", "))
 	]
       else if (class == mc:i_call)
         [
-          dformat("%s := call %s%s", mc:svar(ins[mc:i_cdest]),
-                  concat_words(lmap(mc:svar, ins[mc:i_cargs]), ", "),
-                  if (mc:call_escapes?(ins)) " [escape]" else "");
+          writer:format(w, "%s := call %s%s", mc:svar(ins[mc:i_cdest]),
+                        concat_words(lmap(mc:svar, ins[mc:i_cargs]), ", "),
+                        if (mc:call_escapes?(ins)) " [escape]" else "");
           print_sz(ins[mc:i_csizeinfo]);
         ]
       else if (class == mc:i_trap)
@@ -1154,61 +1158,61 @@ mc:const_itype = fn (v)
                   ret = "(returning) ";
                   v &= ~mc:typeset_flag_return;
                 ];
-              dformat("if %s %s ", trap_names[top], mc:svar(arg));
+              writer:format(w, "if %s %s ", trap_names[top], mc:svar(arg));
               if (top == mc:trap_type)
-                dformat("%s ", type_names[v])
+                writer:format(w, "%s ", type_names[v])
               else
-                dformat("{%s} ",
-                        concat_words(bits_reduce(fn (t, l) [
-                          if (t == ffs(typeset_false) - 1)
-                            t = stype_false
-                          else
-                            assert(t < mudlle_types);
-                          type_names[t] . l
-                        ], null, v), ","));
-              display(ret);
+                writer:format(w, "{%s} ",
+                              concat_words(bits_reduce(fn (t, l) [
+                              if (t == ffs(typeset_false) - 1)
+                              t = stype_false
+                              else
+                              assert(t < mudlle_types);
+                              type_names[t] . l
+                              ], null, v), ","));
+              writer:write(w, ret);
               if (argnum != null)
                 [
                   argnum = mc:var_value(argnum);
                   if (argnum >= 0)
-                    dformat("(arg %d) ", argnum);
+                    writer:format(w, "(arg %d) ", argnum);
                 ];
             ]
           else if (mc:trap_is_unreachable?(ins))
-            display("(unreachable) ")
+            writer:write(w, "(unreachable) ")
           else
-            print_if(trap_names[ins[mc:i_top]], ins[mc:i_targs]);
-          display("trap");
+            print_if(trap_names[ins[mc:i_top]], ins[mc:i_targs], w);
+          writer:write(w, "trap");
           if (top != mc:trap_global_read && top != mc:trap_global_write)
-            dformat(" %s (%d)", error_messages[ins[mc:i_tdest]],
-                    ins[mc:i_tdest]);
+            writer:format(w, " %s (%d)", error_messages[ins[mc:i_tdest]],
+                          ins[mc:i_tdest]);
           | arg |
           arg = mc:trap_is_nomatch?(ins);
           if (arg)
-            dformat(" %s", mc:svar(arg));
+            writer:format(w, " %s", mc:svar(arg));
 	]
       else if (class == mc:i_return)
-	dformat("return %s", mc:svar(ins[mc:i_rvalue]))
+	writer:format(w, "return %s", mc:svar(ins[mc:i_rvalue]))
       else if (class == mc:i_maybe_sconcat)
-        dformat("(maybe) %s := sconcat %s",
-                mc:svar(ins[mc:i_scdest]),
-                concat_words(lmap(mc:svar, ins[mc:i_scargs]), ", "))
+        writer:format(w, "(maybe) %s := sconcat %s",
+                      mc:svar(ins[mc:i_scdest]),
+                      concat_words(lmap(mc:svar, ins[mc:i_scargs]), ", "))
       else if (class == mc:i_nop)
-        display("nop")
+        writer:write(w, "nop")
       else
         fail();
       closures
     ];
 
-  print_if = fn (op, args)
+  print_if = fn (op, args, {vector,null} w = null)
     if (op)
       [
-	display("if ");
-	print_op(op, args, false);
-	display(" ");
+	writer:write(w, "if ");
+	print_op(op, args, false, w);
+	writer:write(w, " ");
       ];
 
-  print_op = fn (op, args, call?)
+  print_op = fn (op, args, call?, {vector,null} w = null)
     [
       | nargs |
       nargs = llength(args);
@@ -1217,18 +1221,18 @@ mc:const_itype = fn (v)
           | prefix |
           if (string?(op))
             [
-              display(op);
+              writer:write(w, op);
               prefix = " ";
             ]
           else
             prefix = "";
           lforeach(fn (arg) [
-            dformat("%s%s", prefix, mc:svar(arg));
+            writer:format(w, "%s%s", prefix, mc:svar(arg));
             prefix = " ";
           ], args);
         ]
       else
-	dformat("%s %s %s", mc:svar(car(args)), op, mc:svar(cadr(args)))
+	writer:format(w, "%s %s %s", mc:svar(car(args)), op, mc:svar(cadr(args)))
     ];
 
   mc:skip_label_alias = fn (vector label)

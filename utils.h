@@ -77,6 +77,8 @@ static inline unsigned long get_stack_pointer(void)
   asm("movq %%rsp,%0" : "=r" (r));
 #elif defined __aarch64__
   asm("mov %0,sp" : "=r" (r));
+#elif defined __riscv && __riscv_xlen == 64
+  asm("mv %0,sp" : "=r" (r));
 #else
  #warning Improve this
   volatile int v;

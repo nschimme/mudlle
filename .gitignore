@@ -1,0 +1,38 @@
+# Build products
+*.o
+*.i
+*.obj
+mudlle
+genconst
+compiler
+build0/
+build1/
+build2/
+
+# Generated parser, lexer, and compiler headers
+lexer.c
+tokens.h
+parser.tab.c
+parser.tab.h
+parser.output
+genconstdefs.h
+x64consts.h
+mudlle-macro-n.h
+runtime/mudllecst.c
+
+# Generated dependency and architecture state
+.depend
+runtime/.depend
+.mudlle-arch
+.mudlle-llvm-cache/
+runtime/llvm-cache-abi.h
+
+# Temporary regression outputs
+test_asmwriter_tmp.txt
+test_llvm_reg.s
+.mudlle-history
+
+# Keep raw benchmark runs outside Git; retain the reusable upstream baseline.
+doc/benchmarks/*.json
+!doc/benchmarks/x64-baseline.json
+doc/benchmarks/*.patch

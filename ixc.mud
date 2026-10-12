@@ -28,7 +28,8 @@ garbage_collect(700000);
 load(srcdir + "lib.mud") &&
 load(srcdir + "inference.mud") &&
 load(srcdir + mc:archname + ".mud") &&
-load(srcdir + "compile.mud") &&
+load(srcdir + (if (string_equal?(mc:archname, "llvm"))
+                  "llvmcompile" else "compile") + ".mud") &&
 load(srcdir + "interface.mud") &&
 protect_compiler_libs();
 mc:verbose = 0;

@@ -51,5 +51,6 @@ fload(objdir + "link.obj") &&
 
 fload(objdir + "inference.obj") &&
 fload(objdir + mc:archname + ".obj") &&
-fload(objdir + "compile.obj");
+fload(objdir + (if (string_equal?(mc:archname, "llvm"))
+                   "llvmcompile" else "compile") + ".obj");
 mc:verbose = 0;

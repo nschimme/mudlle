@@ -35,7 +35,8 @@
 
 #undef GCDBEUG
 
-#if defined __x86_64__ || defined __aarch64__
+#if defined __x86_64__ || defined __aarch64__ \
+    || (defined __riscv && __riscv_xlen == 64)
 #  define GCQDEBUG
 #  define GCDEBUG_CHECK
 #  undef WORDS_BIGENDIAN
@@ -68,7 +69,7 @@
 #  define __has_extension(x) 0
 #endif
 
-#ifdef __aarch64__
+#if defined __aarch64__ || (defined __riscv && __riscv_xlen == 64)
 #  undef NOCOMPILER
 #  define NOCOMPILER
 #endif

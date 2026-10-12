@@ -37,6 +37,10 @@
 #include "symbol.h"
 #include "vector.h"
 
+#ifdef MUDLLE_USE_LLVM
+#include "llvm.h"
+#endif
+
 #include "../compile.h"
 #include "../mcompile.h"
 #include "../mtree.h"
@@ -402,7 +406,8 @@ TYPEDOP(compiledp, "compiled?",
   struct call_stack *cstack = call_stack;
   while (cstack && cstack->type == call_c)
     cstack = cstack->next;
-  return makebool(cstack && cstack->type == call_compiled);
+  return makebool(cstack && (cstack->type == call_compiled
+                            || cstack->type == call_llvm));
 }
 
 TYPEDOP(max_loop_count, ,
@@ -1030,6 +1035,17 @@ TYPEDOP(immutablep, "immutable?",
   return makebool(immutablep(x));
 }
 
+TYPEDOP(compiler_stable_closurep, "compiler_stable_closure?",
+        "`x -> `b. Internal compiler predicate for stable backend closures.",
+        (value x), OP_LEAF | OP_NOALLOC | OP_NOESCAPE, "x.n")
+{
+#ifdef MUDLLE_USE_LLVM
+  return makebool(llvm_stable_closure(x));
+#else
+  return makebool(false);
+#endif
+}
+
 TYPEDOP(readonlyp, "readonly?",
         "`x -> `b. Returns true if `x is a read-only value",
 	(value x),
@@ -1283,6 +1299,7 @@ void basic_init(void)
 
   DEFINE(typeof);
   DEFINE(immutablep);
+  DEFINE(compiler_stable_closurep);
   DEFINE(readonlyp);
   DEFINE(protect);
   DEFINE(rprotect);

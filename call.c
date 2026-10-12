@@ -783,13 +783,45 @@ struct mcallback
 {
   struct mprivate p;
   value (*cb)(void *cbdata);
+  mcallback_varargs_fn cb_varargs;
   void *cbdata;
 };
 
-value call_mcallback(struct mcallback *cb)
+bool mcallback_varargs_matches(struct closure *fn,
+                               mcallback_varargs_fn callback,
+                               void **cbdata)
+{
+  if (!TYPE(fn, closure))
+    return false;
+  size_t nvars = (fn->o.size - offsetof(struct closure, variables))
+    / sizeof fn->variables[0];
+  if (nvars == 0 || !TYPE(fn->variables[0], variable))
+    return false;
+  value callback_value = fn->variables[0]->vvalue;
+  if (!TYPE(callback_value, private))
+    return false;
+  struct mcallback *mcb = (struct mcallback *)callback_value;
+  if (mcb->p.ptype != makeint(PRIVATE_MCALLBACK)
+      || mcb->cb_varargs != callback)
+    return false;
+  if (cbdata != NULL)
+    *cbdata = mcb->cbdata;
+  return true;
+}
+
+value call_mcallback(struct mcallback *cb, struct closure *fn,
+                     struct vector *locals)
 {
   assert(TYPE(cb, private));
   assert(cb->p.ptype == makeint(PRIVATE_MCALLBACK));
+  if (cb->cb_varargs != NULL)
+    {
+      assert(vector_len(locals) > 0);
+      struct variable *var = locals->data[0];
+      assert(TYPE(var->vvalue, vector));
+      return cb->cb_varargs(cb->cbdata, fn, var->vvalue);
+    }
+  assert(cb->cb != NULL);
   return cb->cb(cb->cbdata);
 }
 
@@ -806,6 +838,49 @@ struct closure *make_mcallback(
     cbfree);
   c->p.ptype = makeint(PRIVATE_MCALLBACK);
   c->cb = cb;
+  c->cb_varargs = NULL;
   c->cbdata = cbdata;
   return make_primitive_closure(c, funcname, help, filename, line);
+}
+
+struct closure *make_mcallback_varargs_captured_sec(
+  mcallback_varargs_fn cb, weak_ref_free_fn cbfree, void *cbdata,
+  struct vector *captures, const char *funcname, struct string *help,
+  const char *filename, int line, seclev_t seclev)
+{
+  GCPRO(captures);
+  struct mcallback *c = (struct mcallback *)alloc_weak_ref(
+    type_private, sizeof (struct mcallback), cbdata, cbfree);
+  c->p.ptype = makeint(PRIVATE_MCALLBACK);
+  c->cb = NULL;
+  c->cb_varargs = cb;
+  c->cbdata = cbdata;
+  struct closure *closure = make_primitive_closure_varargs_captured_sec(
+    c, funcname, help, filename, line, captures, seclev);
+  UNGCPRO();
+  return closure;
+}
+
+struct closure *make_mcallback_varargs_captured_sec_cached(
+  mcallback_varargs_fn cb, weak_ref_free_fn cbfree, void *cbdata,
+  struct vector *captures, const char *funcname, struct string *help,
+  const char *filename, int line, seclev_t seclev, struct icode **icode_slot,
+  struct vector *arguments, typeset_t return_typeset)
+{
+  /* alloc_weak_ref may collect, so the cached code needs a root until the
+     callee takes over. */
+  struct icode *icode = *icode_slot;
+  GCPRO(captures, arguments, icode);
+  struct mcallback *c = (struct mcallback *)alloc_weak_ref(
+    type_private, sizeof (struct mcallback), cbdata, cbfree);
+  c->p.ptype = makeint(PRIVATE_MCALLBACK);
+  c->cb = NULL;
+  c->cb_varargs = cb;
+  c->cbdata = cbdata;
+  struct closure *closure = make_primitive_closure_varargs_captured_sec_cached(
+    c, funcname, help, filename, line, captures, seclev, &icode,
+    arguments, return_typeset);
+  *icode_slot = icode;
+  UNGCPRO();
+  return closure;
 }

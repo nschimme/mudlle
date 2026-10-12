@@ -424,7 +424,11 @@ static void *alloc_gc_block(size_t size)
       mudlle_log("alloc_gc_block(): out of memory");
       abort();
     }
+#ifdef MUDLLE_USE_LLVM
+  if (mprotect(b, size, PROT_READ | PROT_WRITE) != 0)
+#else
   if (mprotect(b, size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+#endif
     perror("mprotect()");
   return b;
 }
@@ -642,11 +646,18 @@ static void forward_roots(void)
           continue;
 
 	case call_bytecode:
+        case call_llvm:
           {
             struct call_stack_mudlle *mstk = (struct call_stack_mudlle *)stk;
             special_forward(&mstk->fn);
             special_forward(&mstk->code);
             special_forward(&mstk->locals);
+            /* Frames pushed inline by generated direct calls (offset -2)
+               own their argument array; others have it rooted by the
+               caller. */
+            if (stk->type == call_llvm && mstk->offset == -2)
+              for (int i = 0; i < mstk->nargs; ++i)
+                special_forward(&mstk->native_args[i]);
             continue;
           }
 
@@ -1435,6 +1446,30 @@ struct obj *gc_allocate(long n)
 /* Basic allocation */
 /* ---------------- */
 
+static ALWAYS_INLINE struct obj *initialize_allocated_obj(
+  struct obj *obj, enum garbage_type garbage_type, enum mudlle_type type,
+  size_t size, unsigned flags)
+{
+  *obj = (struct obj){
+    .size	  = size,
+    .garbage_type = garbage_type,
+    .type	  = type,
+    .flags	  = flags,
+#ifdef GCDEBUG
+    .generation   = obj->generation
+#endif
+  };
+
+#ifdef GCSTATS
+  gcstats_add_alloc(type, MUDLLE_ALIGN(size, sizeof (value)));
+#endif
+
+#ifdef ALLOC_STATS
+  record_allocation(type, size);
+#endif
+  return obj;
+}
+
 static struct obj *allocate_obj(bool is_fast,
                                 enum garbage_type garbage_type,
                                 enum mudlle_type type,
@@ -1451,24 +1486,57 @@ static struct obj *allocate_obj(bool is_fast,
   else
     obj = gc_allocate(size);
 
-  *obj = (struct obj){
-    .size	  = size,
-    .garbage_type = garbage_type,
-    .type	  = type,
-    .flags	  = flags,
-#ifdef GCDEBUG
-    .generation   = newp->o.generation
-#endif
-  };
+  return initialize_allocated_obj(obj, garbage_type, type, size, flags);
+}
 
-#ifdef GCSTATS
-  gcstats_add_alloc(type, MUDLLE_ALIGN(size, sizeof (value)));
-#endif
+/* Keep reservation, header initialization and filling in the allocator's
+   translation unit so the noncollecting path can inline allocate_obj. No
+   interior pointer or unrooted argument may survive a collecting call. */
+struct vector *try_alloc_vector(value *arguments, size_t entries,
+                                bool readonly, bool immutable)
+{
+  ulong size = record_size(entries);
+  if (!alloc_available(MUDLLE_ALIGN(size, sizeof(value))))
+    return NULL;
+  struct obj *obj = get_free_list(size);
+  if (obj == NULL)
+    obj = fast_gc_allocate(size);
+  struct vector *vector = (struct vector *)initialize_allocated_obj(
+    obj, garbage_record, type_vector, size,
+    entries == 0 ? OBJ_READONLY | OBJ_IMMUTABLE : 0);
+  for (size_t i = 0; i < entries; ++i)
+    {
+      GCCHECK(arguments[i]);
+      vector->data[i] = arguments[i];
+      immutable = immutable && immutablep(arguments[i]);
+    }
+  if (readonly)
+    {
+      make_readonly(vector);
+      if (immutable)
+        vector->o.flags |= OBJ_IMMUTABLE;
+    }
+  return vector;
+}
 
-#ifdef ALLOC_STATS
-  record_allocation(type, size);
-#endif
-  return obj;
+/* Pair counterpart of try_alloc_vector: NULL without collecting if the
+   nursery cannot fit it, so unrooted car/cdr are safe on success. */
+struct list *try_alloc_list(value car, value cdr, bool readonly)
+{
+  ulong size = sizeof (struct obj) + 2 * sizeof (value);
+  if (!alloc_available(MUDLLE_ALIGN(size, sizeof(value))))
+    return NULL;
+  struct obj *obj = get_free_list(size);
+  if (obj == NULL)
+    obj = fast_gc_allocate(size);
+  struct list *p = (struct list *)initialize_allocated_obj(
+    obj, garbage_record, type_pair, size, 0);
+  p->car = car;
+  p->cdr = cdr;
+  if (readonly)
+    p->o.flags |= OBJ_READONLY
+      | (immutablep(car) && immutablep(cdr) ? OBJ_IMMUTABLE : 0);
+  return p;
 }
 
 struct grecord *alloc_record_noinit(

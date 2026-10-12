@@ -7,6 +7,13 @@ Mudlle's garbage collector (GC) is a copying two-generational garbage
 collector. All newly allocated objects go in generation 0. Immutable
 objects are migrated to generation 1 by GC sweeps.
 
+An immutable object must only reference immutable values. Generation 1 is not
+scanned during minor collections, so an immutable vector containing a mutable
+generation 0 object would retain a stale pointer when that child moves. Readonly
+does not imply immutable, and being a compiler constant does not establish
+immutability. Check the actual elements before setting `OBJ_IMMUTABLE` on a
+constructed vector.
+
 All mudlle values except `null`, integers, and static strings are
 stored in GC memory. Mudlle `null` is represented by C `NULL`, mudlle
 integers are ``intptr_t``/``long`` C integers with the lowest bit
