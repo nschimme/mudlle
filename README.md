@@ -89,32 +89,35 @@ The AMD Ryzen 9 7940HS host ran Linux 7.0.14, GCC 14.2.0 and LLVM 19.1.7.
 Mudlle is single threaded; LLVM kernels use `default<O2>`. The native object
 cache was disabled, but filesystem caches were not flushed.
 
-Each row reports the per-backend median CPU milliseconds per sample, followed
-by the median of the 31 paired LLVM/x64 ratios and its deterministic bootstrap
-95% interval. Lower ratios favor LLVM. There were 31 fresh-process pairs and
-100 timed calls per workload, except the integer loop, which used 2,000 calls.
-Ratios and intervals are rounded to three decimals.
+There are 31 fresh LLVM process samples from 2026-10-12 15:40–15:44 UTC and 31
+unchanged x64 samples from upstream master, recorded earlier at 15:00–15:10
+UTC. Each sample ran 100 timed calls per workload, except the integer loop,
+which ran 2,000. The table shows median CPU milliseconds and signed CPU time
+change versus the x64 median: negative is faster on LLVM, positive is slower.
+Percentages and independently bootstrapped 95% intervals are rounded to one
+decimal place.
 
-| Workload | LLVM ms | x64 ms | Paired ratio | 95% interval |
-|----------|--------:|-------:|-------------:|-------------:|
-| Floating point primitives (100,000 steps) | 525 | 2,610 | 0.201 | 0.199–0.204 |
-| Integer loop (50,000 steps; 2,000 calls) | 40 | 88 | 0.453 | 0.448–0.460 |
-| Native list/vector conversion, width 32 | 346 | 444 | 0.774 | 0.759–0.788 |
-| Native list/vector conversion, width 257 | 611 | 697 | 0.862 | 0.855–0.877 |
-| Mixed bigint/float (20,000 steps) | 718 | 794 | 0.914 | 0.893–0.928 |
-| Tables, 32 keys | 164 | 177 | 0.936 | 0.918–0.958 |
-| Recursive local closure, `fib(27)` | 221 | 235 | 0.936 | 0.919–0.956 |
-| Tables, 257 keys | 183 | 192 | 0.948 | 0.920–0.984 |
-| Bigint primitives (20,000 steps) | 1,185 | 1,166 | 1.009 | 0.995–1.026 |
-| Library list/vector round trip, width 32 | 3,354 | 3,276 | 1.025 | 1.007–1.031 |
-| Local closure loop (2,000,000 iterations) | 584 | 587 | 1.002 | 0.985–1.022 |
+| Workload | LLVM ms | x64 ms | CPU time vs x64 | 95% interval |
+|----------|--------:|-------:|----------------:|-------------:|
+| Floating point primitives (100,000 steps) | 526 | 2,610 | -79.8% | -80.5% to -79.4% |
+| Integer loop (50,000 steps; 2,000 calls) | 40 | 88 | -54.5% | -55.7% to -53.4% |
+| Native list/vector conversion, width 32 | 370 | 444 | -16.7% | -18.8% to -14.3% |
+| Native list/vector conversion, width 257 | 599 | 697 | -14.1% | -15.5% to -11.7% |
+| Mixed bigint/float (20,000 steps) | 729 | 794 | -8.2% | -9.7% to -6.5% |
+| Tables, 32 keys | 160 | 177 | -9.6% | -11.7% to -5.7% |
+| Recursive local closure, `fib(27)` | 214 | 235 | -8.9% | -9.7% to -4.7% |
+| Tables, 257 keys | 182 | 192 | -5.2% | -9.1% to -1.1% |
+| Local closure loop (2,000,000 iterations) | 583 | 587 | -0.7% | -1.4% to +2.4% |
+| Library list/vector round trip, width 32 | 3,329 | 3,276 | +1.6% | +0.5% to +2.8% |
+| Bigint primitives (20,000 steps) | 1,192 | 1,166 | +2.2% | +0.8% to +3.0% |
 
-The library conversion remains 2.5% slower on LLVM in this sample, with an
-interval of 0.7% to 3.1% slower. The bigint and closure-loop intervals include
-1. These intervals describe these builds and workloads on this shared host;
-the bootstrap resamples paired-round log-ratios 5,000 times with seed
-20261012 and assumes round pairs are independent and identically distributed.
-They do not establish general platform parity. No ARM64, RISC-V or LLVM 14
+The library conversion and bigint workloads remain slower on LLVM. The other
+nine workloads have lower LLVM medians; the closure-loop interval includes
+zero. This is an unpaired, same-host comparison: the
+bootstrap independently resamples the 31 samples for each backend 5,000 times
+with seed 20261012. It assumes independent, identically distributed samples and
+does not capture temporal drift between the baseline and LLVM runs. These
+results do not establish general platform parity. No ARM64, RISC-V or LLVM 14
 measurements or validation are included.
 
 Timers sum `ctime()` only across kernel calls. Compilation, warmup, numeric
@@ -122,24 +125,24 @@ reference calculations, explicit collection stress, and post-call checks are
 outside the timers; table and sequence identity/content guards remain inside
 their timed loops. Timed loops keep ordinary loop accounting. The library
 conversion calls interpreted library closures; native conversions compile
-the equivalent loops locally. The report includes every sample and checksum,
-statistical summaries, and build fingerprints in
-[`doc/benchmarks/2026-10-12-final.json`](doc/benchmarks/2026-10-12-final.json).
+the equivalent loops locally. The compact x64 sample fixture is
+[`doc/benchmarks/x64-baseline.json`](doc/benchmarks/x64-baseline.json).
+The runner writes raw samples, checksums, source/binary fingerprints and
+statistical summaries outside Git through its `--output` option.
 
-To reproduce the full comparison, build this branch's LLVM tree with
-`make USE_LLVM=yes` and `make -j8 compiler USE_LLVM=yes`. Build upstream master
-`99a6a18` with `make` and `make -j8 compiler`, and copy this branch's regression
-files into that tree; its compiler, runtime and libraries remain upstream.
-The report identifies the measured LLVM source snapshot by its base revision
-and source hashes. Then run:
+To reproduce the LLVM samples on the same host and reuse the checked-in x64
+fixture, build this branch with `make USE_LLVM=yes` and
+`make -j8 compiler USE_LLVM=yes`, then run:
 
-    perl regression/benchmark-rich-backends.pl --llvm <llvm-tree> \
-      --x64 <upstream-master-x64-tree> --suite all --runs 31 \
+    perl regression/benchmark-rich-backends.pl --llvm <this-branch-tree> \
+      --baseline-report doc/benchmarks/x64-baseline.json \
+      --suite all --runs 31 \
       --timed-calls 100 \
-      --llvm-revision "$(git -C <llvm-tree> rev-parse HEAD)" \
+      --llvm-revision "$(git -C <this-branch-tree> rev-parse HEAD)" \
       --x64-revision 99a6a18b0145f45c326555ae23145eeab16b08cc \
-      --output doc/benchmarks/2026-10-12-final.json
+      --output /tmp/mudlle-benchmark-report.json
 
+The baseline fixture requires the same host platform and cache configuration.
 The runner checks each workload against its reference and requires its success
 marker before recording a sample.
 

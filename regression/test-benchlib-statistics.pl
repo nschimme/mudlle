@@ -24,7 +24,8 @@ use warnings;
 use FindBin;
 use lib $FindBin::Bin;
 use Test::More;
-use BenchLib qw(sample_summary paired_log_ratio_summary);
+use BenchLib qw(sample_summary paired_log_ratio_summary
+                independent_median_ratio_summary);
 
 my $summary = sample_summary([1, 2, 3, 4, 100]);
 is($summary->{n}, 5, 'sample count');
@@ -66,5 +67,31 @@ is($all_zero->{valid_pairs}, 0, 'all-zero input has no valid pairs');
 ok(!exists $all_zero->{median_ratio}, 'all-zero input avoids division');
 ok(!exists $all_zero->{bootstrap_95pct_ci_ratio},
    'all-zero input has no bootstrap interval');
+
+my $independent_constant = independent_median_ratio_summary(
+    [20, 20, 20], [10, 10], resamples => 100, seed => 17);
+is($independent_constant->{median_ratio}, 2,
+   'independent median ratio for constant samples');
+is_deeply($independent_constant->{bootstrap_95pct_ci_ratio}, [2, 2],
+          'constant independent samples have a point interval');
+
+my $independent_varying = independent_median_ratio_summary(
+    [1, 2, 4], [1, 1, 1], resamples => 5000, seed => 29);
+is($independent_varying->{median_ratio}, 2,
+   'independent median ratio with varying timings');
+is_deeply($independent_varying->{bootstrap_95pct_ci_ratio}, [1, 4],
+          'independent bootstrap samples each backend distribution');
+my $independent_unequal = independent_median_ratio_summary(
+    [1, 2, 4, 8], [2, 4], resamples => 5000, seed => 29);
+is($independent_unequal->{llvm_samples}, 4,
+   'independent samples permit unequal round counts');
+is($independent_unequal->{x64_samples}, 2,
+   'x64 count is recorded separately');
+
+eval {
+    independent_median_ratio_summary([1, 0], [1, 1]);
+    1;
+};
+like($@, qr/timings must be positive/, 'invalid independent timings are rejected');
 
 done_testing();

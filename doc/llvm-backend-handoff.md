@@ -2,19 +2,31 @@
 
 Goal: LLVM at or ahead of upstream x64 on every README workload. Remove this
 file when that goal is reached. Current measurements and reproduction commands
-are in `README.md`; raw samples are in `doc/benchmarks/2026-10-12-final.json`.
+are in `README.md`; the compact upstream x64 sample fixture is
+`doc/benchmarks/x64-baseline.json`, and the raw reused-baseline report remains
+outside Git under `/tmp`.
 
 ## Remaining gap
 
-The 31-pair O2 comparison against upstream master
-`99a6a18b0145f45c326555ae23145eeab16b08cc` leaves one measurable slowdown:
-`list-vector-library-32`, paired LLVM/x64 ratio 1.025, bootstrap 95% interval
-[1.007, 1.031]. The other ten workloads are faster or have intervals spanning
-1. Library conversion calls interpreted `misc.mud`/`sequences.mud` closures
-from a compiled loop. Inspect `llvm_call_value` and `llvm_call_fallback` in
-`runtime/llvm.c`: the fallback allocates an argument vector before `callv`.
-x64's `builtin_call_interpreter` passes protected arguments directly to the
-interpreter stack. Measure a bridge change independently before adopting it.
+The latest O2 comparison used 31 fresh LLVM samples from branch base
+`e073c62f3f1c0b629852fbba6632ffc5e331938d` against the 31 unchanged x64
+samples recorded from upstream master `99a6a18b0145f45c326555ae23145eeab16b08cc`.
+The x64 run was 2026-10-12 15:00–15:10 UTC; LLVM ran 15:40–15:44 UTC. The
+unpaired bootstrap leaves two slowdowns: library list/vector conversion is
+1.6% slower on LLVM (95% interval +0.5% to +2.8%), and bigint primitives are
+2.2% slower (+0.8% to +3.0%). The other nine workloads have lower LLVM
+medians; the closure-loop interval spans zero. This comparison uses independent
+backend medians and does not capture temporal drift between the two run
+windows, so parity is not established.
+
+Library conversion calls interpreted `misc.mud`/`sequences.mud` closures from
+a compiled loop. `llvm_call_fallback` now detects interpreted closures and
+copies protected arguments directly to the interpreter stack after reserving
+space, avoiding the temporary argument vector. The closure and copied values
+remain rooted in the fallback, while the generated caller frame also roots
+its live values; removing that duplicate root chain is one remaining cost to
+measure. Keep the reference report and run timestamps attached to future
+comparisons, and do not pair these reused x64 rounds with later LLVM rounds.
 
 ## Current implementation and invariants
 
@@ -38,17 +50,18 @@ parallelizes separate processes while retaining O2.
 
 ## Validation and measurement
 
-The current generator/runtime passed clean O2 and `none` bootstraps, source
-suites, and per-pass-verified compiled-loader cold/warm suites. Each cold loader
-recorded 4,457 misses, followed by 4,457 warm hits and no misses. Cache ABI and
-integration tests, all three known-call stress scripts, baseline error traces,
-and exact vector loop accounting passed. Branch x64 and upstream x64 passed
-source and compiled suites; the current branch regression suite also passed
-on upstream master, with LLVM-only tests skipped by its architecture guard.
+The current generator/runtime passed source suites at O2 and `none`, a clean
+O2 `make -j8 compiler USE_LLVM=yes` bootstrap, and compiled-loader cold/warm O2
+suites with `MUDLLE_LLVM_VERIFY_EACH=1`: 4,464 misses followed by 4,464 warm
+hits and no misses. Cache ABI/integration checks, known-call stress and
+diagnostic tests passed. The refreshed branch x64 runtime build and both source
+and compiled `regression/all.mud` suites passed.
 
 Run future build/regression checks separately from measurements. Use upstream
-master x64 for performance and branch x64 for regression checks. Run O2
-benchmarks in alternating fresh serial processes with native caching disabled;
-record exact revisions and source/binary hashes. Require result checks and
+master x64 for performance and branch x64 for regression checks. Reuse the
+recorded upstream baseline while its build and workloads remain unchanged;
+collect fresh serial LLVM samples with O2 and native caching disabled. Compare
+the samples independently, retaining the temporal-drift limitation. Record
+exact revisions and source/binary hashes. Require result checks and
 completion markers rather than exit status alone. See the README for the
 31-round, 100-call command and statistical limitations.

@@ -31,3 +31,8 @@ runtime/llvm-cache-abi.h
 test_asmwriter_tmp.txt
 test_llvm_reg.s
 .mudlle-history
+
+# Keep raw benchmark runs outside Git; retain the reusable upstream baseline.
+doc/benchmarks/*.json
+!doc/benchmarks/x64-baseline.json
+doc/benchmarks/*.patch

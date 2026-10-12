@@ -32,7 +32,8 @@ use Time::HiRes qw(time);
 
 our @EXPORT_OK = qw(slurp spew sha256_file sha256_hex median round6 host_info
                     to_json run_command run_timed child_cpu
-                    sample_summary paired_log_ratio_summary);
+                    sample_summary paired_log_ratio_summary
+                    independent_median_ratio_summary);
 
 sub slurp {
     my ($path) = @_;
@@ -115,6 +116,51 @@ sub paired_log_ratio_summary {
     $result->{median_ratio} = exp($observed);
     $result->{bootstrap_resamples} = $resamples;
     $result->{bootstrap_95pct_ci_ratio} = [ exp($lo), exp($hi) ];
+    return $result;
+}
+
+# Compare medians from independent samples. Each backend's timings are
+# resampled independently, so no round-pairing is implied by this interval.
+sub independent_median_ratio_summary {
+    my ($llvm, $x64, %opt) = @_;
+    @$llvm && @$x64 or die "independent samples must both be nonempty\n";
+    my $resamples = $opt{resamples} // 5000;
+    my $seed = $opt{seed} // 20261012;
+    $resamples > 0 or die "resamples must be positive\n";
+    for my $samples ($llvm, $x64) {
+        for my $value (@$samples) {
+            defined($value) && $value =~ /\A(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\z/
+                && $value > 0 or die "independent timings must be positive numbers\n";
+        }
+    }
+    my $llvm_median = median(@$llvm);
+    my $x64_median = median(@$x64);
+    my $result = {
+        llvm_samples => scalar(@$llvm), x64_samples => scalar(@$x64),
+        llvm_median_cpu_ms => $llvm_median, x64_median_cpu_ms => $x64_median,
+        median_ratio => $llvm_median / $x64_median,
+        bootstrap_resamples => $resamples, bootstrap_seed => 0 + $seed,
+    };
+    my @boot;
+    my $state = $seed % 2147483647;
+    $state = 1 if $state <= 0;
+    for (1 .. $resamples) {
+        my (@llvm_draw, @x64_draw);
+        for (1 .. @$llvm) {
+            $state = (48271 * $state) % 2147483647;
+            push @llvm_draw, $llvm->[$state % @$llvm];
+        }
+        for (1 .. @$x64) {
+            $state = (48271 * $state) % 2147483647;
+            push @x64_draw, $x64->[$state % @$x64];
+        }
+        push @boot, median(@llvm_draw) / median(@x64_draw);
+    }
+    @boot = sort { $a <=> $b } @boot;
+    $result->{bootstrap_95pct_ci_ratio} = [
+        $boot[int(0.025 * ($resamples - 1))],
+        $boot[int(0.975 * ($resamples - 1))],
+    ];
     return $result;
 }
 

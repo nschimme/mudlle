@@ -339,6 +339,12 @@ actual arguments to GC and call-trace handling. Native entry preserves stack,
 interrupt, arity, minimum security level, and maximum security level checks.
 `compiled?()` recognizes these frames.
 
+Calls to bytecode closures copy rooted arguments directly onto the interpreter
+stack, following x64's interpreter entry convention. The closure and argument
+copies remain protected across stack growth, which can collect. The interpreter
+performs its normal arity, security, interrupt, recursion and loop checks. Other
+generic callees retain the argument-vector fallback.
+
 Allocating functions reload their closure through the active frame's `fn`
 field after safepoints. The collector already forwards that field, so no
 duplicate local environment root is needed. A function with no rooted local

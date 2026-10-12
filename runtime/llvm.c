@@ -36,6 +36,8 @@
 #include "../compile.h"
 #include "../context.h"
 #include "../global.h"
+#include "../interpret.h"
+#include "../stack.h"
 #include "../utils.h"
 #include "bigint.h"
 #include "call.h"
@@ -1211,12 +1213,30 @@ static value llvm_call_fallback(value function, value *arguments, size_t nargs)
   if (nargs != 0)
     gcpro = &argument_roots[nargs - 1];
 
-  struct vector *argv = alloc_vector(nargs);
-  struct gcpro argv_root;
-  GCPROV(argv_root, argv);
-  for (size_t i = 0; i < nargs; ++i)
-    argv->data[i] = rooted_args[i];
-  value result = callv(function, argv);
+  value result;
+  if (TYPE(function, closure)
+      && TYPE(((struct closure *)function)->code, icode))
+    {
+      /* Like x64's builtin_call_interpreter, copy protected arguments
+         directly to the interpreter stack. stack_make_room can collect;
+         both the closure and these copies remain rooted across it. */
+      check_allow_mudlle_call();
+      if (nargs != 0)
+        stack_make_room(nargs);
+      for (size_t i = 0; i < nargs; ++i)
+        stack_set(i, rooted_args[i]);
+      do_interpret((struct closure *)function, (int)nargs);
+      result = stack_pop();
+    }
+  else
+    {
+      struct vector *argv = alloc_vector(nargs);
+      struct gcpro argv_root;
+      GCPROV(argv_root, argv);
+      for (size_t i = 0; i < nargs; ++i)
+        argv->data[i] = rooted_args[i];
+      result = callv(function, argv);
+    }
   gcpro = old_gcpro;
   return result;
 }
