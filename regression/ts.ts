@@ -19,12 +19,44 @@
  * SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
  */
 
-// Complicated TypeScript example exercising TS features and Mudlle interop
+// Complicated TypeScript example exercising TS Handbook functional constructs:
+// - Type aliases & Interface declarations
+// - Generic functions <T>
+// - Union type annotations
+// - typeof type narrowing
+// - Floating point calculations
+// - Array & Object processing
+// - Template string interpolation
+// - Try/Catch exception handling
 
-function process_scores(scores: vector, threshold: number): object {
+type ScoreList = number[];
+
+interface ProcessResult {
+  count: number;
+  total: number;
+  avg: number;
+  max: number;
+  label: string;
+  status: number;
+  summary: string;
+};
+
+function identity<T>(arg: T): T {
+  return arg;
+};
+
+function classify_value(val: string | number): string {
+  if (typeof val === "string") {
+    return `text:${val}`;
+  } else {
+    return `num:${val}`;
+  };
+};
+
+function process_scores(scores: ScoreList, threshold: number): ProcessResult {
   let count: number = 0;
-  let total: number = 0;
-  let max_val: number = -1;
+  let total: number = 0.0;
+  let max_val: number = -1.0;
 
   for (let i: number = 0; i < 5; i = i + 1) {
     let val: number = scores[i];
@@ -37,7 +69,7 @@ function process_scores(scores: vector, threshold: number): object {
     };
   };
 
-  let avg: number = 0;
+  let avg: number = 0.0;
   if (count > 0) {
     avg = total / count;
   };
@@ -55,18 +87,21 @@ function process_scores(scores: vector, threshold: number): object {
     safe_check = 500;
   };
 
+  let tag: string = classify_value(identity("valid"));
+
   return {
     count: count,
     total: total,
     avg: avg,
     max: max_val,
     label: label,
-    status: safe_check
+    status: safe_check,
+    summary: tag
   };
 };
 
-let scores: vector = [10, 25, 40, 15, 50];
-let stats: object = process_scores(scores, 20);
+let scores: ScoreList = [10.5, 25.5, 40.0, 15.0, 50.0];
+let stats: ProcessResult = process_scores(scores, 20.0);
 
 // Return result object for Mudlle validation
 stats;

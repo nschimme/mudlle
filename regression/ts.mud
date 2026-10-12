@@ -59,32 +59,36 @@
   regress("ts_eval try/catch",
           ts_eval("let res = 0; try { throw 99; } catch (err) { res = 99; }; res;"), 99);
 
-  // 9. Functions and Arrow functions
+  // 9. Functions, Generics <T>, and Arrow functions
   regress("ts_eval function decl",
-          ts_eval("function add(a: number, b: number): number { return a + b; }; add(12, 30);"), 42);
+          ts_eval("function add<T>(a: number, b: number): number { return a + b; }; add(12, 30);"), 42);
   regress("ts_eval arrow function",
           ts_eval("let mul = (a: number, b: number): number => a * b; mul(6, 7);"), 42);
 
-  // 10. Object literals and member access
+  // 10. Type aliases, Interface declarations, and typeof narrowing
+  regress("ts_eval type/interface/typeof",
+          ts_eval("type Num = number; interface Box { val: Num; }; function check(v: string | number): string { if (typeof v === \"string\") { return \"str\"; } else { return \"num\"; }; }; check(123);"), "num");
+
+  // 11. Object literals and member access
   | obj_res |
   obj_res = ts_eval("let o = { x: 10, y: \"test\" }; o.x + slength(o.y);");
   regress("ts_eval object literal", obj_res, 14);
 
-  // 11. Array literals and indexing
+  // 12. Array literals and indexing
   | arr_res |
   arr_res = ts_eval("let a = [10, 20, 30]; a[0] + a[1] + a[2];");
   regress("ts_eval array literal", arr_res, 60);
 
-  // 12. TS calling Mudlle APIs
+  // 13. TS calling Mudlle APIs
   regress("ts_eval Mudlle format API",
           ts_eval("format(\"Value: %d\", 42);"), "Value: 42");
 
-  // 13. Mudlle calling exported TS function
+  // 14. Mudlle calling exported TS function
   | ts_fn |
   ts_fn = ts_eval("function ts_factorial(n: number): number { if (n <= 1) { return 1; } else { return n * ts_factorial(n - 1); }; }; ts_factorial;");
   regress("Mudlle calling TS factorial", ts_fn(5), 120);
 
-  // 14. Source location tracking verification
+  // 15. Source location tracking verification
   | ast, loc |
   ast = ts_parse("let x = 42;", "test_loc.ts");
   loc = ast[mc:m_body][mc:c_loc];
@@ -92,14 +96,15 @@
   regress("ts_parse source location column", loc[1], 1);
   regress("ts_parse source location pos", loc[2], 0);
 
-  // 15. Loading native TS file (regression/ts.ts)
+  // 16. Loading native TS file (regression/ts.ts)
   | ts_stats |
   ts_stats = load_ts("regression/ts.ts");
   regress("load_ts count", ts_stats["count"], 3);
-  regress("load_ts total", ts_stats["total"], 115);
-  regress("load_ts max", ts_stats["max"], 50);
-  regress("load_ts label", ts_stats["label"], "Count: 3, Avg: 38, Max: 50");
+  regress("load_ts total", ts_stats["total"], 115.5);
+  regress("load_ts max", ts_stats["max"], 50.0);
+  regress("load_ts label", ts_stats["label"], "Count: 3, Avg: 38.5, Max: 50.0");
   regress("load_ts status", ts_stats["status"], 200);
+  regress("load_ts summary", ts_stats["summary"], "text:valid");
 
   true
 ];

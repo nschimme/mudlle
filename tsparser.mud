@@ -50,15 +50,16 @@ defines ts_tokenize, ts_parse_string
   keywords_tab["throw"] = "keyword_throw";
   keywords_tab["type"] = "keyword_type";
   keywords_tab["interface"] = "keyword_interface";
+  keywords_tab["typeof"] = "keyword_typeof";
 
   ts_type_to_typeset = fn (name)
     [
-      if (string_cmp(name, "number") == 0) tset_int
-      else if (string_cmp(name, "string") == 0) tset_str
-      else if (string_cmp(name, "boolean") == 0) tset_int
-      else if (string_cmp(name, "vector") == 0 || string_cmp(name, "Array") == 0) tset_vec
-      else if (string_cmp(name, "object") == 0) tset_tab
-      else typeset_any
+      if (string_cmp(name, "number") == 0) TYPESET_ANY
+      else if (string_cmp(name, "string") == 0) TSET_STR
+      else if (string_cmp(name, "boolean") == 0) TSET_INT
+      else if (string_cmp(name, "vector") == 0 || string_cmp(name, "Array") == 0) TSET_VEC
+      else if (string_cmp(name, "object") == 0) TSET_TAB
+      else TYPESET_ANY
     ];
 
   // Tokenizer implementation
@@ -421,8 +422,15 @@ defines ts_tokenize, ts_parse_string
     [
       | tokens, tok_pos, cur_tok, match_tok, consume_tok, tok_loc,
         parse_expr, parse_assign, parse_binary, parse_primary,
-        parse_stmt_list, parse_type,
+        parse_stmt_list, parse_type, gen_tmp_var, tmp_var_count,
         make_const, make_recall, make_assign, make_call, make_builtin, make_block, make_closure |
+
+      tmp_var_count = 0;
+      gen_tmp_var = fn (prefix)
+        [
+          ++tmp_var_count;
+          format("_%s_%d", prefix, tmp_var_count)
+        ];
 
       tokens = list_to_vector(ts_tokenize(code, fname));
       tok_pos = 0;
@@ -512,17 +520,48 @@ defines ts_tokenize, ts_parse_string
       parse_type = fn ()
         if (match_tok("colon"))
           [
-            | t_tok |
-            if (string_cmp(cur_tok()[0], "identifier") == 0)
+            | t_set |
+            t_set = 0;
+            loop
               [
-                t_tok = consume_tok();
-                ts_type_to_typeset(t_tok[1])
+                if (string_cmp(cur_tok()[0], "identifier") == 0)
+                  [
+                    | t_tok |
+                    t_tok = consume_tok();
+                    t_set = t_set | ts_type_to_typeset(t_tok[1]);
+                    if (string_cmp(cur_tok()[0], "lbracket") == 0)
+                      [
+                        consume_tok();
+                        match_tok("rbracket");
+                        t_set = t_set | TSET_VEC;
+                      ];
+                    if (string_cmp(cur_tok()[0], "op_lt") == 0)
+                      [
+                        consume_tok();
+                        while (string_cmp(cur_tok()[0], "op_gt") != 0 && string_cmp(cur_tok()[0], "eof") != 0)
+                          consume_tok();
+                        match_tok("op_gt");
+                      ];
+                  ]
+                else if (string_cmp(cur_tok()[0], "lbrace") == 0)
+                  [
+                    consume_tok();
+                    while (string_cmp(cur_tok()[0], "rbrace") != 0 && string_cmp(cur_tok()[0], "eof") != 0)
+                      consume_tok();
+                    match_tok("rbrace");
+                    t_set = t_set | TSET_TAB;
+                  ]
+                else
+                  consume_tok();
+
+                if (string_cmp(cur_tok()[0], "op_bitor") == 0 || string_cmp(cur_tok()[0], "op_bitand") == 0)
+                  consume_tok()
+                else
+                  exit (if (t_set == 0) TYPESET_ANY else t_set);
               ]
-            else
-              typeset_any
           ]
         else
-          typeset_any;
+          TYPESET_ANY;
 
       // Recursive descent parsing
       parse_primary = fn ()
@@ -554,6 +593,44 @@ defines ts_tokenize, ts_parse_string
             [
               consume_tok();
               make_recall(loc, tok[1])
+            ]
+          else if (match_tok("keyword_typeof"))
+            [
+              | operand, type_loc, seq, v_tv |
+              type_loc = loc;
+              v_tv = gen_tmp_var("tv");
+              operand = parse_primary();
+              seq = list(
+                make_assign(type_loc, v_tv, operand),
+                make_builtin(type_loc, mc:b_ifelse, list(
+                  make_call(type_loc, make_recall(type_loc, "string?"), list(make_recall(type_loc, v_tv))),
+                  make_const(type_loc, "string"),
+                  make_builtin(type_loc, mc:b_ifelse, list(
+                    make_builtin(type_loc, mc:b_logical_or, list(
+                      make_call(type_loc, make_recall(type_loc, "integer?"), list(make_recall(type_loc, v_tv))),
+                      make_call(type_loc, make_recall(type_loc, "float?"), list(make_recall(type_loc, v_tv)))
+                    )),
+                    make_const(type_loc, "number"),
+                    make_builtin(type_loc, mc:b_ifelse, list(
+                      make_call(type_loc, make_recall(type_loc, "function?"), list(make_recall(type_loc, v_tv))),
+                      make_const(type_loc, "function"),
+                      make_builtin(type_loc, mc:b_ifelse, list(
+                        make_builtin(type_loc, mc:b_logical_or, list(
+                          make_call(type_loc, make_recall(type_loc, "vector?"), list(make_recall(type_loc, v_tv))),
+                          make_call(type_loc, make_recall(type_loc, "table?"), list(make_recall(type_loc, v_tv)))
+                        )),
+                        make_const(type_loc, "object"),
+                        make_const(type_loc, "undefined")
+                      ))
+                    ))
+                  ))
+                ))
+              );
+              make_block(
+                type_loc,
+                list(vector(v_tv, TYPESET_ANY, type_loc)),
+                seq
+              )
             ]
           // Parenthesized expression or Arrow function
           else if (match_tok("lparen"))
@@ -645,14 +722,15 @@ defines ts_tokenize, ts_parse_string
 
               // Build object as table creation block:
               // let _obj = make_table(); _obj["k1"] = v1; _obj
-              | seq, table_recall |
+              | seq, table_recall, v_obj |
+              v_obj = gen_tmp_var("obj");
               table_recall = make_call(obj_loc, make_recall(obj_loc, "make_table"), null);
-              seq = list(make_assign(obj_loc, "_obj", table_recall));
+              seq = list(make_assign(obj_loc, v_obj, table_recall));
               lforeach(fn (@(k . v)) [
-                seq = make_builtin(obj_loc, mc:b_set, list(make_recall(obj_loc, "_obj"), make_const(obj_loc, k), v)) . seq;
+                seq = make_builtin(obj_loc, mc:b_set, list(make_recall(obj_loc, v_obj), make_const(obj_loc, k), v)) . seq;
               ], lreverse!(pairs));
-              seq = make_recall(obj_loc, "_obj") . seq;
-              make_block(obj_loc, list(vector("_obj", typeset_any, obj_loc)), lreverse!(seq))
+              seq = make_recall(obj_loc, v_obj) . seq;
+              make_block(obj_loc, list(vector(v_obj, TYPESET_ANY, obj_loc)), lreverse!(seq))
             ]
           else
             [
@@ -749,15 +827,16 @@ defines ts_tokenize, ts_parse_string
                   // Spaceship Operator <=>
                   if (string_cmp(op_type, "op_spaceship") == 0)
                     [
-                      // let _sp_a = left; let _sp_b = right; if (_sp_a < _sp_b) -1 else if (_sp_a == _sp_b) 0 else 1
-                      | sp_loc, seq, cmp_lt, cmp_eq |
+                      | sp_loc, seq, cmp_lt, cmp_eq, v_spa, v_spb |
                       sp_loc = loc;
-                      cmp_lt = make_builtin(sp_loc, mc:b_lt, list(make_recall(sp_loc, "_sp_a"), make_recall(sp_loc, "_sp_b")));
-                      cmp_eq = make_builtin(sp_loc, mc:b_eq, list(make_recall(sp_loc, "_sp_a"), make_recall(sp_loc, "_sp_b")));
+                      v_spa = gen_tmp_var("spa");
+                      v_spb = gen_tmp_var("spb");
+                      cmp_lt = make_builtin(sp_loc, mc:b_lt, list(make_recall(sp_loc, v_spa), make_recall(sp_loc, v_spb)));
+                      cmp_eq = make_builtin(sp_loc, mc:b_eq, list(make_recall(sp_loc, v_spa), make_recall(sp_loc, v_spb)));
 
                       seq = list(
-                        make_assign(sp_loc, "_sp_a", left),
-                        make_assign(sp_loc, "_sp_b", right),
+                        make_assign(sp_loc, v_spa, left),
+                        make_assign(sp_loc, v_spb, right),
                         make_builtin(sp_loc, mc:b_ifelse, list(
                           cmp_lt,
                           make_const(sp_loc, -1),
@@ -771,27 +850,87 @@ defines ts_tokenize, ts_parse_string
 
                       left = make_block(
                         sp_loc,
-                        list(vector("_sp_a", typeset_any, sp_loc), vector("_sp_b", typeset_any, sp_loc)),
+                        list(vector(v_spa, TYPESET_ANY, sp_loc), vector(v_spb, TYPESET_ANY, sp_loc)),
+                        seq
+                      );
+                    ]
+                  // Polymorphic arithmetic & comparisons (+, -, *, /, <, <=, >, >=)
+                  else if (string_cmp(op_type, "op_add") == 0
+                           || string_cmp(op_type, "op_sub") == 0
+                           || string_cmp(op_type, "op_mul") == 0
+                           || string_cmp(op_type, "op_div") == 0
+                           || string_cmp(op_type, "op_lt") == 0
+                           || string_cmp(op_type, "op_le") == 0
+                           || string_cmp(op_type, "op_gt") == 0
+                           || string_cmp(op_type, "op_ge") == 0)
+                    [
+                      | num_loc, seq, is_flt, float_fn, float_branch, int_branch, v_na, v_nb |
+                      num_loc = loc;
+                      v_na = gen_tmp_var("na");
+                      v_nb = gen_tmp_var("nb");
+                      float_fn = if (string_cmp(op_type, "op_add") == 0) "fadd"
+                        else if (string_cmp(op_type, "op_sub") == 0) "fsub"
+                        else if (string_cmp(op_type, "op_mul") == 0) "fmul"
+                        else if (string_cmp(op_type, "op_div") == 0) "fdiv"
+                        else "fcmp";
+
+                      is_flt = make_builtin(num_loc, mc:b_logical_or, list(
+                        make_call(num_loc, make_recall(num_loc, "float?"), list(make_recall(num_loc, v_na))),
+                        make_call(num_loc, make_recall(num_loc, "float?"), list(make_recall(num_loc, v_nb)))
+                      ));
+
+                      if (string_cmp(float_fn, "fcmp") == 0)
+                        [
+                          | fcmp_call, rel_bfn |
+                          fcmp_call = make_call(num_loc, make_recall(num_loc, "fcmp"), list(make_recall(num_loc, v_na), make_recall(num_loc, v_nb)));
+                          rel_bfn = if (string_cmp(op_type, "op_lt") == 0) mc:b_lt
+                            else if (string_cmp(op_type, "op_le") == 0) mc:b_le
+                            else if (string_cmp(op_type, "op_gt") == 0) mc:b_gt
+                            else mc:b_ge;
+
+                          float_branch = make_builtin(num_loc, rel_bfn, list(fcmp_call, make_const(num_loc, 0)));
+                          int_branch = make_builtin(num_loc, rel_bfn, list(make_recall(num_loc, v_na), make_recall(num_loc, v_nb)));
+                        ]
+                      else
+                        [
+                          float_branch = make_call(num_loc, make_recall(num_loc, float_fn), list(make_recall(num_loc, v_na), make_recall(num_loc, v_nb)));
+                          int_branch = make_builtin(num_loc, bfn, list(make_recall(num_loc, v_na), make_recall(num_loc, v_nb)));
+                        ];
+
+                      seq = list(
+                        make_assign(num_loc, v_na, left),
+                        make_assign(num_loc, v_nb, right),
+                        make_builtin(num_loc, mc:b_ifelse, list(
+                          is_flt,
+                          float_branch,
+                          int_branch
+                        ))
+                      );
+
+                      left = make_block(
+                        num_loc,
+                        list(vector(v_na, TYPESET_ANY, num_loc), vector(v_nb, TYPESET_ANY, num_loc)),
                         seq
                       );
                     ]
                   else if (string_cmp(op_type, "op_nullish") == 0)
                     [
                       // Nullish coalescing: let _na = left; if (_na != null) _na else right
-                      | null_loc, seq, cmp_ne |
+                      | null_loc, seq, cmp_ne, v_na |
                       null_loc = loc;
-                      cmp_ne = make_builtin(null_loc, mc:b_ne, list(make_recall(null_loc, "_na"), make_const(null_loc, null)));
+                      v_na = gen_tmp_var("na");
+                      cmp_ne = make_builtin(null_loc, mc:b_ne, list(make_recall(null_loc, v_na), make_const(null_loc, null)));
                       seq = list(
-                        make_assign(null_loc, "_na", left),
+                        make_assign(null_loc, v_na, left),
                         make_builtin(null_loc, mc:b_ifelse, list(
                           cmp_ne,
-                          make_recall(null_loc, "_na"),
+                          make_recall(null_loc, v_na),
                           right
                         ))
                       );
                       left = make_block(
                         null_loc,
-                        list(vector("_na", typeset_any, null_loc)),
+                        list(vector(v_na, TYPESET_ANY, null_loc)),
                         seq
                       );
                     ]
@@ -980,8 +1119,8 @@ defines ts_tokenize, ts_parse_string
                   match_tok("rparen");
                   catch_body = parse_stmt_list("rbrace");
 
-                  try_fn = make_closure(loc, typeset_any, null, null, try_body, "try_body");
-                  catch_fn = make_closure(loc, typeset_any, null, list(vector(vector(format("%s", err_name), typeset_any, err_loc), null, null, null, null)), catch_body, "catch_body");
+                  try_fn = make_closure(loc, TYPESET_ANY, null, null, try_body, "try_body");
+                  catch_fn = make_closure(loc, TYPESET_ANY, null, list(vector(vector(format("%s", err_name), TYPESET_ANY, err_loc), null, null, null, null)), catch_body, "catch_body");
 
                   block_seq = make_call(loc, make_recall(loc, "trap_error"), list(try_fn, catch_fn, make_recall(loc, "call_trace_off"), make_const(loc, null))) . block_seq;
                 ]
@@ -993,12 +1132,49 @@ defines ts_tokenize, ts_parse_string
                   if (string_cmp(cur_tok()[0], "semicolon") == 0) match_tok("semicolon");
                   block_seq = make_call(loc, make_recall(loc, "error"), list(throw_expr)) . block_seq;
                 ]
-              // Function Declaration: function foo(a: number): string { ... }
+              // Type Alias Statement: type Name = ...;
+              else if (match_tok("keyword_type"))
+                [
+                  | brace_depth |
+                  brace_depth = 0;
+                  while ((brace_depth > 0 || string_cmp(cur_tok()[0], "semicolon") != 0) && string_cmp(cur_tok()[0], "eof") != 0)
+                    [
+                      if (string_cmp(cur_tok()[0], "lbrace") == 0) ++brace_depth
+                      else if (string_cmp(cur_tok()[0], "rbrace") == 0) --brace_depth;
+                      consume_tok();
+                    ];
+                  if (match_tok("semicolon")) null;
+                ]
+              // Interface Statement: interface Name { ... }
+              else if (match_tok("keyword_interface"))
+                [
+                  consume_tok(); // name
+                  if (string_cmp(cur_tok()[0], "lbrace") == 0)
+                    [
+                      consume_tok();
+                      | depth |
+                      depth = 1;
+                      while (depth > 0 && string_cmp(cur_tok()[0], "eof") != 0)
+                        [
+                          if (string_cmp(cur_tok()[0], "lbrace") == 0) ++depth
+                          else if (string_cmp(cur_tok()[0], "rbrace") == 0) --depth;
+                          consume_tok();
+                        ];
+                    ]
+                ]
+              // Function Declaration: function foo<T>(a: number): string { ... }
               else if (match_tok("keyword_function"))
                 [
                   | fn_name, params, ret_type, body_s, closure_comp |
                   fn_name = cur_tok()[1];
                   consume_tok(); // fn name
+                  if (string_cmp(cur_tok()[0], "op_lt") == 0)
+                    [
+                      consume_tok();
+                      while (string_cmp(cur_tok()[0], "op_gt") != 0 && string_cmp(cur_tok()[0], "eof") != 0)
+                        consume_tok();
+                      match_tok("op_gt");
+                    ];
                   match_tok("lparen");
                   params = null;
                   if (string_cmp(cur_tok()[0], "rparen") != 0)
@@ -1021,7 +1197,7 @@ defines ts_tokenize, ts_parse_string
                   ret_type = parse_type();
                   body_s = parse_stmt_list("rbrace");
 
-                  block_locals = vector(format("%s", fn_name), typeset_any, loc) . block_locals;
+                  block_locals = vector(format("%s", fn_name), TYPESET_ANY, loc) . block_locals;
                   closure_comp = make_closure(loc, ret_type, null, lreverse!(params), body_s, fn_name);
                   block_seq = make_assign(loc, fn_name, closure_comp) . block_seq;
                 ]
