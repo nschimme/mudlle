@@ -106,5 +106,13 @@
   regress("load_ts status", ts_stats["status"], 200);
   regress("load_ts summary", ts_stats["summary"], "text:valid");
 
+  // 17. Classes, Constructors, Methods, and Inheritance
+  regress("ts_eval class instance method",
+          ts_eval("class Point { x: number = 10; y: number = 20; constructor(x: number, y: number) { this.x = x; this.y = y; }; getSum(): number { return this.x + this.y; }; }; let p = new Point(15, 25); p.getSum();"), 40);
+  regress("ts_eval class static method",
+          ts_eval("class Point { static originVal(): number { return 100; }; }; Point.originVal();"), 100);
+  regress("ts_eval class extends inheritance",
+          ts_eval("class Animal { sound: string = \"generic\"; getSound(): string { return this.sound; }; }; class Dog extends Animal { constructor() { this.sound = \"woof\"; }; }; let d = new Dog(); d.getSound();"), "woof");
+
   true
 ];

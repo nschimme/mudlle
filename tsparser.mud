@@ -52,6 +52,17 @@ defines ts_tokenize, ts_parse_string
   keywords_tab["interface"] = "keyword_interface";
   keywords_tab["typeof"] = "keyword_typeof";
   keywords_tab["export"] = "keyword_export";
+  keywords_tab["class"] = "keyword_class";
+  keywords_tab["new"] = "keyword_new";
+  keywords_tab["this"] = "keyword_this";
+  keywords_tab["constructor"] = "keyword_constructor";
+  keywords_tab["public"] = "keyword_public";
+  keywords_tab["private"] = "keyword_private";
+  keywords_tab["protected"] = "keyword_protected";
+  keywords_tab["readonly"] = "keyword_readonly";
+  keywords_tab["static"] = "keyword_static";
+  keywords_tab["extends"] = "keyword_extends";
+  keywords_tab["super"] = "keyword_super";
 
   ts_type_to_typeset = fn (name)
     [
@@ -423,7 +434,7 @@ defines ts_tokenize, ts_parse_string
     [
       | tokens, tok_pos, cur_tok, match_tok, consume_tok, tok_loc,
         parse_expr, parse_assign, parse_binary, parse_primary,
-        parse_stmt_list, parse_type, gen_tmp_var, tmp_var_count,
+        parse_stmt_list, parse_type, parse_class_decl, gen_tmp_var, tmp_var_count,
         make_const, make_recall, make_assign, make_call, make_builtin, make_block, make_closure |
 
       tmp_var_count = 0;
@@ -496,12 +507,12 @@ defines ts_tokenize, ts_parse_string
           mc:c_klocals   . locals_list,
           mc:c_ksequence . seq_list);
 
-      make_closure = fn (loc, ret_typeset, help, fullargs, body_comp, fn_name)
+      make_closure = fn (loc, ret_typeset, help, fullargs, body_comp, fn_name, nopt = 0, vararg = false)
         [
-          | nargs, nopt, vararg |
+          | nargs |
+          if (nopt == null) nopt = 0;
+          if (vararg == null) vararg = false;
           nargs = llength(fullargs);
-          nopt = 0;
-          vararg = false;
           indexed_vector(
             mc:c_class           . mc:c_closure,
             mc:c_loc             . loc,
@@ -589,6 +600,31 @@ defines ts_tokenize, ts_parse_string
           else if (match_tok("string") || match_tok("template_literal")) make_const(loc, tok[1])
           else if (match_tok("keyword_true")) make_const(loc, true)
           else if (match_tok("keyword_false")) make_const(loc, false)
+          else if (match_tok("keyword_this")) make_recall(loc, "this")
+          else if (match_tok("keyword_new"))
+            [
+              | class_ident, new_loc, ctor_fn |
+              new_loc = loc;
+              class_ident = parse_primary();
+              ctor_fn = make_builtin(new_loc, mc:b_ref, list(class_ident, make_const(new_loc, "new")));
+              if (match_tok("lparen"))
+                [
+                  | ctor_args |
+                  ctor_args = null;
+                  if (string_cmp(cur_tok()[0], "rparen") != 0)
+                    [
+                      loop
+                        [
+                          ctor_args = parse_expr() . ctor_args;
+                          if (!match_tok("comma")) exit null;
+                        ]
+                    ];
+                  match_tok("rparen");
+                  make_call(new_loc, ctor_fn, lreverse!(ctor_args))
+                ]
+              else
+                make_call(new_loc, ctor_fn, null)
+            ]
           else if (match_tok("keyword_null") || match_tok("keyword_undefined")) make_const(loc, null)
           else if (string_cmp(tok[0], "identifier") == 0)
             [
@@ -636,9 +672,11 @@ defines ts_tokenize, ts_parse_string
           // Parenthesized expression or Arrow function
           else if (match_tok("lparen"))
             [
-              | params, saved_pos, ret_type |
+              | params, saved_pos, ret_type, nopt, vararg |
               saved_pos = tok_pos - 1;
               params = null;
+              nopt = 0;
+              vararg = false;
 
               if (string_cmp(cur_tok()[0], "rparen") != 0)
                 [
@@ -667,7 +705,7 @@ defines ts_tokenize, ts_parse_string
                     body = parse_stmt_list("rbrace")
                   else
                     body = parse_expr();
-                  make_closure(loc, ret_type, null, lreverse!(params), body, "arrow")
+                  make_closure(loc, ret_type, null, lreverse!(params), body, "arrow", nopt, vararg)
                 ]
               else
                 [
@@ -775,18 +813,82 @@ defines ts_tokenize, ts_parse_string
               else if (string_cmp(op_type, "lparen") == 0)
                 [
                   consume_tok();
-                  | args |
+                  | args, is_spread |
                   args = null;
+                  is_spread = false;
                   if (string_cmp(cur_tok()[0], "rparen") != 0)
                     [
                       loop
                         [
-                          args = parse_expr() . args;
+                          if (match_tok("op_rest"))
+                            [
+                              is_spread = true;
+                              args = parse_expr();
+                            ]
+                          else
+                            args = parse_expr() . args;
                           if (!match_tok("comma")) exit null;
                         ]
                     ];
                   match_tok("rparen");
-                  left = make_call(loc, left, lreverse!(args));
+
+                  // Desugar obj.method(args) -> pass obj as implicit 1st argument (this), unless prop is "new"
+                  if (left[mc:c_class] == mc:c_builtin && left[mc:c_bfn] == mc:b_ref)
+                    [
+                      | call_loc, target_obj, prop_expr, v_o, v_m, seq, is_new_prop |
+                      call_loc = loc;
+                      target_obj = car(left[mc:c_bargs]);
+                      prop_expr = cadr(left[mc:c_bargs]);
+
+                      is_new_prop = prop_expr[mc:c_class] == mc:c_constant && equal?(prop_expr[mc:c_cvalue], "new");
+
+                      v_o = gen_tmp_var("o");
+                      v_m = gen_tmp_var("m");
+
+                      | full_args |
+                      if (is_new_prop)
+                        [
+                          if (is_spread)
+                            full_args = args
+                          else
+                            full_args = lreverse!(args);
+
+                          seq = list(
+                            make_assign(call_loc, v_o, target_obj),
+                            make_assign(call_loc, v_m, make_builtin(call_loc, mc:b_ref, list(make_recall(call_loc, v_o), prop_expr)))
+                          );
+
+                          if (is_spread)
+                            seq = lappend!(seq, list(make_call(call_loc, make_recall(call_loc, "apply"), list(make_recall(call_loc, v_m), full_args))))
+                          else
+                            seq = lappend!(seq, list(make_call(call_loc, make_recall(call_loc, v_m), full_args)));
+
+                          left = make_block(call_loc, list(vector(v_o, TYPESET_ANY, call_loc), vector(v_m, TYPESET_ANY, call_loc)), seq);
+                        ]
+                      else
+                        [
+                          if (is_spread)
+                            full_args = list(make_recall(call_loc, v_o), args)
+                          else
+                            full_args = make_recall(call_loc, v_o) . lreverse!(args);
+
+                          seq = list(
+                            make_assign(call_loc, v_o, target_obj),
+                            make_assign(call_loc, v_m, make_builtin(call_loc, mc:b_ref, list(make_recall(call_loc, v_o), prop_expr)))
+                          );
+
+                          if (is_spread)
+                            seq = lappend!(seq, list(make_call(call_loc, make_recall(call_loc, "apply"), list(make_recall(call_loc, v_m), full_args))))
+                          else
+                            seq = lappend!(seq, list(make_call(call_loc, make_recall(call_loc, v_m), full_args)));
+
+                          left = make_block(call_loc, list(vector(v_o, TYPESET_ANY, call_loc), vector(v_m, TYPESET_ANY, call_loc)), seq);
+                        ]
+                    ]
+                  else if (is_spread)
+                    left = make_call(loc, make_recall(loc, "apply"), list(left, args))
+                  else
+                    left = make_call(loc, left, lreverse!(args));
                 ]
               else
                 [
@@ -980,7 +1082,229 @@ defines ts_tokenize, ts_parse_string
       // Statement list parser collecting block-scoped local variables and statement components
       parse_stmt_list = fn (string end_token)
         [
-          | block_loc, block_locals, block_seq, top_level |
+          | block_loc, block_locals, block_seq, top_level, parse_class_decl |
+          parse_class_decl = fn (is_exp)
+            [
+              | class_name, parent_name, class_loc, ctor_params, ctor_body, instance_methods, field_inits, static_methods, nopt, vararg |
+              class_loc = tok_loc();
+              class_name = cur_tok()[1];
+              consume_tok(); // ClassName
+
+              parent_name = null;
+              if (match_tok("keyword_extends"))
+                [
+                  parent_name = cur_tok()[1];
+                  consume_tok();
+                ];
+
+              match_tok("lbrace"); // {
+
+              ctor_params = null;
+              ctor_body = null;
+              instance_methods = null;
+              field_inits = null;
+              static_methods = null;
+              nopt = 0;
+              vararg = false;
+
+              while (string_cmp(cur_tok()[0], "rbrace") != 0 && string_cmp(cur_tok()[0], "eof") != 0)
+                [
+                  | member_loc, is_static |
+                  member_loc = tok_loc();
+                  // Skip visibility modifiers
+                  match_tok("keyword_public");
+                  match_tok("keyword_private");
+                  match_tok("keyword_protected");
+                  is_static = match_tok("keyword_static");
+                  match_tok("keyword_readonly");
+
+                  | member_name, member_tok |
+                  member_tok = cur_tok();
+                  if (string_cmp(member_tok[0], "keyword_constructor") == 0)
+                    [
+                      consume_tok(); // constructor
+                      match_tok("lparen");
+                      if (string_cmp(cur_tok()[0], "rparen") != 0)
+                        [
+                          loop
+                            [
+                              | p_tok, p_loc, p_type, is_opt, is_rest, def_val |
+                              is_rest = match_tok("op_rest");
+                              p_tok = cur_tok();
+                              p_loc = p_tok[2];
+                              if (string_cmp(p_tok[0], "identifier") == 0)
+                                [
+                                  consume_tok();
+                                  is_opt = match_tok("question");
+                                  p_type = parse_type();
+                                  def_val = null;
+                                  if (match_tok("op_assign"))
+                                    [
+                                      def_val = parse_expr();
+                                      is_opt = true;
+                                    ];
+                                  if (is_opt)
+                                    [
+                                      ++nopt;
+                                      p_type = p_type | TYPESET_FLAG_OPTIONAL;
+                                      if (def_val == null) def_val = make_const(p_loc, null);
+                                    ];
+                                  if (is_rest)
+                                    [
+                                      vararg = true;
+                                      p_type = null;
+                                    ];
+                                  ctor_params = vector(vector(format("%s", p_tok[1]), p_type, p_loc), null, null, null, def_val) . ctor_params;
+                                ];
+                              if (!match_tok("comma")) exit null;
+                            ]
+                        ];
+                      match_tok("rparen");
+                      ctor_body = parse_stmt_list("rbrace");
+                    ]
+                  else if (string_cmp(member_tok[0], "identifier") == 0)
+                    [
+                      member_name = member_tok[1];
+                      consume_tok(); // member_name
+
+                      // Method vs Field check
+                      if (string_cmp(cur_tok()[0], "lparen") == 0 || string_cmp(cur_tok()[0], "op_lt") == 0)
+                        [
+                          // Method declaration
+                          if (string_cmp(cur_tok()[0], "op_lt") == 0)
+                            [
+                              consume_tok();
+                              while (string_cmp(cur_tok()[0], "op_gt") != 0 && string_cmp(cur_tok()[0], "eof") != 0)
+                                consume_tok();
+                              match_tok("op_gt");
+                            ];
+                          match_tok("lparen");
+                          | m_params, m_ret, m_body, mnopt, mvararg |
+                          m_params = list(vector(vector("this", TYPESET_ANY, member_loc), null, null, null, null));
+                          mnopt = 0;
+                          mvararg = false;
+                          if (string_cmp(cur_tok()[0], "rparen") != 0)
+                            [
+                              loop
+                                [
+                                  | p_tok, p_loc, p_type, is_opt, is_rest, def_val |
+                                  is_rest = match_tok("op_rest");
+                                  p_tok = cur_tok();
+                                  p_loc = p_tok[2];
+                                  if (string_cmp(p_tok[0], "identifier") == 0)
+                                    [
+                                      consume_tok();
+                                      is_opt = match_tok("question");
+                                      p_type = parse_type();
+                                      def_val = null;
+                                      if (match_tok("op_assign"))
+                                        [
+                                          def_val = parse_expr();
+                                          is_opt = true;
+                                        ];
+                                      if (is_opt)
+                                        [
+                                          ++mnopt;
+                                          p_type = p_type | TYPESET_FLAG_OPTIONAL;
+                                          if (def_val == null) def_val = make_const(p_loc, null);
+                                        ];
+                                      if (is_rest)
+                                        [
+                                          mvararg = true;
+                                          p_type = null;
+                                        ];
+                                      m_params = vector(vector(format("%s", p_tok[1]), p_type, p_loc), null, null, null, def_val) . m_params;
+                                    ];
+                                  if (!match_tok("comma")) exit null;
+                                ]
+                            ];
+                          match_tok("rparen");
+                          m_ret = parse_type();
+                          m_body = parse_stmt_list("rbrace");
+
+                          | m_closure |
+                          m_closure = make_closure(member_loc, m_ret, null, lreverse!(m_params), m_body, member_name, mnopt, mvararg);
+
+                          if (is_static)
+                            static_methods = (member_name . m_closure) . static_methods
+                          else
+                            instance_methods = (member_name . m_closure) . instance_methods;
+                        ]
+                      else
+                        [
+                          // Field declaration
+                          | f_init |
+                          parse_type();
+                          f_init = null;
+                          if (match_tok("op_assign"))
+                            f_init = parse_expr();
+                          if (match_tok("semicolon")) null;
+
+                          field_inits = (member_name . f_init) . field_inits;
+                        ]
+                    ]
+                  else
+                    consume_tok();
+                ];
+
+              match_tok("rbrace"); // }
+
+              // Construct Class Factory Function
+              | factory_seq, v_this, table_recall |
+              v_this = "this";
+              factory_seq = null;
+
+              if (parent_name != null)
+                [
+                  // Inheritance: let this = parent_name["new"]();
+                  | parent_ctor |
+                  parent_ctor = make_builtin(class_loc, mc:b_ref, list(make_recall(class_loc, parent_name), make_const(class_loc, "new")));
+                  factory_seq = list(make_assign(class_loc, v_this, make_call(class_loc, parent_ctor, null)))
+                ]
+              else
+                [
+                  table_recall = make_call(class_loc, make_recall(class_loc, "make_table"), null);
+                  factory_seq = list(make_assign(class_loc, v_this, table_recall))
+                ];
+
+              // Attach instance methods to this[m_name] = method_fn
+              lforeach(fn (@(m_name . m_comp)) [
+                factory_seq = make_builtin(class_loc, mc:b_set, list(make_recall(class_loc, v_this), make_const(class_loc, m_name), m_comp)) . factory_seq;
+              ], lreverse!(instance_methods));
+
+              // Initialize fields
+              lforeach(fn (@(f_name . f_comp)) [
+                if (f_comp != null)
+                  factory_seq = make_builtin(class_loc, mc:b_set, list(make_recall(class_loc, v_this), make_const(class_loc, f_name), f_comp)) . factory_seq;
+              ], lreverse!(field_inits));
+
+              // Constructor body statements
+              if (ctor_body != null)
+                factory_seq = ctor_body . factory_seq;
+
+              // Return this
+              factory_seq = make_recall(class_loc, v_this) . factory_seq;
+
+              | class_factory_closure, ctor_full_params |
+              ctor_full_params = lreverse!(ctor_params);
+              class_factory_closure = make_closure(class_loc, TSET_TAB, null, ctor_full_params, make_block(class_loc, list(vector(v_this, TSET_TAB, class_loc)), lreverse!(factory_seq)), "new", nopt, vararg);
+
+              // Register class name
+              if (is_exp)
+                [
+                  has_exports = true;
+                  top_defines = vector(format("%s", class_name), TYPESET_ANY, class_loc) . top_defines;
+                ]
+              else
+                block_locals = vector(format("%s", class_name), TYPESET_ANY, class_loc) . block_locals;
+
+              block_seq = make_assign(class_loc, class_name, make_call(class_loc, make_recall(class_loc, "make_table"), null)) . block_seq;
+              block_seq = make_builtin(class_loc, mc:b_set, list(make_recall(class_loc, class_name), make_const(class_loc, "new"), class_factory_closure)) . block_seq;
+
+              lforeach(fn (@(s_name . s_comp)) [
+                block_seq = make_builtin(class_loc, mc:b_set, list(make_recall(class_loc, class_name), make_const(class_loc, s_name), s_comp)) . block_seq;
+              ], lreverse!(static_methods));
+            ];
           block_loc = tok_loc();
           block_locals = null;
           block_seq = null;
@@ -995,16 +1319,21 @@ defines ts_tokenize, ts_parse_string
               tok = cur_tok();
               loc = tok[2];
 
-              // Export Statement: export function ... | export let/const/var ... | export { ... }
+              // Export Statement: export function ... | export class ... | export let/const/var ... | export { ... }
               if (match_tok("keyword_export"))
                 [
                   has_exports = true;
                   | exp_tok |
                   exp_tok = cur_tok();
-                  if (string_cmp(exp_tok[0], "keyword_function") == 0)
+                  if (string_cmp(exp_tok[0], "keyword_class") == 0)
+                    [
+                      consume_tok(); // class
+                      parse_class_decl(true);
+                    ]
+                  else if (string_cmp(exp_tok[0], "keyword_function") == 0)
                     [
                       consume_tok(); // function
-                      | fn_name, params, ret_type, body_s, closure_comp |
+                      | fn_name, params, ret_type, body_s, closure_comp, nopt, vararg |
                       fn_name = cur_tok()[1];
                       consume_tok(); // fn name
                       if (string_cmp(cur_tok()[0], "op_lt") == 0)
@@ -1016,18 +1345,39 @@ defines ts_tokenize, ts_parse_string
                         ];
                       match_tok("lparen");
                       params = null;
+                      nopt = 0;
+                      vararg = false;
                       if (string_cmp(cur_tok()[0], "rparen") != 0)
                         [
                           loop
                             [
-                              | p_tok, p_loc, p_type |
+                              | p_tok, p_loc, p_type, is_opt, is_rest, def_val |
+                              is_rest = match_tok("op_rest");
                               p_tok = cur_tok();
                               p_loc = p_tok[2];
                               if (string_cmp(p_tok[0], "identifier") == 0)
                                 [
                                   consume_tok();
+                                  is_opt = match_tok("question");
                                   p_type = parse_type();
-                                  params = vector(vector(format("%s", p_tok[1]), p_type, p_loc), null, null, null, null) . params;
+                                  def_val = null;
+                                  if (match_tok("op_assign"))
+                                    [
+                                      def_val = parse_expr();
+                                      is_opt = true;
+                                    ];
+                                  if (is_opt)
+                                    [
+                                      ++nopt;
+                                      p_type = p_type | TYPESET_FLAG_OPTIONAL;
+                                      if (def_val == null) def_val = make_const(p_loc, null);
+                                    ];
+                                  if (is_rest)
+                                    [
+                                      vararg = true;
+                                      p_type = null;
+                                    ];
+                                  params = vector(vector(format("%s", p_tok[1]), p_type, p_loc), null, null, null, def_val) . params;
                                 ];
                               if (!match_tok("comma")) exit null;
                             ]
@@ -1036,8 +1386,8 @@ defines ts_tokenize, ts_parse_string
                       ret_type = parse_type();
                       body_s = parse_stmt_list("rbrace");
 
-                      top_defines = format("%s", fn_name) . top_defines;
-                      closure_comp = make_closure(loc, ret_type, null, lreverse!(params), body_s, fn_name);
+                      top_defines = vector(format("%s", fn_name), TYPESET_ANY, loc) . top_defines;
+                      closure_comp = make_closure(loc, ret_type, null, lreverse!(params), body_s, fn_name, nopt, vararg);
                       block_seq = make_assign(loc, fn_name, closure_comp) . block_seq;
                     ]
                   else if (string_cmp(exp_tok[0], "keyword_let") == 0 || string_cmp(exp_tok[0], "keyword_const") == 0 || string_cmp(exp_tok[0], "keyword_var") == 0)
@@ -1052,8 +1402,8 @@ defines ts_tokenize, ts_parse_string
                             [
                               consume_tok();
                               v_name = v_tok[1];
-                              v_type = parse_type();
-                              top_defines = format("%s", v_name) . top_defines;
+                              parse_type();
+                              top_defines = vector(format("%s", v_name), TYPESET_ANY, v_loc) . top_defines;
 
                               if (match_tok("op_assign"))
                                 [
@@ -1217,7 +1567,7 @@ defines ts_tokenize, ts_parse_string
                   try_fn = make_closure(loc, TYPESET_ANY, null, null, try_body, "try_body");
                   catch_fn = make_closure(loc, TYPESET_ANY, null, list(vector(vector(format("%s", err_name), TYPESET_ANY, err_loc), null, null, null, null)), catch_body, "catch_body");
 
-                  block_seq = make_call(loc, make_recall(loc, "trap_error"), list(try_fn, catch_fn, make_recall(loc, "call_trace_off"), make_const(loc, null))) . block_seq;
+                  block_seq = make_call(loc, make_recall(loc, "trap_error"), list(try_fn, catch_fn, make_const(loc, 0), make_const(loc, null))) . block_seq;
                 ]
               // Throw Statement: throw expr;
               else if (match_tok("keyword_throw"))
@@ -1257,10 +1607,15 @@ defines ts_tokenize, ts_parse_string
                         ];
                     ]
                 ]
+              // Class Declaration: class ClassName [extends ParentName] { ... }
+              else if (match_tok("keyword_class"))
+                [
+                  parse_class_decl(false);
+                ]
               // Function Declaration: function foo<T>(a: number): string { ... }
               else if (match_tok("keyword_function"))
                 [
-                  | fn_name, params, ret_type, body_s, closure_comp |
+                  | fn_name, params, ret_type, body_s, closure_comp, nopt, vararg |
                   fn_name = cur_tok()[1];
                   consume_tok(); // fn name
                   if (string_cmp(cur_tok()[0], "op_lt") == 0)
@@ -1272,18 +1627,39 @@ defines ts_tokenize, ts_parse_string
                     ];
                   match_tok("lparen");
                   params = null;
+                  nopt = 0;
+                  vararg = false;
                   if (string_cmp(cur_tok()[0], "rparen") != 0)
                     [
                       loop
                         [
-                          | p_tok, p_loc, p_type |
+                          | p_tok, p_loc, p_type, is_opt, is_rest, def_val |
+                          is_rest = match_tok("op_rest");
                           p_tok = cur_tok();
                           p_loc = p_tok[2];
                           if (string_cmp(p_tok[0], "identifier") == 0)
                             [
                               consume_tok();
+                              is_opt = match_tok("question");
                               p_type = parse_type();
-                              params = vector(vector(format("%s", p_tok[1]), p_type, p_loc), null, null, null, null) . params;
+                              def_val = null;
+                              if (match_tok("op_assign"))
+                                [
+                                  def_val = parse_expr();
+                                  is_opt = true;
+                                ];
+                              if (is_opt)
+                                [
+                                  ++nopt;
+                                  p_type = p_type | TYPESET_FLAG_OPTIONAL;
+                                  if (def_val == null) def_val = make_const(p_loc, null);
+                                ];
+                              if (is_rest)
+                                [
+                                  vararg = true;
+                                  p_type = null;
+                                ];
+                              params = vector(vector(format("%s", p_tok[1]), p_type, p_loc), null, null, null, def_val) . params;
                             ];
                           if (!match_tok("comma")) exit null;
                         ]
@@ -1297,7 +1673,7 @@ defines ts_tokenize, ts_parse_string
                   else
                     top_defines = format("%s", fn_name) . top_defines;
 
-                  closure_comp = make_closure(loc, ret_type, null, lreverse!(params), body_s, fn_name);
+                  closure_comp = make_closure(loc, ret_type, null, lreverse!(params), body_s, fn_name, nopt, vararg);
                   block_seq = make_assign(loc, fn_name, closure_comp) . block_seq;
                 ]
               // Nested Block Statement: { ... }

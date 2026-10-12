@@ -100,6 +100,33 @@ function process_scores(scores: ScoreList, threshold: number): ProcessResult {
   };
 };
 
+class Shape {
+  name: string = "shape";
+
+  getName(): string {
+    return this.name;
+  }
+}
+
+class Circle extends Shape {
+  radius: number;
+
+  constructor(r: number) {
+    this.name = "circle";
+    this.radius = r;
+  }
+
+  area(): number {
+    return 3.14 * this.radius * this.radius;
+  }
+
+  static unitCircle(): Circle {
+    return new Circle(1.0);
+  }
+}
+
+let c = Circle.unitCircle();
+
 let scores: ScoreList = [10.5, 25.5, 40.0, 15.0, 50.0];
 let stats: ProcessResult = process_scores(scores, 20.0);
 

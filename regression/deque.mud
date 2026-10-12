@@ -76,5 +76,16 @@
   path_len = bfs_shortest_path(graph, "A", "E");
   regress("bfs_shortest_path A -> E", path_len, 2);
 
+  // Test Deque class instance
+  | dq_obj |
+  dq_obj = Deque["new"]();
+  dq_obj[ "pushBack" ](dq_obj, 100);
+  dq_obj[ "pushFront" ](dq_obj, 50);
+  regress("Deque class size", dq_obj[ "size" ](dq_obj), 2);
+  regress("Deque class peekFront", dq_obj[ "peekFront" ](dq_obj), 50);
+  regress("Deque class peekBack", dq_obj[ "peekBack" ](dq_obj), 100);
+  regress("Deque class popFront", dq_obj[ "popFront" ](dq_obj), 50);
+  regress("Deque class size after pop", dq_obj[ "size" ](dq_obj), 1);
+
   true
 ];

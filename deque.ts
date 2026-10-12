@@ -208,3 +208,43 @@ export function bfs_shortest_path(graph: object, start: string, target: string):
 
   return -1; // Unreachable
 };
+
+export class Deque {
+  d: vector;
+
+  constructor() {
+    this.d = deque_new();
+  }
+
+  size(): number {
+    return deque_size(this.d);
+  }
+
+  isEmpty(): boolean {
+    return deque_is_empty(this.d);
+  }
+
+  pushBack(val: any): void {
+    deque_push_back(this.d, val);
+  }
+
+  pushFront(val: any): void {
+    deque_push_front(this.d, val);
+  }
+
+  popFront(): any {
+    return deque_pop_front(this.d);
+  }
+
+  popBack(): any {
+    return deque_pop_back(this.d);
+  }
+
+  peekFront(): any {
+    return deque_peek_front(this.d);
+  }
+
+  peekBack(): any {
+    return deque_peek_back(this.d);
+  }
+}
