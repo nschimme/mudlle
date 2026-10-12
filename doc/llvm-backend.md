@@ -388,6 +388,15 @@ constant float globals (what `#arith(f)` expands to) use `llvm_float_binop`
 operands and NaN comparisons fall back to the generic call so errors are
 unchanged.
 
+`fadd`/`fsub`/`fmul`/`fdiv` and `fneg`/`fabs`/`fsqrt` run on raw doubles:
+`mudlle_try_double` converts a fixnum or float operand inline, and an anonymous
+temporary that is defined once and used once, by another such call in the same
+basic block, stays a double and is never boxed (`llvm_find_float_temps`). The
+result of a chain is boxed once with `llvm_box_float`. A bigint or invalid
+operand takes the generic call after boxing any double operands, so results and
+errors are unchanged. `fmod` and the libm-backed functions keep using the
+boxed helpers, since the JIT does not resolve libm symbols.
+
 #### Hardcoded layouts
 
 Generated IR hardcodes `call_llvm` (11), `struct call_stack_mudlle` offsets

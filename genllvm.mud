@@ -49,11 +49,14 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
     function_roots_required,
     llvm_function_may_allocate?, llvm_allocate_slots, llvm_slot_number,
     slot_indices, llvm_instruction_may_allocate?, root_slot_indices, nonallocating_ops, nonallocating_branches, vector_find_required,
-    llvm_inline_max_size, closure_cache_fns, closure_cache_seen |
+    llvm_inline_max_size, closure_cache_fns, closure_cache_seen,
+    float_internal, float_doubles, llvm_float_call_op, llvm_find_float_temps |
 
   llvm_inline_max_size = 3500;
   closure_cache_fns = null;
   closure_cache_seen = make_table();
+  float_internal = make_table();
+  float_doubles = make_table();
   tmp_seq = 0;
   globals_seen = make_table();
   current_ifn = null;
@@ -608,6 +611,88 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       vector(ptr, mark, "null", count)
     ];
 
+  // For a call to fadd/fsub/fmul/fdiv or fneg/fabs/fsqrt on non-function
+  // arguments: (index . unary?), else null. These can run on raw doubles.
+  llvm_float_call_op = fn (ins)
+    [
+      | args, fnv, names, found, idx, unary |
+      if (ins[mc:i_class] != mc:i_call) exit<function> null;
+      args = ins[mc:i_cargs];
+      fnv = car(args);
+      if (fnv[mc:v_class] != mc:v_global_constant
+          || lexists?(fn (v) v[mc:v_class] == mc:v_function, cdr(args)))
+        exit<function> null;
+      unary = llength(cdr(args)) == 1;
+      names = if (unary) '("fneg" "fabs" "fsqrt")
+              else if (llength(cdr(args)) == 2)
+                '("fadd" "fsub" "fmul" "fdiv")
+              else null;
+      found = -1;
+      idx = 0;
+      lforeach(fn (cand) [
+        if (found < 0 && string_equal?(fnv[mc:v_name], cand)) found = idx;
+        idx = idx + 1;
+      ], names);
+      if (found < 0) null else found . unary
+    ];
+
+  // Marks anonymous temporaries that are produced by a raw-double-capable
+  // float call and consumed exactly once, in the same basic block, by another
+  // one; such a value never needs a boxed float object.
+  llvm_find_float_temps = fn (ifn)
+    [
+      | uses, defs, produced, consumed, block, scan, il, ins, dest, key |
+      float_internal = make_table();
+      float_doubles = make_table();
+      if (!vector?(ifn[mc:c_fvalue])) exit<function> null;
+      uses = make_table();
+      defs = make_table();
+      produced = make_table();
+      consumed = make_table();
+      block = 0;
+      scan = ifn[mc:c_fvalue];
+      loop [
+        il = dget(scan);
+        if (il[mc:il_label]) block = block + 1;
+        ins = il[mc:il_ins];
+        if (ins != null)
+          [
+            lforeach(fn (v) [
+              if (vector?(v) && v[mc:v_class] == mc:v_local
+                  && slength(v[mc:v_name]) == 0)
+                [
+                  key = itoa(v[mc:v_number]);
+                  uses[key] = if (uses[key] == null) 1 else uses[key] + 1;
+                ];
+            ], mc:arguments(ins, null));
+            dest = if (ins[mc:i_class] == mc:i_closure
+                       || ins[mc:i_class] == mc:i_maybe_sconcat)
+              false
+            else mc:defined_var(ins);
+            if (dest && vector?(dest) && dest[mc:v_class] == mc:v_local
+                && slength(dest[mc:v_name]) == 0)
+              [
+                key = itoa(dest[mc:v_number]);
+                defs[key] = if (defs[key] == null) 1 else defs[key] + 1;
+                if (llvm_float_call_op(ins) != null)
+                  produced[key] = block;
+              ];
+            if (llvm_float_call_op(ins) != null)
+              lforeach(fn (v) [
+                if (vector?(v) && v[mc:v_class] == mc:v_local
+                    && slength(v[mc:v_name]) == 0)
+                  consumed[itoa(v[mc:v_number])] = block;
+              ], cdr(ins[mc:i_cargs]));
+          ];
+        scan = dnext(scan);
+        if (scan == ifn[mc:c_fvalue]) exit 0;
+      ];
+      table_foreach(fn (@<k = b>) [
+        if (defs[k] == 1 && uses[k] == 1 && consumed[k] == b)
+          float_internal[k] = true;
+      ], produced);
+    ];
+
   // True if 'ifn' takes exactly 'count' fixed arguments, no optional or
   // variable-length ones.
   llvm_exact_arity? = fn (ifn, count)
@@ -1090,6 +1175,8 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
       w = writer:new_string();
       closure_cache_fns = null;
       closure_cache_seen = make_table();
+      if (pair?(ifn[mc:c_fvalue])) mc:flatten_blocks(ifn);
+      llvm_find_float_temps(ifn);
       fname = format("fn_%d", ifn[mc:c_fnumber]);
       args = lmap(fn (fa) fa[0][0], ifn[mc:c_ffullargs]);
 
@@ -2069,7 +2156,7 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
             root_slots, root_records, root_token, root_slot_ptr,
             root_slots_data, root_records_data, arg_count,
             arg_slot, root_index, call_id, secure_call, floatop, floatres, floatunary,
-            direct_fn, self_call |
+            direct_fn, self_call, chain, chain_internal, fop |
           dest_var = ins[mc:i_cdest];
           call_args = ins[mc:i_cargs];
           fn_var = car(call_args);
@@ -2111,7 +2198,82 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                 idx = idx + 1;
               ], names);
             ];
-          if (floatop >= 0)
+          chain = floatop >= 0 && llvm_float_call_op(ins) != null;
+          if (chain)
+            [
+              // Raw-double arithmetic: operands that are single-use float
+              // temporaries stay doubles; other operands are converted
+              // inline. Anything unconvertible takes the generic call.
+              | fid, k, allok, dnames, dn, tname, op_text, boxed |
+              fid = call_id;
+              chain_internal = float_internal[itoa(dest_var[mc:v_number])]
+                != null;
+              writer:format(w, "  br label %%fl_start_%d\nfl_start_%d:\n",
+                            fid, fid);
+              k = 0;
+              allok = "true";
+              dnames = null;
+              lforeach(fn (a) [
+                dn = float_doubles[itoa(a[mc:v_number])];
+                if (dn == null)
+                  [
+                    tname = format("%%fl_t_%d_%d", fid, k);
+                    writer:format(w,
+                      "  %s = call { double, i1 } @mudlle_try_double(i64 %s)\n\
+  %%fl_d_%d_%d = extractvalue { double, i1 } %s, 0\n\
+  %%fl_o_%d_%d = extractvalue { double, i1 } %s, 1\n\
+  %%fl_a_%d_%d = and i1 %s, %%fl_o_%d_%d\n",
+                      tname, llvm_read_var(a, w), fid, k, tname, fid, k,
+                      tname, fid, k, allok, fid, k);
+                    dn = format("%%fl_d_%d_%d", fid, k);
+                    allok = format("%%fl_a_%d_%d", fid, k);
+                  ];
+                dnames = dn . dnames;
+                k = k + 1;
+              ], call_args);
+              dnames = lreverse!(dnames);
+              writer:format(w,
+                "  br i1 %s, label %%fl_compute_%d, label %%fl_slow_%d\nfl_compute_%d:\n",
+                allok, fid, fid, fid);
+              fop = car(llvm_float_call_op(ins));
+              if (floatunary)
+                op_text = if (fop == 0)
+                  format("fneg double %s", car(dnames))
+                else if (fop == 1)
+                  format("call double @llvm.fabs.f64(double %s)", car(dnames))
+                else
+                  format("call double @llvm.sqrt.f64(double %s)", car(dnames))
+              else
+                op_text = format("%s double %s, %s",
+                                 '["fadd" "fsub" "fmul" "fdiv"][fop],
+                                 car(dnames), cadr(dnames));
+              writer:format(w, "  %%fl_r_%d = %s\n", fid, op_text);
+              if (chain_internal)
+                floatres = ""
+              else
+                [
+                  floatres = format("%%fl_box_%d", fid);
+                  writer:format(w,
+                    "  %s = call i64 @llvm_box_float(double %%fl_r_%d)\n",
+                    floatres, fid);
+                ];
+              writer:format(w, "  br label %%fl_join_%d\nfl_slow_%d:\n",
+                            fid, fid);
+              // The generic call needs boxed operands.
+              k = 0;
+              lforeach(fn (a) [
+                if (float_doubles[itoa(a[mc:v_number])] != null)
+                  [
+                    boxed = format("%%fl_bx_%d_%d", fid, k);
+                    writer:format(w,
+                      "  %s = call i64 @llvm_box_float(double %s)\n",
+                      boxed, float_doubles[itoa(a[mc:v_number])]);
+                    llvm_write_var(a, boxed, w);
+                  ];
+                k = k + 1;
+              ], call_args);
+            ]
+          else if (floatop >= 0)
             [
               // Direct float arithmetic; non-numeric operands fall through
               // to the generic call so errors are unchanged.
@@ -2153,11 +2315,26 @@ reads mc:c_fnumber, mc:c_flocals, mc:update_maxseclev
                   writer:format(w, "  call void @llvm.stackrestore(ptr %s)\n",
                                 copied[1]);
                 ];
+              if (chain && chain_internal)
+                [
+                  writer:format(w,
+                    "  %%fl_st_%d = call { double, i1 } @mudlle_try_double(i64 %s)\n\
+  %%fl_sd_%d = extractvalue { double, i1 } %%fl_st_%d, 0\n\
+  br label %%fl_join_%d\nfl_join_%d:\n\
+  %%fl_dres_%d = phi double [ %%fl_r_%d, %%fl_compute_%d ], [ %%fl_sd_%d, %%fl_slow_%d ]\n",
+                    call_id, res, call_id, call_id, call_id, call_id,
+                    call_id, call_id, call_id, call_id, call_id);
+                  float_doubles[itoa(dest_var[mc:v_number])]
+                    = format("%%fl_dres_%d", call_id);
+                  exit<function> null;
+                ];
               if (floatop >= 0)
                 [
                   writer:format(w,
-                    "  br label %%fl_join_%d\nfl_join_%d:\n  %%fl_res_%d = phi i64 [ %s, %%fl_start_%d ], [ %s, %%fl_slow_%d ]\n",
-                    call_id, call_id, call_id, floatres, call_id, res, call_id);
+                    "  br label %%fl_join_%d\nfl_join_%d:\n  %%fl_res_%d = phi i64 [ %s, %%%s_%d ], [ %s, %%fl_slow_%d ]\n",
+                    call_id, call_id, call_id, floatres,
+                    if (chain) "fl_compute" else "fl_start", call_id,
+                    res, call_id);
                   res = format("%%fl_res_%d", call_id);
                 ];
               llvm_write_var(dest_var, res, w);
@@ -2721,6 +2898,37 @@ done:
 }
 """);
       writer:format(w, """
+define internal { double, i1 } @mudlle_try_double(i64 %%value) {
+entry:
+  %%tag = and i64 %%value, 1
+  %%isint = icmp ne i64 %%tag, 0
+  br i1 %%isint, label %%int, label %%object
+int:
+  %%shifted = ashr i64 %%value, 1
+  %%d = sitofp i64 %%shifted to double
+  %%ri = insertvalue { double, i1 } poison, double %%d, 0
+  %%rii = insertvalue { double, i1 } %%ri, i1 true, 1
+  ret { double, i1 } %%rii
+object:
+  %%nonnull = icmp ne i64 %%value, 0
+  br i1 %%nonnull, label %%header, label %%no
+header:
+  %%p = inttoptr i64 %%value to ptr
+  %%typeptr = getelementptr i8, ptr %%p, i64 9
+  %%type = load i8, ptr %%typeptr, align 1
+  %%isfloat = icmp eq i8 %%type, %d
+  br i1 %%isfloat, label %%load, label %%no
+load:
+  %%dptr = getelementptr i8, ptr %%p, i64 16
+  %%f = load double, ptr %%dptr, align 8
+  %%rf = insertvalue { double, i1 } poison, double %%f, 0
+  %%rff = insertvalue { double, i1 } %%rf, i1 true, 1
+  ret { double, i1 } %%rff
+no:
+  ret { double, i1 } { double 0.0, i1 false }
+}
+""", type_float);
+      writer:format(w, """
 define internal i32 @mudlle_has_type(i64 %%value, i64 %%expected) {
 entry:
   %%tag = and i64 %%value, 1
@@ -2839,6 +3047,9 @@ done:
       writer:write_line(w, "declare i32 @llvm_vector_find(i64, i64)\n");
       writer:write_line(w, "declare i64 @llvm_pair_car(i64)\n");
       writer:write_line(w, "declare i64 @llvm_make_function_closure_for_call(i64, i64, ptr, i64, i64, i64, i64, i64)\n");
+      writer:write_line(w, "declare i64 @llvm_box_float(double)\n");
+      writer:write_line(w, "declare double @llvm.fabs.f64(double)\n");
+      writer:write_line(w, "declare double @llvm.sqrt.f64(double)\n");
       writer:write_line(w, "declare i64 @llvm_cons(i64, i64, i64)\n");
       writer:write_line(w, "declare i64 @llvm_float_binop(i64, i64, i64)\n");
       writer:write_line(w, "declare i64 @llvm_float_unop(i64, i64)\n");

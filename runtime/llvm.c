@@ -173,6 +173,8 @@ static void llvm_unresolved_symbol_stub(void)
    closure/code fields at fixed offsets (see mudlle_call_known in genllvm.mud).
    Break the build if any of these layouts change. */
 _Static_assert(call_llvm == 11, "generated IR hardcodes call_llvm");
+_Static_assert(offsetof(struct mudlle_float, d) == 16,
+               "generated IR hardcodes the float payload offset");
 _Static_assert(sizeof (struct call_stack_mudlle) == 56
                && offsetof(struct call_stack_mudlle, s.next) == 0
                && offsetof(struct call_stack_mudlle, s.type) == 8
@@ -234,6 +236,7 @@ static void llvm_orc_register_absolute_symbols(LLVMOrcJITDylibRef dylib)
     LLVM_SYMBOL_ENTRY(llvm_make_function_closure_for_call),
     LLVM_SYMBOL_ENTRY(llvm_float_binop),
     LLVM_SYMBOL_ENTRY(llvm_float_unop),
+    LLVM_SYMBOL_ENTRY(llvm_box_float),
     LLVM_SYMBOL_ENTRY(llvm_equal),
     LLVM_SYMBOL_ENTRY(llvm_build_vector),
     LLVM_SYMBOL_ENTRY(llvm_concat_strings),
@@ -740,6 +743,14 @@ int64_t llvm_float_binop(int64_t op, int64_t raw_a, int64_t raw_b)
     default: return 0;
     }
   return (int64_t)(uintptr_t)alloc_float(r);
+}
+
+/* Boxes the result of inline double arithmetic. */
+int64_t llvm_box_float(double d);
+
+int64_t llvm_box_float(double d)
+{
+  return (int64_t)(uintptr_t)alloc_float(d);
 }
 
 /* Unary float functions on floats and fixnums; 0 means use the generic call. */
