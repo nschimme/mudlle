@@ -19,6 +19,8 @@
  * SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
  */
 
+library deque;
+
 // Optimal O(1) Circular Ring Buffer Deque and Algorithms in TypeScript for Mudlle
 
 // Representation: d = [buffer_vector, head_index, count, capacity]

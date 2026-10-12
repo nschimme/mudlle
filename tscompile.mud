@@ -31,12 +31,30 @@ reads mc:compile, mc:linkrun
     [
       if (filename == null) filename = "ts_eval.ts";
 
-      | cbody |
-      cbody = ts_parse_string(code, filename);
+      | parsed, cbody, lib_info, has_exp, lib_name, lib_class, inferred_name, dot |
+      parsed = ts_parse_string(code, filename);
+      cbody = parsed[0];
+      lib_info = parsed[1];
+      has_exp = parsed[2];
+
+      if (pair?(lib_info) && string?(car(lib_info)))
+        [
+          lib_name = car(lib_info);
+          lib_class = if (cdr(lib_info)) 1 else 0;
+        ]
+      else
+        [
+          inferred_name = basename(filename);
+          dot = string_index(inferred_name, ?.);
+          if (dot >= 0)
+            inferred_name = substring(inferred_name, 0, dot);
+          lib_name = inferred_name;
+          lib_class = if (has_exp) 1 else 0;
+        ];
 
       indexed_vector(
         mc:m_class    . 0,
-        mc:m_name     . filename,
+        mc:m_name     . lib_name,
         mc:m_requires . null,
         mc:m_defines  . null,
         mc:m_reads    . null,
@@ -44,7 +62,7 @@ reads mc:compile, mc:linkrun
         mc:m_statics  . null,
         mc:m_body     . cbody,
         mc:m_filename . filename,
-        mc:m_nicename . filename,
+        mc:m_nicename . lib_name,
         mc:m_loc      . mc:no_loc,
         mc:m_endloc   . mc:no_loc,
         mc:m_comments . null)
