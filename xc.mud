@@ -31,5 +31,7 @@ load(srcdir + mc:archname + ".mud") &&
 load(srcdir + (if (string_equal?(mc:archname, "llvm"))
                   "llvmcompile" else "compile") + ".mud") &&
 load(srcdir + "interface.mud") &&
+load(srcdir + "tsparser.mud") &&
+load(srcdir + "tscompile.mud") &&
 protect_compiler_libs();
 mc:verbose = 0;
