@@ -843,38 +843,6 @@ struct closure *make_mcallback(
   return make_primitive_closure(c, funcname, help, filename, line);
 }
 
-struct closure *make_mcallback_varargs(
-  mcallback_varargs_fn cb, weak_ref_free_fn cbfree, void *cbdata,
-  const char *funcname, struct string *help, const char *filename, int line)
-{
-  struct mcallback *c = (struct mcallback *)alloc_weak_ref(
-    type_private, sizeof (struct mcallback), cbdata, cbfree);
-  c->p.ptype = makeint(PRIVATE_MCALLBACK);
-  c->cb = NULL;
-  c->cb_varargs = cb;
-  c->cbdata = cbdata;
-  return make_primitive_closure_varargs_captured(
-    c, funcname, help, filename, line, NULL);
-}
-
-struct closure *make_mcallback_varargs_captured(
-  mcallback_varargs_fn cb, weak_ref_free_fn cbfree, void *cbdata,
-  struct vector *captures, const char *funcname, struct string *help,
-  const char *filename, int line)
-{
-  GCPRO(captures);
-  struct mcallback *c = (struct mcallback *)alloc_weak_ref(
-    type_private, sizeof (struct mcallback), cbdata, cbfree);
-  c->p.ptype = makeint(PRIVATE_MCALLBACK);
-  c->cb = NULL;
-  c->cb_varargs = cb;
-  c->cbdata = cbdata;
-  struct closure *closure = make_primitive_closure_varargs_captured(
-    c, funcname, help, filename, line, captures);
-  UNGCPRO();
-  return closure;
-}
-
 struct closure *make_mcallback_varargs_captured_sec(
   mcallback_varargs_fn cb, weak_ref_free_fn cbfree, void *cbdata,
   struct vector *captures, const char *funcname, struct string *help,

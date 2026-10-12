@@ -20,7 +20,7 @@
  */
 
 library mp
-requires allvm, genllvm, ins3, mllvm
+requires genllvm, ins3, mllvm
 defines mp:nscratch, mp:ncaller, mp:ncallee, mp:nregargs, mp:new_label,
   mp:ins_list, mp:assemble, mp:mgen_preamble, mp:mgen_instruction,
   mp:select_registers, mp:migrate, mp:uses_regclass, mp:reset_counters
@@ -41,7 +41,6 @@ defines mp:nscratch, mp:ncaller, mp:ncallee, mp:nregargs, mp:new_label,
 
   mp:reset_counters = fn ()
     [
-      llvm:reset_counters();
       mc:reset_ins_count();
     ];
 ];

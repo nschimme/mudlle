@@ -30,7 +30,7 @@ comparisons, and do not pair these reused x64 rounds with later LLVM rounds.
 
 ## Current implementation and invariants
 
-Read `doc/llvm-backend.md`, `doc/gc.md`, and the x64 generator before changing
+Read `doc/llvm.md`, `doc/gc.md`, and the x64 generator before changing
 GC or call behavior. Mudlle is single threaded; `make -j4` or `make -j8`
 parallelizes separate processes while retaining O2.
 

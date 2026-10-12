@@ -231,13 +231,6 @@ struct closure *make_mcallback(
   const char *funcname,
   struct string *help,
   const char *filename, int line);
-struct closure *make_mcallback_varargs(
-  mcallback_varargs_fn cb, void (*cbfree)(void *cbdata), void *cbdata,
-  const char *funcname, struct string *help, const char *filename, int line);
-struct closure *make_mcallback_varargs_captured(
-  mcallback_varargs_fn cb, void (*cbfree)(void *cbdata), void *cbdata,
-  struct vector *captures, const char *funcname, struct string *help,
-  const char *filename, int line);
 struct closure *make_mcallback_varargs_captured_sec(
   mcallback_varargs_fn cb, void (*cbfree)(void *cbdata), void *cbdata,
   struct vector *captures, const char *funcname, struct string *help,

@@ -17,9 +17,10 @@ backend and an LLVM backend.
     Result: 5
 
 EOF (Ctrl-D) or `quit()` exits. `doc/mudlle-intro.doc` and
-`doc/mudlle-ref.doc` are the introduction and reference;
-`doc/llvm-backend.md` documents the LLVM backend, and
-`doc/llvm-backend-handoff.md` lists its open work and validation steps.
+`doc/mudlle-ref.doc` are the introduction and reference.
+The LLVM backend is summarized below and documented in
+[`doc/llvm.md`](doc/llvm.md); history lives in
+[`doc/llvm-backend-handoff.md`](doc/llvm-backend-handoff.md).
 
 
 Build
@@ -54,48 +55,32 @@ Test (each build should print `SUCCESS`):
 
 LLVM backend
 ------------
-`load("xc.mud")` selects the LLVM backend on ARM64 and RISC-V; on x86-64 it
-keeps the x64 compiler, and `llvmc.mud` selects LLVM. Use a fresh process per
-backend when comparing. To get IR text for a function:
+Versus the x64 backend on `master`, the front-end and shared `ins3`
+instruction pipeline are unchanged. The x64 machine-code emitter and `mcode`
+loader are replaced by LLVM IR generation (`genllvm.mud`) and ORC LLJIT
+loading (`runtime/llvm.c`), optimized at O2 by default.
 
-    load("xc.mud")
-    source = "fn (a, b) a + b";
-    tree = mudlle_parse(source, null, false);
-    ir = mc:compile_llvm(tree, 1, mc:source_code(source));
-    w = writer:new_file("module.ll"); writer:write(w, ir); writer:close(w);
+- **Mudlle-specific fast paths:** checked tagged-integer ops, unboxed
+  floating-point chains, direct known-function and primitive calls, and
+  guarded vector access and construction, with runtime fallbacks for type,
+  error and security behavior.
+- **GC:** explicit shadow roots for the moving collector.
+- **Persistent cache:** relocatable native objects are cached across processes.
+- **Portability:** LLVM is the only compiler on ARM64 and RISC-V. On x86-64,
+  x64 stays the default and `llvmc.mud` selects LLVM.
+- **Formats:** LLVM and x64 prelinked objects are not interchangeable.
 
-Environment variables:
-
-| Variable | Effect |
-|----------|--------|
-| `MUDLLE_LLVM_OPT` | `none`, `O0`, `O1`, `O2` (default), `O3`, or experimental `fast` |
-| `MUDLLE_LLVM_VERIFY_EACH=1` | verify after every pass (default: module boundaries only) |
-| `MUDLLE_LLVM_TIMING=1` | report IR size and time per compilation stage on a cache miss |
-| `MUDLLE_LLVM_CACHE=<dir>` | native object cache directory (default `.mudlle-llvm-cache`; empty disables) |
-| `MUDLLE_LLVM_CACHE_TRACE=1` | print cache hits and misses |
-
-The persistent cache stores relocatable native objects. A hit skips IR parsing,
-optimization and code generation. Keys cover the IR, runtime ABI, LLVM version,
-target, CPU features and optimization settings; unusable entries fall back to
-compilation. Writes are atomic; there is no automatic eviction. The cache and
-compatibility rules are described in `doc/llvm-backend.md`.
+Design, environment variables, cache rules, IR inspection and validation:
+[`doc/llvm.md`](doc/llvm.md).
 
 
 Benchmarks
 ----------
-Comparison: this branch's LLVM backend against upstream x64 master
-[`99a6a18`](https://github.com/nschimme/mudlle/commit/99a6a18b0145f45c326555ae23145eeab16b08cc).
-The AMD Ryzen 9 7940HS host ran Linux 7.0.14, GCC 14.2.0 and LLVM 19.1.7.
-Mudlle is single threaded; LLVM kernels use `default<O2>`. The native object
-cache was disabled, but filesystem caches were not flushed.
-
-There are 31 fresh LLVM process samples from 2026-10-12 15:40–15:44 UTC and 31
-unchanged x64 samples from upstream master, recorded earlier at 15:00–15:10
-UTC. Each sample ran 100 timed calls per workload, except the integer loop,
-which ran 2,000. The table shows median CPU milliseconds and signed CPU time
-change versus the x64 median: negative is faster on LLVM, positive is slower.
-Percentages and independently bootstrapped 95% intervals are rounded to one
-decimal place.
+LLVM (this branch) against upstream x64 master
+[`99a6a18`](https://github.com/nschimme/mudlle/commit/99a6a18b0145f45c326555ae23145eeab16b08cc):
+median CPU ms over 31 single-threaded process samples each, AMD Ryzen 9
+7940HS, Linux 7.0.14, GCC 14.2.0, LLVM 19.1.7, O2, object cache disabled.
+Negative is faster on LLVM; the interval is a bootstrapped 95% CI.
 
 | Workload | LLVM ms | x64 ms | CPU time vs x64 | 95% interval |
 |----------|--------:|-------:|----------------:|-------------:|
@@ -111,51 +96,11 @@ decimal place.
 | Library list/vector round trip, width 32 | 3,329 | 3,276 | +1.6% | +0.5% to +2.8% |
 | Bigint primitives (20,000 steps) | 1,192 | 1,166 | +2.2% | +0.8% to +3.0% |
 
-The library conversion and bigint workloads remain slower on LLVM. The other
-nine workloads have lower LLVM medians; the closure-loop interval includes
-zero. This is an unpaired, same-host comparison: the
-bootstrap independently resamples the 31 samples for each backend 5,000 times
-with seed 20261012. It assumes independent, identically distributed samples and
-does not capture temporal drift between the baseline and LLVM runs. These
-results do not establish general platform parity. No ARM64, RISC-V or LLVM 14
-measurements or validation are included.
-
-Timers sum `ctime()` only across kernel calls. Compilation, warmup, numeric
-reference calculations, explicit collection stress, and post-call checks are
-outside the timers; table and sequence identity/content guards remain inside
-their timed loops. Timed loops keep ordinary loop accounting. The library
-conversion calls interpreted library closures; native conversions compile
-the equivalent loops locally. The compact x64 sample fixture is
-[`doc/benchmarks/x64-baseline.json`](doc/benchmarks/x64-baseline.json).
-The runner writes raw samples, checksums, source/binary fingerprints and
-statistical summaries outside Git through its `--output` option.
-
-To reproduce the LLVM samples on the same host and reuse the checked-in x64
-fixture, build this branch with `make USE_LLVM=yes` and
-`make -j8 compiler USE_LLVM=yes`, then run:
-
-    perl regression/benchmark-rich-backends.pl --llvm <this-branch-tree> \
-      --baseline-report doc/benchmarks/x64-baseline.json \
-      --suite all --runs 31 \
-      --timed-calls 100 \
-      --llvm-revision "$(git -C <this-branch-tree> rev-parse HEAD)" \
-      --x64-revision 99a6a18b0145f45c326555ae23145eeab16b08cc \
-      --output /tmp/mudlle-benchmark-report.json
-
-The baseline fixture requires the same host platform and cache configuration.
-The runner checks each workload against its reference and requires its success
-marker before recording a sample.
-
-Validation for a change to the LLVM backend (serial; the bootstrap and the
-compiled-loader runs catch relocation and GC-rooting bugs that the single
-session source suite does not):
-
-    MUDLLE_LLVM_CACHE= ./mudlle -c 'silent=true' -e xc.mud -e regression/all.mud
-    MUDLLE_LLVM_OPT=none MUDLLE_LLVM_CACHE= make compiler USE_LLVM=yes
-    perl regression/test-llvm-cache-abi.pl
-    perl regression/test-llvm-cache.pl
-    MUDLLE_LLVM_VERIFY_EACH=1 MUDLLE_LLVM_CACHE_TRACE=1 ./mudlle \
-      -c 'silent=true' -e icxc.mud -e regression/all.mud    # cold, then warm
+Nine of eleven workloads have a lower LLVM median (floating point -80%,
+integer loops -55%); library list/vector conversion and bigint primitives are
+2% slower, and the closure loop is within noise. This is an unpaired same-host
+comparison on x86-64 only; no ARM64, RISC-V or LLVM 14 results exist.
+Methodology and reproduction: [`doc/benchmark.md`](doc/benchmark.md).
 
 
 Contact Information

@@ -42,18 +42,12 @@ struct closure *compile_code(struct mfile *f, seclev_t seclev);
 struct closure *make_primitive_closure(
   struct mcallback *cb, const char *funcname, struct string *help,
   const char *filename, int line);
-struct closure *make_primitive_closure_varargs(
-  struct mcallback *cb, const char *funcname, struct string *help,
-  const char *filename, int line);
-struct closure *make_primitive_closure_varargs_captured(
-  struct mcallback *cb, const char *funcname, struct string *help,
-  const char *filename, int line, struct vector *captures);
 struct closure *make_primitive_closure_varargs_captured_sec(
   struct mcallback *cb, const char *funcname, struct string *help,
   const char *filename, int line, struct vector *captures, seclev_t seclev);
 
 struct icode;
-/* As above, but reuses *icode_slot as the closure's code if it is non-NULL and
+/* Like make_primitive_closure, but with a vararg callback; reuses *icode_slot as the closure's code if it is non-NULL and
    stores the code used in it on return. A new code gets the immutable
    'arguments' and 'return_typeset' (when 'arguments' is non-NULL) at creation;
    immutable code must not be modified afterwards. The caller must not use the slot's

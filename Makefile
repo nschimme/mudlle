@@ -325,7 +325,7 @@ dep depend: .depend
 ifeq ($(NOCOMPILER),)
 
 COMPILER_API := $(if $(filter llvm,$(MUDARCH)),llvmcompile,compile)
-MUD_FILES := $(patsubst %, $(srcdir)%.mud, $(sort a$(MUDARCH) asmwriter $(COMPILER_API) \
+MUD_FILES := $(patsubst %, $(srcdir)%.mud, $(sort $(if $(filter llvm,$(MUDARCH)),,a$(MUDARCH)) asmwriter $(COMPILER_API) \
 	compiler cxc dihash dlist flow genllvm gen$(MUDARCH) graph icxc	\
 	inference ins3 interface ixc lib link misc m$(MUDARCH) noinf	\
 	optimise phase1 phase2 phase3 phase4 pxslow sequences vars	\

@@ -48,7 +48,7 @@ trap_error(fn() [
   | mfiles |
   // sort by size
   mfiles = vmap(fn (f) [ f += ".mud"; f . file_stat(srcdir + f)[fs_size] ], '[
-    ,("a" + mc:archname)
+    ,(if (string_equal?(mc:archname, "llvm")) "asmwriter" else "a" + mc:archname)
     "asmwriter"
     ,(if (string_equal?(mc:archname, "llvm")) "llvmcompile" else "compile")
     "compiler"
@@ -73,6 +73,17 @@ trap_error(fn() [
     "vars"
     ,mc:archname
   ]);
+  // some backends name the same file twice (e.g. "genllvm")
+  | seen |
+  seen = null;
+  mfiles = vfilter(fn (f) [
+    | dup |
+    dup = false;
+    for (| l | l = seen; l != null; l = cdr(l))
+      if (string_equal?(car(l), car(f))) dup = true;
+    if (!dup) seen = car(f) . seen;
+    !dup
+  ], mfiles);
   vqsort!(fn (a, b) cdr(a) > cdr(b), mfiles);
 
   for (| n | n = slice; n < vlength(mfiles); n += slices)

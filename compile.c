@@ -980,22 +980,6 @@ struct closure *make_primitive_closure(
     cb, funcname, help, filename, line, false, NULL, MAX_SECLEVEL, NULL, NULL, TYPESET_ANY);
 }
 
-struct closure *make_primitive_closure_varargs(
-  struct mcallback *cb, const char *funcname, struct string *help,
-  const char *filename, int line)
-{
-  return make_primitive_closure_internal(
-    cb, funcname, help, filename, line, true, NULL, MAX_SECLEVEL, NULL, NULL, TYPESET_ANY);
-}
-
-struct closure *make_primitive_closure_varargs_captured(
-  struct mcallback *cb, const char *funcname, struct string *help,
-  const char *filename, int line, struct vector *captures)
-{
-  return make_primitive_closure_internal(
-    cb, funcname, help, filename, line, true, captures, MAX_SECLEVEL, NULL, NULL, TYPESET_ANY);
-}
-
 struct closure *make_primitive_closure_varargs_captured_sec(
   struct mcallback *cb, const char *funcname, struct string *help,
   const char *filename, int line, struct vector *captures, seclev_t seclev)
